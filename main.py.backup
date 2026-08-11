@@ -1,0 +1,1052 @@
+"""
+Forza Horizon 6 ADAS/LKA
+Pipeline principal de visão em tempo real.
+
+Pipeline:
+Captura -> UFLD -> Geometria -> Filtro -> ADAS Display -> Overlay
+
+Modo:
+VISION_ONLY
+
+ATENÇÃO:
+Este módulo NÃO envia comandos para volante, pedais ou qualquer
+outro dispositivo físico.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import threading
+import time
+from typing import Optional
+
+import cv2
+import numpy as np
+import torch
+
+import config
+from capture.screen_capture import ScreenCapture
+from vision.ufld_detector import (
+    LaneDetectionResult,
+    UFLDLaneDetector,
+)
+from vision.lane_geometry import (
+    LaneGeometry,
+    LaneGeometryResult,
+)
+from vision.temporal_filter import EMATemporalFilter
+from visualization.debug_overlay import DebugOverlay
+from visualization.adas_display import (
+    ADASDisplay,
+    ADASDisplayState,
+)
+
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(config, "LOG_LEVEL", "INFO"),
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# SISTEMA PRINCIPAL
+# =============================================================================
+
+class ForzaADAS:
+    """
+    Pipeline principal do sistema de percepção.
+
+    Responsabilidades:
+        - captura de frames;
+        - execução do detector;
+        - cálculo geométrico;
+        - filtragem temporal;
+        - renderização do overlay;
+        - atualização do painel ADAS;
+        - controle do ciclo de vida.
+
+    Não possui qualquer lógica de controle físico.
+    """
+
+    def __init__(self, video_path: Optional[str] = None) -> None:
+        self.video_path = video_path
+
+        self.mode = "VISION_ONLY"
+        self.processing_enabled = True
+        self.running = False
+
+        # ------------------------------------------------------------------
+        # Calibração
+        # ------------------------------------------------------------------
+
+        calibration = config.load_calibration()
+
+        self.roi = (
+            int(calibration["left"]),
+            int(calibration["top"]),
+            int(calibration["right"]),
+            int(calibration["bottom"]),
+        )
+
+        self._validate_roi()
+
+        # ------------------------------------------------------------------
+        # Componentes
+        # ------------------------------------------------------------------
+
+        self.capture: Optional[ScreenCapture] = None
+        self.detector: Optional[UFLDLaneDetector] = None
+        self.geometry: Optional[LaneGeometry] = None
+        self.temporal_filter: Optional[EMATemporalFilter] = None
+        self.overlay: Optional[DebugOverlay] = None
+        self.adas_display: Optional[ADASDisplay] = None
+
+        # ------------------------------------------------------------------
+        # Resultado mais recente
+        # ------------------------------------------------------------------
+
+        self.latest_detection: Optional[LaneDetectionResult] = None
+        self.latest_geometry: Optional[LaneGeometryResult] = None
+
+        # ------------------------------------------------------------------
+        # Frame para inferência
+        # ------------------------------------------------------------------
+
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_available = threading.Event()
+        self._inference_lock = threading.Lock()
+
+        self._inference_thread: Optional[threading.Thread] = None
+
+        # ------------------------------------------------------------------
+        # Performance
+        # ------------------------------------------------------------------
+
+        self.fps = 0.0
+        self.capture_latency_ms = 0.0
+        self.inference_latency_ms = 0.0
+        self.total_latency_ms = 0.0
+
+        self._frame_count = 0
+        self._fps_timestamp = time.perf_counter()
+
+        # ------------------------------------------------------------------
+        # Estado
+        # ------------------------------------------------------------------
+
+        self._initialized = False
+
+    # =========================================================================
+    # VALIDAÇÃO
+    # =========================================================================
+
+    def _validate_roi(self) -> None:
+        """Valida a configuração da ROI antes de iniciar o sistema."""
+
+        left, top, right, bottom = self.roi
+
+        if left < 0 or top < 0:
+            raise ValueError(
+                f"ROI inválida: coordenadas negativas: {self.roi}"
+            )
+
+        if right <= left:
+            raise ValueError(
+                f"ROI inválida: right <= left: {self.roi}"
+            )
+
+        if bottom <= top:
+            raise ValueError(
+                f"ROI inválida: bottom <= top: {self.roi}"
+            )
+
+        if right > config.SCREEN_WIDTH:
+            raise ValueError(
+                f"ROI excede largura da tela: {self.roi}"
+            )
+
+        if bottom > config.SCREEN_HEIGHT:
+            raise ValueError(
+                f"ROI excede altura da tela: {self.roi}"
+            )
+
+    # =========================================================================
+    # INICIALIZAÇÃO
+    # =========================================================================
+
+    def initialize(self) -> bool:
+        """
+        Inicializa todos os componentes.
+
+        Retorna:
+            True se tudo foi inicializado corretamente.
+        """
+
+        logger.info("=" * 70)
+        logger.info("FORZA HORIZON 6 - ADAS / LKA")
+        logger.info("VISION ONLY")
+        logger.info("=" * 70)
+
+        # ------------------------------------------------------------------
+        # GPU
+        # ------------------------------------------------------------------
+
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+
+            logger.info(
+                "[CUDA] GPU disponível: %s",
+                gpu_name,
+            )
+
+            logger.info(
+                "[CUDA] PyTorch: %s",
+                torch.__version__,
+            )
+        else:
+            logger.warning(
+                "[CUDA] GPU CUDA não disponível. "
+                "Inferência será executada em CPU."
+            )
+
+        # ------------------------------------------------------------------
+        # Captura
+        # ------------------------------------------------------------------
+
+        if self.video_path is not None:
+
+            logger.info(
+                "[CAPTURE] Modo vídeo: %s",
+                self.video_path,
+            )
+
+            self.capture = ScreenCapture(
+                video_path=self.video_path,
+                target_fps=config.CAPTURE_TARGET_FPS,
+                max_buffer_size=config.MAX_FRAME_BUFFER_SIZE,
+            )
+
+        else:
+
+            logger.info("[CAPTURE] Modo tela")
+
+            logger.info(
+                "[CAPTURE] ROI: %s",
+                self.roi,
+            )
+
+            self.capture = ScreenCapture(
+                region=self.roi,
+                target_fps=config.CAPTURE_TARGET_FPS,
+                backend=config.CAPTURE_BACKEND,
+                output_color=config.CAPTURE_OUTPUT_COLOR,
+                max_buffer_size=config.MAX_FRAME_BUFFER_SIZE,
+            )
+
+        if not self.capture.initialize():
+            logger.error("[CAPTURE] Falha ao inicializar captura.")
+            return False
+
+        self.capture.start()
+
+        # ------------------------------------------------------------------
+        # Detector UFLD
+        # ------------------------------------------------------------------
+
+        logger.info("[UFLD] Inicializando detector...")
+
+        self.detector = UFLDLaneDetector(
+            model_path=config.UFLD_MODEL_PATH,
+            backbone=config.UFLD_BACKBONE,
+            cls_dim=config.UFLD_CLS_DIM,
+            use_aux=config.UFLD_USE_AUX,
+            input_width=config.UFLD_INPUT_WIDTH,
+            input_height=config.UFLD_INPUT_HEIGHT,
+            mean=config.UFLD_MEAN,
+            std=config.UFLD_STD,
+            confidence_threshold=config.UFLD_CONFIDENCE_THRESHOLD,
+        )
+
+        if not self.detector.load_model():
+            logger.error("[UFLD] Falha ao carregar modelo.")
+            self.capture.stop()
+            return False
+
+        logger.info("[UFLD] Modelo carregado.")
+
+        # ------------------------------------------------------------------
+        # Geometria
+        # ------------------------------------------------------------------
+
+        self.geometry = LaneGeometry(
+            screen_width=config.SCREEN_WIDTH,
+            screen_height=config.SCREEN_HEIGHT,
+            roi=self.roi,
+            ufld_width=config.UFLD_INPUT_WIDTH,
+            ufld_height=config.UFLD_INPUT_HEIGHT,
+            near_weight=config.LANE_GEOMETRY_NEAR_WEIGHT,
+            far_weight=config.LANE_GEOMETRY_FAR_WEIGHT,
+            min_points=config.MIN_POINTS_PER_LANE,
+        )
+
+        logger.info("[GEOMETRY] Inicializada.")
+
+        # ------------------------------------------------------------------
+        # Filtro temporal
+        # ------------------------------------------------------------------
+
+        self.temporal_filter = EMATemporalFilter(
+            alpha=config.FILTER_ALPHA
+        )
+
+        logger.info(
+            "[FILTER] EMA alpha=%.3f",
+            config.FILTER_ALPHA,
+        )
+
+        # ------------------------------------------------------------------
+        # Overlay
+        # ------------------------------------------------------------------
+
+        self.overlay = DebugOverlay(
+            roi=self.roi,
+            font_scale=config.OVERLAY_FONT_SCALE,
+            font_thickness=config.OVERLAY_FONT_THICKNESS,
+            line_thickness=config.OVERLAY_LINE_THICKNESS,
+            point_radius=config.OVERLAY_POINT_RADIUS,
+        )
+
+        logger.info("[OVERLAY] Inicializado.")
+
+        # ------------------------------------------------------------------
+        # Painel ADAS
+        # ------------------------------------------------------------------
+
+        try:
+            self.adas_display = ADASDisplay()
+
+            self.adas_display.show()
+
+            self.adas_display.update(
+                state=ADASDisplayState.UNKNOWN,
+                system_active=True,
+                message="ADAS inicializado. Aguardando detecção...",
+            )
+
+            logger.info("[ADAS DISPLAY] Painel ADAS inicializado.")
+
+        except Exception:
+            logger.exception(
+                "[ADAS DISPLAY] Falha ao inicializar painel ADAS."
+            )
+
+            self.adas_display = None
+
+        # ------------------------------------------------------------------
+        # Thread de inferência
+        # ------------------------------------------------------------------
+
+        self.running = True
+
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop,
+            name="ADAS-Inference",
+            daemon=True,
+        )
+
+        self._inference_thread.start()
+
+        self._initialized = True
+
+        logger.info("=" * 70)
+        logger.info("SISTEMA PRONTO")
+        logger.info("F8 = processamento ON/OFF")
+        logger.info("ESC = sair")
+        logger.info("=" * 70)
+
+        return True
+
+    # =========================================================================
+    # INFERÊNCIA
+    # =========================================================================
+
+    def _inference_loop(self) -> None:
+        """
+        Thread dedicada à inferência.
+
+        Sempre processa o frame mais recente disponível.
+        Frames antigos são descartados para evitar latência acumulada.
+        """
+
+        while self.running:
+
+            if not self._frame_available.wait(timeout=0.1):
+                continue
+
+            self._frame_available.clear()
+
+            if not self.processing_enabled:
+                continue
+
+            with self._inference_lock:
+                frame = self._latest_frame
+                self._latest_frame = None
+
+            if frame is None:
+                continue
+
+            start = time.perf_counter()
+
+            try:
+
+                # ----------------------------------------------------------
+                # 1. Detecção
+                # ----------------------------------------------------------
+
+                detection = self.detector.detect(frame)
+
+                # ----------------------------------------------------------
+                # 2. Filtro da detecção
+                # ----------------------------------------------------------
+
+                filtered_detection = (
+                    self.temporal_filter.filter_detection(
+                        detection
+                    )
+                )
+
+                # ----------------------------------------------------------
+                # 3. Geometria
+                # ----------------------------------------------------------
+
+                geometry = self.geometry.compute(
+                    filtered_detection
+                )
+
+                # ----------------------------------------------------------
+                # 4. Filtro da geometria
+                # ----------------------------------------------------------
+
+                filtered_geometry = (
+                    self.temporal_filter.filter_geometry(
+                        geometry
+                    )
+                )
+
+                elapsed = time.perf_counter() - start
+
+                self.inference_latency_ms = elapsed * 1000.0
+
+                # ----------------------------------------------------------
+                # Publica resultado atomicamente
+                # ----------------------------------------------------------
+
+                with self._inference_lock:
+
+                    self.latest_detection = filtered_detection
+                    self.latest_geometry = filtered_geometry
+
+            except Exception:
+
+                logger.exception(
+                    "[INFERENCE] Erro durante processamento."
+                )
+
+                self.inference_latency_ms = 0.0
+
+    # =========================================================================
+    # ENVIO DE FRAME
+    # =========================================================================
+
+    def _submit_frame(self, frame: np.ndarray) -> None:
+        """
+        Entrega somente o frame mais recente para a thread de inferência.
+        """
+
+        if frame is None:
+            return
+
+        if frame.ndim != 3:
+            logger.warning(
+                "[FRAME] Frame inválido: ndim=%s",
+                frame.ndim,
+            )
+            return
+
+        with self._inference_lock:
+            self._latest_frame = frame.copy()
+
+        self._frame_available.set()
+
+    # =========================================================================
+    # RECONSTRUÇÃO DO FRAME
+    # =========================================================================
+
+    def _build_display_frame(
+        self,
+        frame: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Reconstrói uma imagem da tela para visualização.
+
+        A inferência continua trabalhando exclusivamente na ROI.
+        """
+
+        if self.video_path is not None:
+            return frame.copy()
+
+        display = np.zeros(
+            (
+                config.SCREEN_HEIGHT,
+                config.SCREEN_WIDTH,
+                3,
+            ),
+            dtype=np.uint8,
+        )
+
+        left, top, right, bottom = self.roi
+
+        roi_width = right - left
+        roi_height = bottom - top
+
+        h, w = frame.shape[:2]
+
+        copy_width = min(w, roi_width)
+        copy_height = min(h, roi_height)
+
+        if copy_width <= 0 or copy_height <= 0:
+            return display
+
+        display[
+            top:top + copy_height,
+            left:left + copy_width,
+        ] = frame[
+            :copy_height,
+            :copy_width,
+        ]
+
+        return display
+
+    # =========================================================================
+    # FPS
+    # =========================================================================
+
+    def _update_fps(self) -> None:
+        """Atualiza FPS de visualização."""
+
+        self._frame_count += 1
+
+        now = time.perf_counter()
+        elapsed = now - self._fps_timestamp
+
+        if elapsed >= 1.0:
+
+            self.fps = self._frame_count / elapsed
+
+            self._frame_count = 0
+            self._fps_timestamp = now
+
+    # =========================================================================
+    # ESTADO ADAS
+    # =========================================================================
+
+    def _update_adas_display(
+        self,
+        geometry: Optional[LaneGeometryResult],
+    ) -> None:
+        """
+        Atualiza o painel ADAS usando a geometria filtrada.
+
+        Nesta primeira integração o estado é derivado diretamente
+        do erro lateral.
+
+        O ADASStateEstimator será integrado posteriormente.
+        """
+
+        if self.adas_display is None:
+            return
+
+        if not self.processing_enabled:
+            self.adas_display.update(
+                state=ADASDisplayState.UNKNOWN,
+                system_active=False,
+                message="Processamento desativado.",
+            )
+            return
+
+        if geometry is None:
+            self.adas_display.update(
+                state=ADASDisplayState.UNKNOWN,
+                system_active=True,
+                message="Aguardando detecção das faixas...",
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # Faixas detectadas
+        # ------------------------------------------------------------------
+
+        left_lane = getattr(
+            geometry,
+            "left_lane_screen",
+            None,
+        )
+
+        right_lane = getattr(
+            geometry,
+            "right_lane_screen",
+            None,
+        )
+
+        left_detected = bool(left_lane)
+        right_detected = bool(right_lane)
+
+        # ------------------------------------------------------------------
+        # Erro lateral
+        # ------------------------------------------------------------------
+
+        lateral_error = getattr(
+            geometry,
+            "lateral_error",
+            None,
+        )
+
+        if lateral_error is None:
+            self.adas_display.update(
+                state=ADASDisplayState.UNKNOWN,
+                left_lane_detected=left_detected,
+                right_lane_detected=right_detected,
+                system_active=True,
+                message="Erro lateral indisponível.",
+            )
+            return
+
+        lateral_error = float(lateral_error)
+
+        # ------------------------------------------------------------------
+        # Estado
+        # ------------------------------------------------------------------
+
+        abs_error = abs(lateral_error)
+
+        if not left_detected and not right_detected:
+
+            state = ADASDisplayState.UNKNOWN
+
+            message = "Faixas não detectadas."
+
+        elif abs_error <= 0.05:
+
+            state = ADASDisplayState.CENTERED
+
+            message = "Veículo centralizado na faixa."
+
+        elif lateral_error < 0:
+
+            state = ADASDisplayState.LEFT
+
+            message = "Veículo deslocado para a esquerda."
+
+        else:
+
+            state = ADASDisplayState.RIGHT
+
+            message = "Veículo deslocado para a direita."
+
+        # ------------------------------------------------------------------
+        # Confiança
+        # ------------------------------------------------------------------
+
+        lane_confidence = getattr(
+            geometry,
+            "confidence",
+            None,
+        )
+
+        if lane_confidence is not None:
+            lane_confidence = float(lane_confidence)
+
+        # ------------------------------------------------------------------
+        # Atualização do display
+        # ------------------------------------------------------------------
+
+        self.adas_display.update(
+            state=state,
+            lane_offset=lateral_error,
+            lane_confidence=lane_confidence,
+            left_lane_detected=left_detected,
+            right_lane_detected=right_detected,
+            vehicle_detected=False,
+            vehicle_distance=None,
+            system_active=True,
+            message=message,
+        )
+
+    # =========================================================================
+    # LOOP PRINCIPAL
+    # =========================================================================
+
+    def run(self) -> None:
+        """Executa o loop principal."""
+
+        if not self._initialized:
+            raise RuntimeError(
+                "ForzaADAS não foi inicializado."
+            )
+
+        window_name = "Forza ADAS/LKA - Vision Only"
+
+        cv2.namedWindow(
+            window_name,
+            cv2.WINDOW_NORMAL,
+        )
+
+        try:
+
+            while self.running:
+
+                loop_start = time.perf_counter()
+
+                # ----------------------------------------------------------
+                # Captura
+                # ----------------------------------------------------------
+
+                capture_start = time.perf_counter()
+
+                frame = self.capture.get_latest_frame()
+
+                self.capture_latency_ms = (
+                    time.perf_counter() - capture_start
+                ) * 1000.0
+
+                if frame is None:
+                    cv2.waitKey(1)
+
+                    if self.adas_display is not None:
+                        self.adas_display.pump()
+
+                    continue
+
+                # ----------------------------------------------------------
+                # Validação básica
+                # ----------------------------------------------------------
+
+                if frame.ndim != 3 or frame.shape[2] != 3:
+
+                    logger.warning(
+                        "[FRAME] Formato inesperado: %s",
+                        frame.shape,
+                    )
+
+                    continue
+
+                # ----------------------------------------------------------
+                # Inferência
+                # ----------------------------------------------------------
+
+                if self.processing_enabled:
+                    self._submit_frame(frame)
+
+                # ----------------------------------------------------------
+                # Frame para visualização
+                # ----------------------------------------------------------
+
+                display_frame = self._build_display_frame(frame)
+
+                # ----------------------------------------------------------
+                # Resultado mais recente
+                # ----------------------------------------------------------
+
+                with self._inference_lock:
+
+                    detection = self.latest_detection
+                    geometry = self.latest_geometry
+
+                # ----------------------------------------------------------
+                # Painel ADAS
+                # ----------------------------------------------------------
+
+                self._update_adas_display(
+                    geometry
+                )
+
+                if self.adas_display is not None:
+                    self.adas_display.pump()
+
+                # ----------------------------------------------------------
+                # Overlay
+                # ----------------------------------------------------------
+
+                display_frame = self.overlay.render(
+                    frame=display_frame,
+                    detection=detection,
+                    geometry=geometry,
+                    fps=self.fps,
+                    capture_latency_ms=self.capture_latency_ms,
+                    inference_latency_ms=self.inference_latency_ms,
+                    total_latency_ms=self.total_latency_ms,
+                    mode=self.mode,
+                    gpu=(
+                        "CUDA"
+                        if torch.cuda.is_available()
+                        else "CPU"
+                    ),
+                )
+
+                # ----------------------------------------------------------
+                # Redimensionamento apenas para visualização
+                # ----------------------------------------------------------
+
+                preview = display_frame
+
+                max_preview_width = 1920
+
+                if preview.shape[1] > max_preview_width:
+
+                    scale = (
+                        max_preview_width
+                        / float(preview.shape[1])
+                    )
+
+                    preview = cv2.resize(
+                        preview,
+                        (
+                            int(preview.shape[1] * scale),
+                            int(preview.shape[0] * scale),
+                        ),
+                        interpolation=cv2.INTER_AREA,
+                    )
+
+                cv2.imshow(
+                    window_name,
+                    preview,
+                )
+
+                # ----------------------------------------------------------
+                # Teclas
+                # ----------------------------------------------------------
+
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == config.HOTKEY_EXIT:
+
+                    logger.info("[INPUT] ESC pressionado.")
+
+                    self.running = False
+
+                elif key == config.HOTKEY_TOGGLE:
+
+                    self.processing_enabled = (
+                        not self.processing_enabled
+                    )
+
+                    status = (
+                        "LIGADO"
+                        if self.processing_enabled
+                        else "DESLIGADO"
+                    )
+
+                    logger.info(
+                        "[INPUT] Processamento %s.",
+                        status,
+                    )
+
+                # ----------------------------------------------------------
+                # Performance
+                # ----------------------------------------------------------
+
+                self.total_latency_ms = (
+                    time.perf_counter() - loop_start
+                ) * 1000.0
+
+                self._update_fps()
+
+        except KeyboardInterrupt:
+
+            logger.info(
+                "[MAIN] Interrompido pelo usuário."
+            )
+
+        except Exception:
+
+            logger.exception(
+                "[MAIN] Erro fatal no loop principal."
+            )
+
+        finally:
+
+            self.shutdown()
+
+    # =========================================================================
+    # SHUTDOWN
+    # =========================================================================
+
+    def shutdown(self) -> None:
+        """Encerra todos os componentes com segurança."""
+
+        if not self.running and not self._initialized:
+            return
+
+        logger.info("[MAIN] Encerrando sistema...")
+
+        self.running = False
+
+        self._frame_available.set()
+
+        # ------------------------------------------------------------------
+        # Thread
+        # ------------------------------------------------------------------
+
+        if self._inference_thread is not None:
+
+            if (
+                self._inference_thread.is_alive()
+                and threading.current_thread()
+                is not self._inference_thread
+            ):
+
+                self._inference_thread.join(
+                    timeout=2.0
+                )
+
+        # ------------------------------------------------------------------
+        # Captura
+        # ------------------------------------------------------------------
+
+        if self.capture is not None:
+
+            try:
+
+                self.capture.stop()
+
+            except Exception:
+
+                logger.exception(
+                    "[CAPTURE] Erro ao liberar captura."
+                )
+
+        # ------------------------------------------------------------------
+        # Painel ADAS
+        # ------------------------------------------------------------------
+
+        if self.adas_display is not None:
+
+            try:
+
+                self.adas_display.close()
+
+            except Exception:
+
+                logger.exception(
+                    "[ADAS DISPLAY] Erro ao fechar painel."
+                )
+
+            self.adas_display = None
+
+        # ------------------------------------------------------------------
+        # OpenCV
+        # ------------------------------------------------------------------
+
+        try:
+
+            cv2.destroyAllWindows()
+
+        except Exception:
+            pass
+
+        self._initialized = False
+
+        logger.info(
+            "[MAIN] Sistema encerrado."
+        )
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def main() -> None:
+    """Entry point."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Forza Horizon 6 ADAS/LKA "
+            "- Vision Only"
+        )
+    )
+
+    parser.add_argument(
+        "--screen",
+        action="store_true",
+        help="Captura a tela em tempo real.",
+    )
+
+    parser.add_argument(
+        "--video",
+        type=str,
+        default=None,
+        help="Arquivo de vídeo para testes.",
+    )
+
+    args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Seleção do modo
+    # ------------------------------------------------------------------
+
+    if args.screen and args.video is not None:
+
+        parser.error(
+            "--screen e --video não podem ser usados "
+            "simultaneamente."
+        )
+
+    if not args.screen and args.video is None:
+        args.screen = True
+
+    # ------------------------------------------------------------------
+    # Sistema
+    # ------------------------------------------------------------------
+
+    adas = ForzaADAS(
+        video_path=args.video,
+    )
+
+    try:
+
+        if not adas.initialize():
+
+            logger.error(
+                "[MAIN] Falha na inicialização."
+            )
+
+            sys.exit(1)
+
+        adas.run()
+
+    except Exception:
+
+        logger.exception(
+            "[MAIN] Falha fatal."
+        )
+
+        adas.shutdown()
+
+        sys.exit(1)
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    main()
