@@ -1,395 +1,243 @@
 """
 vision/lane_tracker.py
 
-Lane Tracker para o sistema Forza Assistente.
+Rastreamento temporal das linhas de faixa.
 
-Responsabilidade:
-
-    LaneDetectionResult
-            |
-            v
-    identificação das faixas
-            |
-            v
+Responsabilidades:
+    YOLOP LaneDetectionResult
+        ↓
     associação temporal
-            |
-            v
-    ajuste geométrico
-            |
-            v
-    projeção das faixas
-            |
-            v
-    LaneTrackingResult
+        ↓
+    manutenção da identidade das lanes
+        ↓
+    estabilidade / perda / recuperação
+        ↓
+    TrackedLane / LaneTrackingResult
 
-O tracker NÃO é responsável por:
+Este módulo NÃO:
+    - executa inferência YOLOP;
+    - cria um modelo polinomial definitivo;
+    - determina a faixa atual do veículo;
+    - calcula posição do veículo;
+    - decide atuação ADAS;
+    - controla o veículo.
 
-- controle do volante;
-- decisão de intervenção;
-- cálculo do estado ADAS;
-- detecção de veículos;
-- inferência do YOLOP;
-- captura da tela.
-
-Essas responsabilidades pertencem a outros módulos.
-
-Modelo geométrico:
-
-    x(y) = a*y³ + b*y² + c*y + d
-
-O eixo principal utilizado pelo tracker é Y da imagem.
-
-A utilização de um polinômio cúbico permite representar:
-
-- retas;
-- curvas suaves;
-- mudanças progressivas de curvatura.
-
-IMPORTANTE:
-
-O tracker nunca deve transformar ausência de informação
-em uma faixa artificial com confiança alta.
-
-Uma faixa projetada possui:
-
-    observed = False
-    projected = True
-
-e sua confiança é degradada progressivamente com o tempo.
+O ajuste matemático das lanes é responsabilidade de lane_model.py.
+A identificação da faixa atual é responsabilidade de lane_assignment.py.
 """
 
 from __future__ import annotations
 
-import logging
+import math
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .yolop_detector import LaneDetectionResult, LanePoint
+from .lane_types import (
+    LaneLine,
+    LaneModel,
+    LanePoint,
+)
 
-logger = logging.getLogger(__name__)
 
-
-# ============================================================================
+# =============================================================================
 # CONFIGURAÇÃO
-# ============================================================================
+# =============================================================================
 
-MAX_LANES = 4
+DEFAULT_MAX_LANES = 8
 
-# Até 3 faixas de tráfego + acostamento.
-MAX_TRAVEL_LANES = 3
-MAX_SHOULDERS = 1
+DEFAULT_HISTORY_SIZE = 8
 
-POLYNOMIAL_DEGREE = 3
+DEFAULT_MIN_POINTS = 4
 
-MIN_FIT_POINTS = 6
+DEFAULT_MATCH_DISTANCE = 90.0
 
-# Número máximo de frames em que uma faixa pode sobreviver
-# apenas através de projeção/histórico.
-MAX_MISSED_FRAMES = 8
+DEFAULT_MAX_MISSED_FRAMES = 8
 
-# Após este número de frames, a confiança cai fortemente.
-CONFIDENCE_DECAY = 0.82
+DEFAULT_MIN_STABLE_FRAMES = 3
 
-# Confiança mínima para considerar uma faixa rastreável.
-MIN_TRACK_CONFIDENCE = 0.30
+DEFAULT_CONFIDENCE_DECAY = 0.82
 
-# Confiança mínima para permitir projeção.
-MIN_PROJECTION_CONFIDENCE = 0.55
+DEFAULT_CONFIDENCE_RECOVERY = 0.35
 
-# Resolução vertical utilizada para produzir a curva.
-DEFAULT_SAMPLE_COUNT = 32
-
-# Resíduo máximo aceitável do ajuste normalizado.
-MAX_NORMALIZED_FIT_ERROR = 0.08
-
-# Distância horizontal máxima entre a previsão anterior
-# e uma nova detecção para permitir associação.
-MAX_ASSOCIATION_DISTANCE_RATIO = 0.16
-
-# Penalidade por mudança brusca de posição.
-POSITION_COST_WEIGHT = 1.0
-
-# Penalidade por mudança brusca de inclinação.
-SLOPE_COST_WEIGHT = 0.25
-
-# Quantidade de histórico geométrico armazenado.
-HISTORY_SIZE = 12
+DEFAULT_STABILITY_ALPHA = 0.35
 
 
-# ============================================================================
-# TIPOS
-# ============================================================================
-
-@dataclass
-class PolynomialModel:
-    """
-    Modelo x(y) de uma faixa.
-
-    coefficients:
-
-        [a, b, c, d]
-
-    representando:
-
-        x = a*y³ + b*y² + c*y + d
-
-    Os coeficientes usam Y normalizado entre 0 e 1.
-    """
-
-    coefficients: np.ndarray
-
-    degree: int = POLYNOMIAL_DEGREE
-
-    fit_error: float = float("inf")
-
-    valid: bool = False
-
-    def evaluate(
-        self,
-        y_normalized: np.ndarray | float,
-    ) -> np.ndarray | float:
-        """Avalia o polinômio."""
-
-        return np.polyval(
-            self.coefficients,
-            y_normalized,
-        )
-
-    def derivative(
-        self,
-        y_normalized: np.ndarray | float,
-    ) -> np.ndarray | float:
-        """Calcula dx/dy."""
-
-        derivative = np.polyder(
-            self.coefficients
-        )
-
-        return np.polyval(
-            derivative,
-            y_normalized,
-        )
+# =============================================================================
+# RESULTADOS
+# =============================================================================
 
 
 @dataclass
 class TrackedLane:
     """
-    Estado temporal de uma faixa.
+    Estado temporal de uma lane.
 
-    lane_id:
-        Identidade persistente da faixa.
-
-    points:
-        Pontos atualmente disponíveis.
-
-    polynomial:
-        Modelo cúbico da faixa.
-
-    observed:
-        Pelo menos parte da faixa foi realmente observada.
-
-    projected:
-        Parte da faixa foi completada matematicamente.
-
-    confidence:
-        Confiança atual do tracking.
-
-    missed_frames:
-        Frames consecutivos sem observação suficiente.
+    O objeto mantém apenas informações relacionadas ao tracking.
+    O modelo geométrico permanece em LaneModel.
     """
 
-    lane_id: int
+    track_id: int
 
-    points: List[LanePoint] = field(
-        default_factory=list
-    )
+    points: List[LanePoint] = field(default_factory=list)
 
-    polynomial: Optional[PolynomialModel] = None
-
-    observed: bool = False
-
-    projected: bool = False
+    model: Optional[LaneModel] = None
 
     confidence: float = 0.0
 
-    missed_frames: int = 0
+    stability: float = 0.0
 
     age: int = 0
 
-    last_y_min: float = 0.0
+    missed_frames: int = 0
 
-    last_y_max: float = 0.0
+    stable_frames: int = 0
 
-    history: List[
-        PolynomialModel
-    ] = field(default_factory=list)
+    detected_this_frame: bool = False
+
+    last_timestamp: float = 0.0
+
+    previous_center_x: Optional[float] = None
+
+    current_center_x: Optional[float] = None
 
     @property
     def valid(self) -> bool:
+        """
+        Indica se a lane possui informação útil neste momento.
+        """
+
+        return bool(
+            self.points
+            or self.model is not None
+        )
+
+    @property
+    def stable(self) -> bool:
+        """
+        Indica estabilidade temporal mínima.
+        """
+
+        return self.stable_frames >= DEFAULT_MIN_STABLE_FRAMES
+
+    @property
+    def lost(self) -> bool:
+        """
+        Indica se a lane ultrapassou o limite de frames perdidos.
+        """
+
         return (
-            self.polynomial is not None
-            and self.polynomial.valid
-            and self.confidence
-            >= MIN_TRACK_CONFIDENCE
+            self.missed_frames
+            > DEFAULT_MAX_MISSED_FRAMES
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class LaneTrackingResult:
     """
-    Resultado completo do tracking.
-
-    lanes:
-        Faixas rastreadas ordenadas da esquerda
-        para a direita.
-
-    active_lane_id:
-        Faixa que representa a faixa atualmente
-        ocupada pelo veículo, quando conhecida.
-
-    active_lane_index:
-        Índice da faixa ocupada na lista ordenada.
-
-    confidence:
-        Confiança global do tracking.
-
-    can_project:
-        Indica se existem informações suficientes
-        para projeção confiável.
-
-    safe_for_control:
-        Indica que o tracking possui qualidade mínima
-        para ser utilizado posteriormente pelo ADAS.
-
-    observed_lane_count:
-        Quantidade de faixas realmente observadas.
-
-    projected_lane_count:
-        Quantidade de faixas que possuem trechos
-        projetados.
+    Resultado de um ciclo de tracking.
     """
 
-    lanes: List[TrackedLane] = field(
-        default_factory=list
-    )
+    lanes: Tuple[TrackedLane, ...]
 
-    active_lane_id: Optional[int] = None
+    timestamp: float
 
-    active_lane_index: Optional[int] = None
+    frame_index: int
 
-    confidence: float = 0.0
+    valid: bool
 
-    can_project: bool = False
+    stable_count: int
 
-    safe_for_control: bool = False
+    detected_count: int
 
-    observed_lane_count: int = 0
-
-    projected_lane_count: int = 0
-
-    frame_width: int = 0
-
-    frame_height: int = 0
-
-    error: Optional[str] = None
-
-    @property
-    def valid(self) -> bool:
-        return (
-            self.safe_for_control
-        )
-
-    @property
-    def lane_count(self) -> int:
-        return len(self.lanes)
+    lost_count: int
 
 
-# ============================================================================
+# =============================================================================
 # TRACKER
-# ============================================================================
+# =============================================================================
+
 
 class LaneTracker:
     """
-    Rastreador temporal das faixas.
+    Mantém identidade temporal das lanes detectadas.
 
-    O detector fornece observações.
+    O tracker não tenta descobrir qual lane é a esquerda/direita
+    nem qual lane pertence ao veículo.
 
-    O tracker fornece continuidade.
+    Ele apenas responde:
 
-    Fluxo:
-
-        detector
-            ↓
-        observações
-            ↓
-        associação temporal
-            ↓
-        fitting cúbico
-            ↓
-        suavização
-            ↓
-        projeção
-            ↓
-        resultado temporal
+        "Esta observação provavelmente corresponde à mesma
+         lane observada anteriormente?"
     """
 
     def __init__(
         self,
-        max_lanes: int = MAX_LANES,
-        min_fit_points: int = MIN_FIT_POINTS,
-        max_missed_frames: int = MAX_MISSED_FRAMES,
-        confidence_decay: float = CONFIDENCE_DECAY,
-        projection_confidence: float = (
-            MIN_PROJECTION_CONFIDENCE
-        ),
-        sample_count: int = DEFAULT_SAMPLE_COUNT,
-        history_size: int = HISTORY_SIZE,
+        max_lanes: int = DEFAULT_MAX_LANES,
+        history_size: int = DEFAULT_HISTORY_SIZE,
+        min_points: int = DEFAULT_MIN_POINTS,
+        match_distance: float = DEFAULT_MATCH_DISTANCE,
+        max_missed_frames: int = DEFAULT_MAX_MISSED_FRAMES,
+        min_stable_frames: int = DEFAULT_MIN_STABLE_FRAMES,
+        confidence_decay: float = DEFAULT_CONFIDENCE_DECAY,
+        confidence_recovery: float = DEFAULT_CONFIDENCE_RECOVERY,
+        stability_alpha: float = DEFAULT_STABILITY_ALPHA,
     ) -> None:
 
         self.max_lanes = max(
-            2,
-            min(
-                int(max_lanes),
-                MAX_LANES,
-            ),
+            1,
+            int(max_lanes),
         )
 
-        self.min_fit_points = max(
-            4,
-            int(min_fit_points),
+        self.history_size = max(
+            1,
+            int(history_size),
+        )
+
+        self.min_points = max(
+            1,
+            int(min_points),
+        )
+
+        self.match_distance = max(
+            1.0,
+            float(match_distance),
         )
 
         self.max_missed_frames = max(
-            1,
+            0,
             int(max_missed_frames),
+        )
+
+        self.min_stable_frames = max(
+            1,
+            int(min_stable_frames),
         )
 
         self.confidence_decay = float(
             np.clip(
                 confidence_decay,
-                0.01,
-                0.99,
-            )
-        )
-
-        self.projection_confidence = float(
-            np.clip(
-                projection_confidence,
                 0.0,
                 1.0,
             )
         )
 
-        self.sample_count = max(
-            8,
-            int(sample_count),
+        self.confidence_recovery = float(
+            np.clip(
+                confidence_recovery,
+                0.0,
+                1.0,
+            )
         )
 
-        self.history_size = max(
-            2,
-            int(history_size),
+        self.stability_alpha = float(
+            np.clip(
+                stability_alpha,
+                0.0,
+                1.0,
+            )
         )
 
         self._tracks: Dict[
@@ -397,1165 +245,817 @@ class LaneTracker:
             TrackedLane,
         ] = {}
 
-        self._next_lane_id = 0
+        self._next_track_id = 0
 
         self._frame_index = 0
 
-        self._last_frame_width = 0
-
-        self._last_frame_height = 0
-
-        self._last_result: Optional[
-            LaneTrackingResult
+        self._last_timestamp: Optional[
+            float
         ] = None
 
-    # ========================================================================
-    # RESET
-    # ========================================================================
-
-    def reset(self) -> None:
-        """Apaga completamente o histórico temporal."""
-
-        self._tracks.clear()
-
-        self._next_lane_id = 0
-
-        self._frame_index = 0
-
-        self._last_result = None
-
-    # ========================================================================
+    # =========================================================================
     # UTILITÁRIOS
-    # ========================================================================
+    # =========================================================================
 
     @staticmethod
-    def _lane_center(
-        lane: Sequence[LanePoint],
-    ) -> Optional[float]:
+    def _safe_float(
+        value: object,
+        default: float = 0.0,
+    ) -> float:
 
-        if not lane:
-            return None
+        try:
+            result = float(value)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return default
 
-        xs = np.asarray(
-            [
-                point.x
-                for point in lane
-                if point.valid
-                and np.isfinite(point.x)
-                and np.isfinite(point.y)
-            ],
-            dtype=np.float64,
-        )
+        if not math.isfinite(result):
+            return default
 
-        if xs.size == 0:
-            return None
+        return result
+
+    @staticmethod
+    def _clip01(
+        value: float,
+    ) -> float:
 
         return float(
-            np.median(xs)
+            np.clip(
+                value,
+                0.0,
+                1.0,
+            )
         )
 
     @staticmethod
-    def _lane_y_range(
-        lane: Sequence[LanePoint],
-    ) -> Tuple[float, float]:
+    def _point_center_x(
+        points: Sequence[LanePoint],
+    ) -> Optional[float]:
+        """
+        Obtém o centro horizontal da observação.
 
-        ys = np.asarray(
-            [
-                point.y
-                for point in lane
-                if point.valid
-                and np.isfinite(point.y)
-            ],
-            dtype=np.float64,
+        É usado somente para associação temporal.
+        Não representa o centro da faixa do veículo.
+        """
+
+        valid = [
+            point
+            for point in points
+            if getattr(point, "valid", True)
+            and math.isfinite(
+                float(point.x)
+            )
+            and math.isfinite(
+                float(point.y)
+            )
+        ]
+
+        if not valid:
+            return None
+
+        # Preferimos os pontos próximos à região inferior da imagem,
+        # pois são normalmente mais úteis para associação temporal.
+        valid = sorted(
+            valid,
+            key=lambda point: float(point.y),
+            reverse=True,
         )
 
-        if ys.size == 0:
-            return 0.0, 0.0
+        sample = valid[
+            : max(
+                1,
+                min(
+                    5,
+                    len(valid),
+                ),
+            )
+        ]
 
-        return (
-            float(np.min(ys)),
-            float(np.max(ys)),
+        return float(
+            np.mean(
+                [
+                    float(point.x)
+                    for point in sample
+                ]
+            )
         )
 
     @staticmethod
-    def _sanitize_lane(
-        lane: Sequence[LanePoint],
+    def _lane_points(
+        lane: object,
     ) -> List[LanePoint]:
+        """
+        Extrai pontos de uma observação de forma compatível com
+        LaneLine e estruturas simples contendo `.points`.
+        """
 
-        result = []
+        points = getattr(
+            lane,
+            "points",
+            None,
+        )
 
-        for point in lane:
+        if points is None:
+            return []
 
-            if not point.valid:
+        result: List[LanePoint] = []
+
+        for point in points:
+
+            if not isinstance(
+                point,
+                LanePoint,
+            ):
                 continue
 
-            if not np.isfinite(point.x):
+            if not getattr(
+                point,
+                "valid",
+                True,
+            ):
                 continue
 
-            if not np.isfinite(point.y):
+            if not (
+                math.isfinite(
+                    float(point.x)
+                )
+                and math.isfinite(
+                    float(point.y)
+                )
+            ):
                 continue
 
             result.append(point)
 
-        result.sort(
-            key=lambda point: point.y
-        )
-
         return result
 
-    # ========================================================================
-    # POLINÔMIO
-    # ========================================================================
-
-    def _fit_polynomial(
-        self,
-        lane: Sequence[LanePoint],
-        frame_height: int,
-    ) -> Optional[PolynomialModel]:
-
-        if len(lane) < self.min_fit_points:
-            return None
-
-        if frame_height <= 1:
-            return None
-
-        y = np.asarray(
-            [
-                point.y
-                for point in lane
-            ],
-            dtype=np.float64,
-        )
-
-        x = np.asarray(
-            [
-                point.x
-                for point in lane
-            ],
-            dtype=np.float64,
-        )
-
-        y_normalized = np.clip(
-            y / float(frame_height - 1),
-            0.0,
-            1.0,
-        )
-
-        valid = (
-            np.isfinite(x)
-            & np.isfinite(y_normalized)
-        )
-
-        x = x[valid]
-        y_normalized = (
-            y_normalized[valid]
-        )
-
-        if x.size < self.min_fit_points:
-            return None
-
-        # Evita fitting cúbico em pontos praticamente
-        # horizontais no eixo Y.
-        if (
-            np.ptp(y_normalized)
-            < 0.05
-        ):
-            return None
-
-        try:
-
-            coefficients = np.polyfit(
-                y_normalized,
-                x,
-                POLYNOMIAL_DEGREE,
-            )
-
-            predicted = np.polyval(
-                coefficients,
-                y_normalized,
-            )
-
-            residual = (
-                np.sqrt(
-                    np.mean(
-                        (
-                            predicted - x
-                        ) ** 2
-                    )
-                )
-            )
-
-            frame_scale = max(
-                1.0,
-                float(
-                    np.max(
-                        x
-                    )
-                    - np.min(x)
-                ),
-            )
-
-            normalized_error = (
-                residual
-                / frame_scale
-            )
-
-            return PolynomialModel(
-                coefficients=np.asarray(
-                    coefficients,
-                    dtype=np.float64,
-                ),
-                degree=POLYNOMIAL_DEGREE,
-                fit_error=float(
-                    normalized_error
-                ),
-                valid=bool(
-                    np.all(
-                        np.isfinite(
-                            coefficients
-                        )
-                    )
-                ),
-            )
-
-        except (
-            np.linalg.LinAlgError,
-            ValueError,
-            FloatingPointError,
-        ):
-
-            return None
-
-    # ========================================================================
-    # SUAVIZAÇÃO
-    # ========================================================================
-
-    def _smooth_model(
-        self,
-        track: TrackedLane,
-        model: PolynomialModel,
-    ) -> PolynomialModel:
-
-        if (
-            track.polynomial is None
-            or not track.polynomial.valid
-        ):
-            return model
-
-        previous = (
-            track.polynomial.coefficients
-        )
-
-        current = (
-            model.coefficients
-        )
-
-        # Suavização temporal.
-        #
-        # Não usamos uma média muito agressiva porque
-        # isso atrasaria curvas.
-        alpha = 0.55
-
-        coefficients = (
-            alpha * current
-            + (1.0 - alpha) * previous
-        )
-
-        return PolynomialModel(
-            coefficients=coefficients,
-            degree=POLYNOMIAL_DEGREE,
-            fit_error=model.fit_error,
-            valid=True,
-        )
-
-    # ========================================================================
-    # PROJEÇÃO
-    # ========================================================================
-
-    def _project_points(
-        self,
-        model: PolynomialModel,
-        frame_width: int,
-        frame_height: int,
-        y_min: float,
-        y_max: float,
-    ) -> List[LanePoint]:
-
-        if not model.valid:
-            return []
-
-        if frame_height <= 1:
-            return []
-
-        y_values = np.linspace(
-            max(0.0, y_min),
-            min(
-                float(frame_height - 1),
-                y_max,
-            ),
-            self.sample_count,
-        )
-
-        y_normalized = (
-            y_values
-            / float(frame_height - 1)
-        )
-
-        x_values = model.evaluate(
-            y_normalized
-        )
-
-        points = []
-
-        for x, y in zip(
-            x_values,
-            y_values,
-        ):
-
-            if not (
-                np.isfinite(x)
-                and np.isfinite(y)
-            ):
-                continue
-
-            # Nunca permitir que a projeção
-            # saia completamente da imagem.
-            if (
-                x < -0.15 * frame_width
-                or x > 1.15 * frame_width
-            ):
-                continue
-
-            points.append(
-                LanePoint(
-                    x=float(x),
-                    y=float(y),
-                    confidence=0.0,
-                    valid=True,
-                )
-            )
-
-        return points
-
-    # ========================================================================
-    # ASSOCIAÇÃO
-    # ========================================================================
-
-    def _predicted_x(
-        self,
-        track: TrackedLane,
-        frame_height: int,
-        y: float,
-    ) -> Optional[float]:
-
-        if (
-            track.polynomial is None
-            or not track.polynomial.valid
-        ):
-            return None
-
-        if frame_height <= 1:
-            return None
-
-        yn = np.clip(
-            y / float(frame_height - 1),
-            0.0,
-            1.0,
-        )
-
-        value = track.polynomial.evaluate(
-            yn
-        )
-
-        if not np.isfinite(value):
-            return None
-
-        return float(value)
-
-    def _association_cost(
-        self,
-        track: TrackedLane,
-        lane: Sequence[LanePoint],
-        frame_width: int,
-        frame_height: int,
+    @staticmethod
+    def _lane_confidence(
+        lane: object,
+        points: Sequence[LanePoint],
     ) -> float:
+        """
+        Obtém confiança da observação.
 
-        center = self._lane_center(
-            lane
+        Usa a confiança explícita da lane quando disponível.
+        Caso contrário, calcula a média dos pontos.
+        """
+
+        confidence = getattr(
+            lane,
+            "confidence",
+            None,
         )
 
-        if center is None:
-            return float("inf")
+        if confidence is not None:
 
-        y_min, y_max = (
-            self._lane_y_range(lane)
-        )
+            try:
+                return float(
+                    np.clip(
+                        float(confidence),
+                        0.0,
+                        1.0,
+                    )
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
 
-        y_reference = (
-            y_max
-            if y_max > 0
-            else frame_height * 0.75
-        )
+        if not points:
+            return 0.0
 
-        predicted = self._predicted_x(
-            track,
-            frame_height,
-            y_reference,
-        )
+        values = []
 
-        if predicted is None:
+        for point in points:
 
-            # Faixa antiga sem modelo confiável.
-            #
-            # Utilizamos a última posição observada.
-            if track.points:
-                previous_center = (
-                    self._lane_center(
-                        track.points
+            try:
+                value = float(
+                    point.confidence
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            if math.isfinite(value):
+                values.append(
+                    np.clip(
+                        value,
+                        0.0,
+                        1.0,
                     )
                 )
 
-                if previous_center is not None:
-                    predicted = previous_center
+        if not values:
+            return 0.0
 
-        if predicted is None:
-            return float("inf")
-
-        position_error = abs(
-            center - predicted
+        return float(
+            np.mean(values)
         )
 
-        normalized_position_error = (
-            position_error
-            / max(
-                1.0,
-                float(frame_width),
-            )
-        )
-
-        # Inclinação aproximada.
-        slope_cost = 0.0
-
-        if (
-            len(lane) >= 2
-            and track.points
-        ):
-
-            new_first = lane[0]
-            new_last = lane[-1]
-
-            dy = (
-                new_last.y
-                - new_first.y
-            )
-
-            if abs(dy) > 1.0:
-
-                new_slope = (
-                    new_last.x
-                    - new_first.x
-                ) / dy
-
-                old_first = track.points[0]
-                old_last = track.points[-1]
-
-                old_dy = (
-                    old_last.y
-                    - old_first.y
-                )
-
-                if abs(old_dy) > 1.0:
-
-                    old_slope = (
-                        old_last.x
-                        - old_first.x
-                    ) / old_dy
-
-                    slope_cost = abs(
-                        new_slope
-                        - old_slope
-                    )
-
-        return (
-            POSITION_COST_WEIGHT
-            * normalized_position_error
-            + SLOPE_COST_WEIGHT
-            * slope_cost
-        )
-
-    # ========================================================================
-    # CRIAÇÃO DE TRACK
-    # ========================================================================
-
-    def _create_track(
+    def _new_track(
         self,
-        lane: Sequence[LanePoint],
-        frame_height: int,
+        points: Sequence[LanePoint],
+        confidence: float,
+        timestamp: float,
     ) -> TrackedLane:
 
-        lane = self._sanitize_lane(
-            lane
-        )
-
-        model = self._fit_polynomial(
-            lane,
-            frame_height,
-        )
-
         track = TrackedLane(
-            lane_id=self._next_lane_id,
-            points=list(lane),
-            polynomial=model,
-            observed=True,
-            projected=False,
-            confidence=(
-                self._initial_confidence(
-                    lane,
-                    model,
-                )
+            track_id=self._next_track_id,
+            points=list(points)[
+                -self.history_size:
+            ],
+            confidence=self._clip01(
+                confidence
             ),
-            missed_frames=0,
+            stability=0.0,
             age=1,
+            missed_frames=0,
+            stable_frames=1,
+            detected_this_frame=True,
+            last_timestamp=timestamp,
+            current_center_x=self._point_center_x(
+                points
+            ),
         )
 
-        if model is not None:
-            track.history.append(
-                model
-            )
-
-        self._next_lane_id += 1
+        self._next_track_id += 1
 
         return track
 
-    @staticmethod
-    def _initial_confidence(
-        lane: Sequence[LanePoint],
-        model: Optional[PolynomialModel],
+    # =========================================================================
+    # DISTÂNCIA DE ASSOCIAÇÃO
+    # =========================================================================
+
+    def _association_distance(
+        self,
+        track: TrackedLane,
+        points: Sequence[LanePoint],
     ) -> float:
 
-        if not lane:
-            return 0.0
-
-        point_score = min(
-            1.0,
-            len(lane) / 20.0,
+        current_x = self._point_center_x(
+            points
         )
 
-        fit_score = 0.0
+        if current_x is None:
+            return float("inf")
 
-        if (
-            model is not None
-            and model.valid
+        if track.current_center_x is None:
+            return float("inf")
+
+        return abs(
+            current_x
+            - track.current_center_x
+        )
+
+    # =========================================================================
+    # ASSOCIAÇÃO
+    # =========================================================================
+
+    def _associate(
+        self,
+        observations: Sequence[
+            Tuple[
+                Sequence[LanePoint],
+                float,
+            ]
+        ],
+    ) -> List[
+        Tuple[
+            Optional[int],
+            Sequence[LanePoint],
+            float,
+        ]
+    ]:
+
+        available_tracks = set(
+            self._tracks.keys()
+        )
+
+        matches = []
+
+        candidates = []
+
+        for observation_index, (
+            points,
+            confidence,
+        ) in enumerate(
+            observations
         ):
-            fit_score = max(
-                0.0,
-                1.0
-                - model.fit_error
-                / MAX_NORMALIZED_FIT_ERROR,
-            )
 
-        return float(
-            np.clip(
-                0.35 * point_score
-                + 0.65 * fit_score,
-                0.0,
-                1.0,
-            )
+            for track_id in available_tracks:
+
+                track = self._tracks[
+                    track_id
+                ]
+
+                distance = (
+                    self._association_distance(
+                        track,
+                        points,
+                    )
+                )
+
+                if distance <= self.match_distance:
+
+                    candidates.append(
+                        (
+                            distance,
+                            observation_index,
+                            track_id,
+                        )
+                    )
+
+        # Melhor correspondência primeiro.
+        candidates.sort(
+            key=lambda item: item[0]
         )
 
-    # ========================================================================
-    # ATUALIZAÇÃO DE TRACK
-    # ========================================================================
+        matched_observations = set()
+        matched_tracks = set()
+
+        for (
+            _distance,
+            observation_index,
+            track_id,
+        ) in candidates:
+
+            if observation_index in matched_observations:
+                continue
+
+            if track_id in matched_tracks:
+                continue
+
+            points, confidence = observations[
+                observation_index
+            ]
+
+            matches.append(
+                (
+                    track_id,
+                    points,
+                    confidence,
+                )
+            )
+
+            matched_observations.add(
+                observation_index
+            )
+
+            matched_tracks.add(
+                track_id
+            )
+
+        # Observações que não conseguiram associação
+        # recebem uma nova identidade.
+        for index, (
+            points,
+            confidence,
+        ) in enumerate(
+            observations
+        ):
+
+            if index in matched_observations:
+                continue
+
+            matches.append(
+                (
+                    None,
+                    points,
+                    confidence,
+                )
+            )
+
+        return matches
+
+    # =========================================================================
+    # ATUALIZAÇÃO
+    # =========================================================================
 
     def _update_track(
         self,
         track: TrackedLane,
-        lane: Sequence[LanePoint],
-        frame_width: int,
-        frame_height: int,
+        points: Sequence[LanePoint],
+        confidence: float,
+        timestamp: float,
     ) -> None:
 
-        lane = self._sanitize_lane(
-            lane
+        new_center = self._point_center_x(
+            points
         )
 
-        model = self._fit_polynomial(
-            lane,
-            frame_height,
+        previous_center = (
+            track.current_center_x
         )
 
-        if model is not None:
+        track.previous_center_x = (
+            previous_center
+        )
 
-            model = self._smooth_model(
-                track,
-                model,
-            )
+        track.current_center_x = (
+            new_center
+        )
 
-            track.polynomial = model
+        track.points = list(points)[
+            -self.history_size:
+        ]
 
-            track.history.append(
-                model
-            )
-
-            if len(track.history) > self.history_size:
-                track.history = (
-                    track.history[
-                        -self.history_size:
-                    ]
-                )
-
-        track.points = list(lane)
-
-        track.observed = True
-
-        track.projected = False
+        track.age += 1
 
         track.missed_frames = 0
 
-        track.age += 1
+        track.detected_this_frame = True
 
-        observed_confidence = (
-            self._initial_confidence(
-                lane,
-                model,
-            )
+        track.last_timestamp = timestamp
+
+        # ---------------------------------------------------------------------
+        # Confiança
+        # ---------------------------------------------------------------------
+
+        confidence = self._clip01(
+            confidence
         )
 
-        # A confiança não sobe instantaneamente.
-        # Isso evita que um frame isolado ruim
-        # cause uma mudança brusca.
         track.confidence = float(
-            np.clip(
-                0.65 * track.confidence
-                + 0.35
-                * observed_confidence,
-                0.0,
-                1.0,
+            (
+                (1.0 - self.confidence_recovery)
+                * track.confidence
+            )
+            + (
+                self.confidence_recovery
+                * confidence
             )
         )
 
-    # ========================================================================
-    # PERDA TEMPORÁRIA
-    # ========================================================================
+        # ---------------------------------------------------------------------
+        # Estabilidade
+        # ---------------------------------------------------------------------
 
-    def _predict_track(
+        if previous_center is None or new_center is None:
+
+            observation_stability = 0.0
+
+        else:
+
+            displacement = abs(
+                new_center
+                - previous_center
+            )
+
+            observation_stability = self._clip01(
+                1.0
+                - (
+                    displacement
+                    / self.match_distance
+                )
+            )
+
+        track.stability = float(
+            (
+                (1.0 - self.stability_alpha)
+                * track.stability
+            )
+            + (
+                self.stability_alpha
+                * observation_stability
+            )
+        )
+
+        if observation_stability >= 0.50:
+
+            track.stable_frames += 1
+
+        else:
+
+            track.stable_frames = max(
+                0,
+                track.stable_frames - 1,
+            )
+
+    def _mark_missed(
         self,
         track: TrackedLane,
-        frame_width: int,
-        frame_height: int,
-    ) -> bool:
+        timestamp: float,
+    ) -> None:
 
-        if (
-            track.polynomial is None
-            or not track.polynomial.valid
-        ):
-            return False
-
-        if (
-            track.missed_frames
-            >= self.max_missed_frames
-        ):
-            return False
+        track.detected_this_frame = False
 
         track.missed_frames += 1
 
-        track.age += 1
+        track.last_timestamp = timestamp
 
         track.confidence *= (
             self.confidence_decay
         )
 
-        # A projeção somente é válida enquanto
-        # ainda houver confiança suficiente.
-        if (
-            track.confidence
-            < self.projection_confidence
-        ):
-            track.projected = False
-            return False
+        track.stability *= 0.85
 
-        y_min = (
-            track.last_y_min
-            if track.last_y_min > 0
-            else 0.0
+        track.stable_frames = max(
+            0,
+            track.stable_frames - 1,
         )
 
-        y_max = (
-            track.last_y_max
-            if track.last_y_max > 0
-            else float(
-                frame_height - 1
-            )
+    # =========================================================================
+    # LIMPEZA
+    # =========================================================================
+
+    def _remove_expired_tracks(self) -> None:
+
+        expired = [
+            track_id
+            for track_id, track
+            in self._tracks.items()
+            if track.missed_frames
+            > self.max_missed_frames
+        ]
+
+        for track_id in expired:
+
+            del self._tracks[
+                track_id
+            ]
+
+    # =========================================================================
+    # NORMALIZAÇÃO DA ENTRADA
+    # =========================================================================
+
+    @staticmethod
+    def _extract_lanes(
+        detection_result: object,
+    ) -> Iterable[object]:
+        """
+        Extrai lanes do resultado do detector.
+
+        O tracker não depende de uma implementação específica
+        do detector além de `.lanes`.
+        """
+
+        lanes = getattr(
+            detection_result,
+            "lanes",
+            None,
         )
 
-        projected = self._project_points(
-            track.polynomial,
-            frame_width,
-            frame_height,
-            y_min,
-            y_max,
-        )
+        if lanes is None:
+            return []
 
-        if len(projected) < self.min_fit_points:
-            track.projected = False
-            return False
+        return lanes
 
-        track.points = projected
-
-        track.observed = False
-
-        track.projected = True
-
-        return True
-
-    # ========================================================================
-    # ORDENAÇÃO
-    # ========================================================================
-
-    def _sort_tracks(
+    def _prepare_observations(
         self,
-        tracks: Sequence[TrackedLane],
-    ) -> List[TrackedLane]:
+        detection_result: object,
+    ) -> List[
+        Tuple[
+            List[LanePoint],
+            float,
+        ]
+    ]:
 
-        return sorted(
-            tracks,
-            key=lambda track: (
-                self._lane_center(
-                    track.points
+        observations = []
+
+        for lane in self._extract_lanes(
+            detection_result
+        ):
+
+            points = self._lane_points(
+                lane
+            )
+
+            if len(points) < self.min_points:
+                continue
+
+            confidence = self._lane_confidence(
+                lane,
+                points,
+            )
+
+            observations.append(
+                (
+                    points,
+                    confidence,
                 )
-                if track.points
-                else float("inf")
-            ),
-        )
+            )
 
-    # ========================================================================
-    # PROCESSAMENTO PRINCIPAL
-    # ========================================================================
+        return observations
+
+    # =========================================================================
+    # UPDATE PÚBLICO
+    # =========================================================================
 
     def update(
         self,
-        detection: LaneDetectionResult,
-        frame_width: Optional[int] = None,
-        frame_height: Optional[int] = None,
+        detection_result: object,
+        timestamp: Optional[float] = None,
     ) -> LaneTrackingResult:
         """
         Atualiza o tracker com uma nova detecção.
 
-        Esta é a única função que o restante da arquitetura
-        precisa chamar.
+        Parameters
+        ----------
+        detection_result:
+            Resultado produzido pelo detector de lanes.
+
+        timestamp:
+            Timestamp monotônico opcional.
+
+        Returns
+        -------
+        LaneTrackingResult
         """
+
+        if timestamp is None:
+            timestamp = time.monotonic()
+
+        timestamp = self._safe_float(
+            timestamp,
+            time.monotonic(),
+        )
 
         self._frame_index += 1
 
-        if detection is None:
-            return self._failure_result(
-                "LaneDetectionResult é None."
-            )
+        self._last_timestamp = timestamp
 
-        width = int(
-            frame_width
-            or detection.input_width
-            or 0
+        observations = self._prepare_observations(
+            detection_result
         )
 
-        height = int(
-            frame_height
-            or detection.input_height
-            or 0
+        observations = observations[
+            : self.max_lanes
+        ]
+
+        matched = self._associate(
+            observations
         )
 
-        self._last_frame_width = width
-        self._last_frame_height = height
+        matched_track_ids = set()
 
-        try:
+        # ---------------------------------------------------------------------
+        # Atualiza tracks existentes / cria novas
+        # ---------------------------------------------------------------------
 
-            observations = [
-                self._sanitize_lane(
-                    lane
-                )
-                for lane in detection.lanes
-            ]
+        for (
+            track_id,
+            points,
+            confidence,
+        ) in matched:
 
-            observations = [
-                lane
-                for lane in observations
-                if len(lane) >= 2
-            ]
+            if track_id is None:
 
-            # Nunca ultrapassar o número físico
-            # máximo que definimos.
-            observations = observations[
-                :self.max_lanes
-            ]
-
-            existing_tracks = list(
-                self._tracks.values()
-            )
-
-            matched_tracks = set()
-
-            matched_observations = set()
-
-            # --------------------------------------------------------------
-            # Associação temporal.
-            #
-            # Primeiro encontramos os pares de menor custo.
-            # --------------------------------------------------------------
-
-            candidates = []
-
-            for track in existing_tracks:
-
-                for index, lane in enumerate(
-                    observations
-                ):
-
-                    if (
-                        track.lane_id
-                        in matched_tracks
-                    ):
-                        continue
-
-                    cost = (
-                        self._association_cost(
-                            track,
-                            lane,
-                            width,
-                            height,
-                        )
-                    )
-
-                    candidates.append(
-                        (
-                            cost,
-                            track,
-                            index,
-                        )
-                    )
-
-            candidates.sort(
-                key=lambda item: item[0]
-            )
-
-            max_cost = (
-                MAX_ASSOCIATION_DISTANCE_RATIO
-            )
-
-            for (
-                cost,
-                track,
-                observation_index,
-            ) in candidates:
-
-                if (
-                    track.lane_id
-                    in matched_tracks
-                ):
-                    continue
-
-                if (
-                    observation_index
-                    in matched_observations
-                ):
-                    continue
-
-                if cost > max_cost:
-                    continue
-
-                self._update_track(
-                    track,
-                    observations[
-                        observation_index
-                    ],
-                    width,
-                    height,
-                )
-
-                matched_tracks.add(
-                    track.lane_id
-                )
-
-                matched_observations.add(
-                    observation_index
-                )
-
-            # --------------------------------------------------------------
-            # Novas faixas.
-            # --------------------------------------------------------------
-
-            for index, lane in enumerate(
-                observations
-            ):
-
-                if index in matched_observations:
-                    continue
-
-                if len(self._tracks) >= self.max_lanes:
-                    break
-
-                track = self._create_track(
-                    lane,
-                    height,
-                )
-
-                track.last_y_min, track.last_y_max = (
-                    self._lane_y_range(lane)
+                track = self._new_track(
+                    points,
+                    confidence,
+                    timestamp,
                 )
 
                 self._tracks[
-                    track.lane_id
+                    track.track_id
                 ] = track
 
-            # --------------------------------------------------------------
-            # Faixas não observadas neste frame.
-            # --------------------------------------------------------------
-
-            for track in list(
-                self._tracks.values()
-            ):
-
-                if (
-                    track.lane_id
-                    in matched_tracks
-                ):
-                    continue
-
-                # Track recém-criada a partir de uma
-                # observação já foi tratada.
-                if (
-                    track.age == self._frame_index
-                    and track.missed_frames == 0
-                    and track.observed
-                ):
-                    continue
-
-                if not self._predict_track(
-                    track,
-                    width,
-                    height,
-                ):
-                    # Ainda não apagamos imediatamente.
-                    #
-                    # Um track inválido é removido aqui
-                    # somente quando excede o período máximo.
-                    if (
-                        track.missed_frames
-                        >= self.max_missed_frames
-                    ):
-                        del self._tracks[
-                            track.lane_id
-                        ]
-
-            # --------------------------------------------------------------
-            # Atualiza ranges.
-            # --------------------------------------------------------------
-
-            for track in self._tracks.values():
-
-                if track.points:
-
-                    (
-                        track.last_y_min,
-                        track.last_y_max,
-                    ) = self._lane_y_range(
-                        track.points
-                    )
-
-            tracks = self._sort_tracks(
-                list(
-                    self._tracks.values()
+                matched_track_ids.add(
+                    track.track_id
                 )
+
+                continue
+
+            track = self._tracks.get(
+                track_id
             )
 
-            # --------------------------------------------------------------
-            # Limpeza de tracks sem qualidade.
-            # --------------------------------------------------------------
+            if track is None:
+                continue
 
-            tracks = [
-                track
-                for track in tracks
-                if (
-                    track.valid
-                    or track.observed
-                )
-            ]
-
-            self._tracks = {
-                track.lane_id: track
-                for track in tracks
-            }
-
-            result = self._build_result(
-                tracks,
-                width,
-                height,
+            self._update_track(
+                track,
+                points,
+                confidence,
+                timestamp,
             )
 
-            self._last_result = result
-
-            return result
-
-        except Exception as exc:
-
-            logger.exception(
-                "[LANE TRACKER] Falha ao atualizar."
+            matched_track_ids.add(
+                track_id
             )
 
-            return self._failure_result(
-                f"{type(exc).__name__}: {exc}",
-                width,
-                height,
+        # ---------------------------------------------------------------------
+        # Tracks não observados neste frame
+        # ---------------------------------------------------------------------
+
+        for track_id, track in list(
+            self._tracks.items()
+        ):
+
+            if track_id in matched_track_ids:
+                continue
+
+            self._mark_missed(
+                track,
+                timestamp,
             )
 
-    # ========================================================================
-    # RESULTADO
-    # ========================================================================
+        # ---------------------------------------------------------------------
+        # Remove tracks expirados
+        # ---------------------------------------------------------------------
 
-    def _build_result(
-        self,
-        tracks: Sequence[TrackedLane],
-        frame_width: int,
-        frame_height: int,
-    ) -> LaneTrackingResult:
+        self._remove_expired_tracks()
 
-        tracks = self._sort_tracks(
-            tracks
+        # ---------------------------------------------------------------------
+        # Resultado
+        # ---------------------------------------------------------------------
+
+        tracks = tuple(
+            sorted(
+                self._tracks.values(),
+                key=lambda track: track.track_id,
+            )
         )
 
-        observed_count = sum(
+        stable_count = sum(
             1
             for track in tracks
-            if track.observed
+            if track.stable
         )
 
-        projected_count = sum(
+        detected_count = sum(
             1
             for track in tracks
-            if track.projected
+            if track.detected_this_frame
         )
 
-        if tracks:
-
-            confidence = float(
-                np.mean(
-                    [
-                        track.confidence
-                        for track in tracks
-                    ]
-                )
-            )
-
-        else:
-            confidence = 0.0
-
-        # Para o ADAS, não basta possuir uma única
-        # faixa matemática.
-        #
-        # Precisamos de duas referências laterais
-        # para definir uma faixa ocupada com segurança.
-        can_project = (
-            len(tracks) >= 2
-            and any(
-                track.observed
-                and track.confidence
-                >= self.projection_confidence
-                for track in tracks
-            )
+        lost_count = sum(
+            1
+            for track in tracks
+            if track.missed_frames > 0
         )
 
-        # Estado seguro para controle:
-        #
-        # - pelo menos duas linhas;
-        # - confiança global suficiente;
-        # - pelo menos uma das linhas observada;
-        # - não depender exclusivamente de projeções.
-        safe_for_control = (
-            len(tracks) >= 2
-            and confidence >= 0.50
-            and observed_count >= 1
-            and can_project
+        valid = bool(
+            detected_count > 0
         )
 
         return LaneTrackingResult(
-            lanes=list(tracks),
-            active_lane_id=None,
-            active_lane_index=None,
-            confidence=confidence,
-            can_project=can_project,
-            safe_for_control=safe_for_control,
-            observed_lane_count=observed_count,
-            projected_lane_count=projected_count,
-            frame_width=frame_width,
-            frame_height=frame_height,
-            error=None,
+            lanes=tracks,
+            timestamp=timestamp,
+            frame_index=self._frame_index,
+            valid=valid,
+            stable_count=stable_count,
+            detected_count=detected_count,
+            lost_count=lost_count,
         )
 
-    def _failure_result(
-        self,
-        error: str,
-        frame_width: int = 0,
-        frame_height: int = 0,
-    ) -> LaneTrackingResult:
+    # =========================================================================
+    # CONTROLE
+    # =========================================================================
 
-        return LaneTrackingResult(
-            lanes=[],
-            active_lane_id=None,
-            active_lane_index=None,
-            confidence=0.0,
-            can_project=False,
-            safe_for_control=False,
-            observed_lane_count=0,
-            projected_lane_count=0,
-            frame_width=frame_width,
-            frame_height=frame_height,
-            error=error,
-        )
+    def reset(self) -> None:
+        """
+        Remove todo o estado temporal.
+        """
 
-    # ========================================================================
-    # CONSULTA
-    # ========================================================================
+        self._tracks.clear()
+
+        self._next_track_id = 0
+
+        self._frame_index = 0
+
+        self._last_timestamp = None
+
+    # =========================================================================
+    # PROPRIEDADES
+    # =========================================================================
 
     @property
-    def last_result(
-        self,
-    ) -> Optional[LaneTrackingResult]:
-        """Último resultado produzido."""
+    def tracks(self) -> Tuple[TrackedLane, ...]:
+        """
+        Tracks atualmente mantidos.
+        """
 
-        return self._last_result
-
-    @property
-    def tracks(
-        self,
-    ) -> List[TrackedLane]:
-        """Lista atual de faixas rastreadas."""
-
-        return self._sort_tracks(
-            list(
-                self._tracks.values()
+        return tuple(
+            sorted(
+                self._tracks.values(),
+                key=lambda track: track.track_id,
             )
         )
 
+    @property
+    def active_count(self) -> int:
+        """
+        Número de tracks ativos.
+        """
 
-# ============================================================================
-# FACTORY
-# ============================================================================
+        return len(
+            self._tracks
+        )
 
-def create_default_lane_tracker(
-    **kwargs,
-) -> LaneTracker:
-    """
-    Cria o tracker padrão do projeto.
-    """
 
-    return LaneTracker(
-        **kwargs
-    )
-
+# =============================================================================
+# API PÚBLICA
+# =============================================================================
 
 __all__ = [
-    "PolynomialModel",
     "TrackedLane",
     "LaneTrackingResult",
     "LaneTracker",
-    "create_default_lane_tracker",
 ]
