@@ -60,7 +60,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .lane_projection import (
+from vision.lane_projection import (
     LaneProjectionResult,
     ProjectedLanePoint,
 )
