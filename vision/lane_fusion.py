@@ -1,62 +1,42 @@
 """
 vision/lane_fusion.py
 
-Fusão das linhas de faixa detectadas/projetadas.
-
-Pipeline:
-
-    YOLOP
-      ↓
-    LaneTracker
-      ↓
-    LaneGeometry
-      ↓
-    LaneProjection
-      ↓
-    LaneFusion
-      ↓
-    corredor da faixa
-      ↓
-    centro previsto da faixa
+Fusão das linhas esquerda/direita em um corredor de faixa.
 
 Responsabilidades:
-    - combinar esquerda e direita;
-    - aceitar linhas parcialmente projetadas;
+    - combinar as duas bordas;
+    - utilizar projeções quando disponíveis;
     - calcular o centro da faixa;
-    - verificar a largura da faixa;
-    - verificar consistência geométrica;
-    - produzir o centro ao longo de vários pontos Y;
-    - informar a qualidade da estimativa.
+    - validar largura;
+    - avaliar consistência;
+    - produzir pontos centrais;
+    - produzir confiança da fusão.
 
 Não faz:
     - inferência YOLOP;
-    - captura de tela;
-    - controle do volante;
-    - decisão de correção ADAS;
-    - classificação de estado ADAS.
-
-A ideia é que o ADAS só receba um corredor considerado
-geometricamente confiável.
+    - rastreamento temporal;
+    - associação de faixas;
+    - cálculo de posição do veículo;
+    - decisão ADAS.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .lane_types import LanePoint
 from .lane_projection import LaneProjectionResult
 
-
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
+# =============================================================================
 # CONFIGURAÇÃO
-# ============================================================================
+# =============================================================================
 
 DEFAULT_MIN_WIDTH = 40.0
 DEFAULT_MAX_WIDTH = 1600.0
@@ -64,24 +44,18 @@ DEFAULT_MAX_WIDTH = 1600.0
 DEFAULT_MIN_WIDTH_RATIO = 0.05
 DEFAULT_MAX_WIDTH_RATIO = 0.90
 
-DEFAULT_WIDTH_VARIATION = 0.45
+DEFAULT_MAX_WIDTH_VARIATION = 0.45
 
 DEFAULT_MIN_SAMPLES = 5
-
 DEFAULT_SAMPLE_STEP = 10
 
 
-# ============================================================================
-# RESULTADO
-# ============================================================================
-
+# =============================================================================
+# RESULTADOS
+# =============================================================================
 
 @dataclass
 class LaneCenterPoint:
-    """
-    Ponto do centro previsto da faixa.
-    """
-
     x: float
     y: float
 
@@ -97,56 +71,26 @@ class LaneCenterPoint:
 
 @dataclass
 class LaneFusionResult:
-    """
-    Resultado da fusão das linhas.
-
-    center_points:
-        Centro previsto da faixa ao longo do eixo Y.
-
-    left_points:
-        Linha esquerda utilizada.
-
-    right_points:
-        Linha direita utilizada.
-
-    valid:
-        Indica se existe um corredor confiável.
-
-    confidence:
-        Confiança global da fusão.
-    """
-
     center_points: List[LaneCenterPoint]
-
     left_points: List[LanePoint]
-
     right_points: List[LanePoint]
 
     lane_widths: List[float]
 
     confidence: float
-
     valid: bool
 
     left_available: bool
-
     right_available: bool
-
     both_sides_available: bool
 
     projected_left: bool
-
     projected_right: bool
 
     error: Optional[str] = None
 
     @property
     def center_lane(self) -> List[LanePoint]:
-        """
-        Compatibilidade com estruturas que trabalham
-        diretamente com LanePoint.
-        """
-
         return [
             LanePoint(
                 x=point.x,
@@ -159,31 +103,97 @@ class LaneFusionResult:
 
     @property
     def has_center(self) -> bool:
-        return bool(
-            self.center_points
+        return bool(self.center_points)
+
+
+# =============================================================================
+# UTILITÁRIOS
+# =============================================================================
+
+def _clip01(value: float) -> float:
+    if not np.isfinite(value):
+        return 0.0
+
+    return float(
+        np.clip(value, 0.0, 1.0)
+    )
+
+
+def _prepare_points(
+    points: Sequence[LanePoint],
+) -> Tuple[np.ndarray, np.ndarray]:
+
+    valid = [
+        point
+        for point in points
+        if point.valid
+        and np.isfinite(point.x)
+        and np.isfinite(point.y)
+    ]
+
+    if len(valid) < 2:
+        return (
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.float64),
         )
 
+    valid.sort(
+        key=lambda point: point.y
+    )
 
-# ============================================================================
+    y = np.asarray(
+        [point.y for point in valid],
+        dtype=np.float64,
+    )
+
+    x = np.asarray(
+        [point.x for point in valid],
+        dtype=np.float64,
+    )
+
+    unique_y, indices = np.unique(
+        y,
+        return_index=True,
+    )
+
+    return (
+        unique_y,
+        x[indices],
+    )
+
+
+def _points_confidence(
+    points: Sequence[LanePoint],
+) -> float:
+
+    values = [
+        float(point.confidence)
+        for point in points
+        if point.valid
+        and np.isfinite(point.confidence)
+    ]
+
+    if not values:
+        return 0.0
+
+    return _clip01(
+        float(np.mean(values))
+    )
+
+
+# =============================================================================
 # FUSÃO
-# ============================================================================
-
+# =============================================================================
 
 class LaneFusion:
     """
-    Constrói o corredor da faixa a partir das duas linhas.
+    Constrói o corredor central a partir das duas bordas.
 
-    A operação principal é:
+    Para cada Y:
 
-        centro(Y) = (esquerda(Y) + direita(Y)) / 2
+        center_x = (left_x + right_x) / 2
 
-    A largura também é monitorada:
-
-        largura(Y) = direita(Y) - esquerda(Y)
-
-    O sistema não aceita simplesmente qualquer par de linhas.
-    A largura precisa permanecer fisicamente plausível e
-    relativamente estável.
+        width = right_x - left_x
     """
 
     def __init__(
@@ -192,7 +202,9 @@ class LaneFusion:
         max_width: float = DEFAULT_MAX_WIDTH,
         min_width_ratio: float = DEFAULT_MIN_WIDTH_RATIO,
         max_width_ratio: float = DEFAULT_MAX_WIDTH_RATIO,
-        max_width_variation: float = DEFAULT_WIDTH_VARIATION,
+        max_width_variation: float = (
+            DEFAULT_MAX_WIDTH_VARIATION
+        ),
         min_samples: int = DEFAULT_MIN_SAMPLES,
         sample_step: int = DEFAULT_SAMPLE_STEP,
     ) -> None:
@@ -223,12 +235,9 @@ class LaneFusion:
             )
         )
 
-        self.max_width_variation = float(
-            np.clip(
-                max_width_variation,
-                0.01,
-                2.0,
-            )
+        self.max_width_variation = max(
+            0.01,
+            float(max_width_variation),
         )
 
         self.min_samples = max(
@@ -241,80 +250,17 @@ class LaneFusion:
             int(sample_step),
         )
 
-    # ========================================================================
-    # INTERPOLAÇÃO
-    # ========================================================================
+        self.last_result: Optional[
+            LaneFusionResult
+        ] = None
 
-    @staticmethod
-    def _prepare_line(
-        points: Sequence[LanePoint],
-    ) -> tuple[np.ndarray, np.ndarray]:
-
-        valid = [
-            point
-            for point in points
-            if point.valid
-            and np.isfinite(point.x)
-            and np.isfinite(point.y)
-        ]
-
-        if len(valid) < 2:
-            return (
-                np.empty(0),
-                np.empty(0),
-            )
-
-        valid = sorted(
-            valid,
-            key=lambda point: point.y,
-        )
-
-        y_values = np.asarray(
-            [point.y for point in valid],
-            dtype=np.float64,
-        )
-
-        x_values = np.asarray(
-            [point.x for point in valid],
-            dtype=np.float64,
-        )
-
-        unique_y, indices = np.unique(
-            y_values,
-            return_index=True,
-        )
-
-        x_values = x_values[
-            indices
-        ]
-
-        return (
-            unique_y,
-            x_values,
-        )
-
-    @staticmethod
-    def _interpolate(
-        y: np.ndarray,
-        line_y: np.ndarray,
-        line_x: np.ndarray,
-    ) -> np.ndarray:
-
-        return np.interp(
-            y,
-            line_y,
-            line_x,
-        )
-
-    # ========================================================================
-    # PONTOS DE PROJEÇÃO
-    # ========================================================================
+    # =========================================================================
+    # PROJEÇÃO
+    # =========================================================================
 
     @staticmethod
     def _projection_points(
-        projection: Optional[
-            LaneProjectionResult
-        ],
+        projection: Optional[LaneProjectionResult],
     ) -> List[LanePoint]:
 
         if projection is None:
@@ -323,25 +269,45 @@ class LaneFusion:
         if not projection.valid:
             return []
 
-        return list(
-            projection.points
+        return [
+            point
+            for point in projection.points
+            if point.valid
+        ]
+
+    def _select_points(
+        self,
+        points: Sequence[LanePoint],
+        projection: Optional[LaneProjectionResult],
+    ) -> Tuple[List[LanePoint], bool]:
+
+        projected = self._projection_points(
+            projection
         )
 
-    # ========================================================================
-    # CONSTRUÇÃO DO EIXO Y
-    # ========================================================================
+        if projected:
+            return projected, True
 
-    def _build_sampling_axis(
+        return list(points), False
+
+    # =========================================================================
+    # AMOSTRAGEM
+    # =========================================================================
+
+    def _build_axis(
         self,
         left_y: np.ndarray,
         right_y: np.ndarray,
     ) -> np.ndarray:
 
         if (
-            left_y.size == 0
-            or right_y.size == 0
+            left_y.size < 2
+            or right_y.size < 2
         ):
-            return np.empty(0)
+            return np.empty(
+                0,
+                dtype=np.float64,
+            )
 
         y_min = max(
             float(np.min(left_y)),
@@ -354,34 +320,35 @@ class LaneFusion:
         )
 
         if y_max <= y_min:
-            return np.empty(0)
+            return np.empty(
+                0,
+                dtype=np.float64,
+            )
 
         count = max(
             self.min_samples,
             int(
-                (
-                    y_max - y_min
-                )
+                (y_max - y_min)
                 / self.sample_step
-            )
-            + 1,
+            ) + 1,
         )
 
         return np.linspace(
             y_min,
             y_max,
             count,
+            dtype=np.float64,
         )
 
-    # ========================================================================
-    # LARGURA
-    # ========================================================================
+    # =========================================================================
+    # VALIDAÇÃO
+    # =========================================================================
 
     def _validate_widths(
         self,
         widths: np.ndarray,
         image_width: int,
-    ) -> tuple[bool, float]:
+    ) -> Tuple[bool, float]:
 
         if widths.size < self.min_samples:
             return False, 0.0
@@ -391,26 +358,22 @@ class LaneFusion:
         ):
             return False, 0.0
 
-        minimum_allowed = max(
+        minimum = max(
             self.min_width,
             image_width
             * self.min_width_ratio,
         )
 
-        maximum_allowed = min(
+        maximum = min(
             self.max_width,
             image_width
             * self.max_width_ratio,
         )
 
-        if np.any(
-            widths < minimum_allowed
-        ):
+        if np.any(widths < minimum):
             return False, 0.0
 
-        if np.any(
-            widths > maximum_allowed
-        ):
+        if np.any(widths > maximum):
             return False, 0.0
 
         mean_width = float(
@@ -431,26 +394,22 @@ class LaneFusion:
         ):
             return False, 0.0
 
-        stability = float(
-            np.clip(
-                1.0
-                - (
-                    variation
-                    / self.max_width_variation
-                ),
-                0.0,
-                1.0,
+        stability = _clip01(
+            1.0
+            - (
+                variation
+                / self.max_width_variation
             )
         )
 
         return True, stability
 
-    # ========================================================================
+    # =========================================================================
     # CONFIANÇA
-    # ========================================================================
+    # =========================================================================
 
     @staticmethod
-    def _confidence(
+    def _calculate_confidence(
         left_confidence: float,
         right_confidence: float,
         width_stability: float,
@@ -458,48 +417,23 @@ class LaneFusion:
     ) -> float:
 
         line_confidence = (
-            float(
-                np.clip(
-                    left_confidence,
-                    0.0,
-                    1.0,
-                )
-            )
-            +
-            float(
-                np.clip(
-                    right_confidence,
-                    0.0,
-                    1.0,
-                )
-            )
+            _clip01(left_confidence)
+            + _clip01(right_confidence)
         ) / 2.0
 
-        sample_score = float(
-            np.clip(
-                sample_count / 30.0,
-                0.0,
-                1.0,
-            )
+        sample_score = _clip01(
+            sample_count / 30.0
         )
 
-        confidence = (
-            0.45 * line_confidence
+        return _clip01(
+            0.50 * line_confidence
             + 0.35 * width_stability
-            + 0.20 * sample_score
+            + 0.15 * sample_score
         )
 
-        return float(
-            np.clip(
-                confidence,
-                0.0,
-                1.0,
-            )
-        )
-
-    # ========================================================================
-    # FUSÃO PRINCIPAL
-    # ========================================================================
+    # =========================================================================
+    # API PRINCIPAL
+    # =========================================================================
 
     def fuse(
         self,
@@ -527,39 +461,26 @@ class LaneFusion:
                     "image_height inválido."
                 )
 
-            # ---------------------------------------------------------------
-            # Se houver projeção válida, ela passa a representar a
-            # continuação da linha.
-            # ---------------------------------------------------------------
-
-            effective_left = (
-                self._projection_points(
-                    left_projection
-                )
-                if left_projection is not None
-                and left_projection.valid
-                else list(left_points)
-            )
-
-            effective_right = (
-                self._projection_points(
-                    right_projection
-                )
-                if right_projection is not None
-                and right_projection.valid
-                else list(right_points)
-            )
-
-            left_y, left_x = (
-                self._prepare_line(
-                    effective_left
+            effective_left, projected_left = (
+                self._select_points(
+                    left_points,
+                    left_projection,
                 )
             )
 
-            right_y, right_x = (
-                self._prepare_line(
-                    effective_right
+            effective_right, projected_right = (
+                self._select_points(
+                    right_points,
+                    right_projection,
                 )
+            )
+
+            left_y, left_x = _prepare_points(
+                effective_left
+            )
+
+            right_y, right_x = _prepare_points(
+                effective_right
             )
 
             if (
@@ -567,44 +488,39 @@ class LaneFusion:
                 or right_y.size < 2
             ):
                 raise ValueError(
-                    "Não existem duas linhas "
-                    "suficientemente definidas."
+                    "Linhas insuficientes para fusão."
                 )
 
-            y = self._build_sampling_axis(
+            y = self._build_axis(
                 left_y,
                 right_y,
             )
 
             if y.size < self.min_samples:
                 raise ValueError(
-                    "Trecho comum entre as linhas "
-                    "é insuficiente."
+                    "Região comum insuficiente."
                 )
 
-            sampled_left = self._interpolate(
+            sampled_left = np.interp(
                 y,
                 left_y,
                 left_x,
             )
 
-            sampled_right = self._interpolate(
+            sampled_right = np.interp(
                 y,
                 right_y,
                 right_x,
             )
 
-            # ---------------------------------------------------------------
-            # A esquerda precisa permanecer à esquerda.
-            # ---------------------------------------------------------------
-
+            # Nunca aceitar linhas cruzadas.
             if np.any(
                 sampled_left
                 >= sampled_right
             ):
                 raise ValueError(
                     "Linhas esquerda/direita "
-                    "cruzaram."
+                    "cruzadas."
                 )
 
             widths = (
@@ -622,12 +538,8 @@ class LaneFusion:
             if not width_valid:
                 raise ValueError(
                     "Largura da faixa "
-                    "geometricamente inconsistente."
+                    "inconsistente."
                 )
-
-            # ---------------------------------------------------------------
-            # Centro geométrico.
-            # ---------------------------------------------------------------
 
             center_x = (
                 sampled_left
@@ -637,8 +549,7 @@ class LaneFusion:
             if np.any(
                 center_x < 0.0
             ) or np.any(
-                center_x
-                >= image_width
+                center_x >= image_width
             ):
                 raise ValueError(
                     "Centro da faixa "
@@ -646,139 +557,167 @@ class LaneFusion:
                 )
 
             left_confidence = (
-                float(
-                    np.mean(
-                        [
-                            p.confidence
-                            for p in effective_left
-                            if p.valid
-                        ]
-                    )
+                _points_confidence(
+                    effective_left
                 )
-                if effective_left
-                else 0.0
             )
 
             right_confidence = (
-                float(
-                    np.mean(
-                        [
-                            p.confidence
-                            for p in effective_right
-                            if p.valid
-                        ]
-                    )
-                )
-                if effective_right
-                else 0.0
-            )
-
-            confidence = self._confidence(
-                left_confidence,
-                right_confidence,
-                width_stability,
-                len(y),
-            )
-
-            center_points = []
-
-            for index in range(
-                len(y)
-            ):
-
-                center_points.append(
-                    LaneCenterPoint(
-                        x=float(
-                            center_x[index]
-                        ),
-                        y=float(
-                            y[index]
-                        ),
-                        left_x=float(
-                            sampled_left[index]
-                        ),
-                        right_x=float(
-                            sampled_right[index]
-                        ),
-                        width=float(
-                            widths[index]
-                        ),
-                        confidence=confidence,
-                        valid=True,
-                    )
-                )
-
-            return LaneFusionResult(
-                center_points=center_points,
-                left_points=list(
-                    effective_left
-                ),
-                right_points=list(
+                _points_confidence(
                     effective_right
-                ),
+                )
+            )
+
+            confidence = (
+                self._calculate_confidence(
+                    left_confidence,
+                    right_confidence,
+                    width_stability,
+                    len(y),
+                )
+            )
+
+            center_points = [
+                LaneCenterPoint(
+                    x=float(center_x[i]),
+                    y=float(y[i]),
+                    left_x=float(
+                        sampled_left[i]
+                    ),
+                    right_x=float(
+                        sampled_right[i]
+                    ),
+                    width=float(widths[i]),
+                    confidence=confidence,
+                    valid=True,
+                )
+                for i in range(len(y))
+            ]
+
+            result = LaneFusionResult(
+                center_points=center_points,
+                left_points=effective_left,
+                right_points=effective_right,
                 lane_widths=[
                     float(width)
                     for width in widths
                 ],
                 confidence=confidence,
                 valid=True,
-                left_available=True,
-                right_available=True,
+                left_available=bool(
+                    effective_left
+                ),
+                right_available=bool(
+                    effective_right
+                ),
                 both_sides_available=True,
-                projected_left=(
-                    left_projection is not None
-                    and left_projection.valid
-                ),
-                projected_right=(
-                    right_projection is not None
-                    and right_projection.valid
-                ),
+                projected_left=projected_left,
+                projected_right=projected_right,
                 error=None,
             )
 
+            self.last_result = result
+
+            return result
+
         except Exception as exc:
 
-            logger.debug(
-                "[LANE FUSION] "
-                "Fusão rejeitada: %s",
-                exc,
+            error = (
+                f"{type(exc).__name__}: {exc}"
             )
 
-            return LaneFusionResult(
+            logger.warning(
+                "[LANE_FUSION] %s",
+                error,
+            )
+
+            result = LaneFusionResult(
                 center_points=[],
-                left_points=[],
-                right_points=[],
+                left_points=list(left_points),
+                right_points=list(right_points),
                 lane_widths=[],
                 confidence=0.0,
                 valid=False,
-                left_available=False,
-                right_available=False,
-                both_sides_available=False,
+                left_available=bool(left_points),
+                right_available=bool(right_points),
+                both_sides_available=(
+                    bool(left_points)
+                    and bool(right_points)
+                ),
                 projected_left=False,
                 projected_right=False,
-                error=(
-                    f"{type(exc).__name__}: {exc}"
-                ),
+                error=error,
             )
 
+            self.last_result = result
 
-# ============================================================================
+            return result
+
+    # =========================================================================
+    # COMPATIBILIDADE
+    # =========================================================================
+
+    def update(
+        self,
+        left_points: Sequence[LanePoint],
+        right_points: Sequence[LanePoint],
+        image_width: int,
+        image_height: int,
+        left_projection: Optional[
+            LaneProjectionResult
+        ] = None,
+        right_projection: Optional[
+            LaneProjectionResult
+        ] = None,
+    ) -> LaneFusionResult:
+
+        return self.fuse(
+            left_points=left_points,
+            right_points=right_points,
+            image_width=image_width,
+            image_height=image_height,
+            left_projection=left_projection,
+            right_projection=right_projection,
+        )
+
+    def process(
+        self,
+        left_points: Sequence[LanePoint],
+        right_points: Sequence[LanePoint],
+        image_width: int,
+        image_height: int,
+        left_projection: Optional[
+            LaneProjectionResult
+        ] = None,
+        right_projection: Optional[
+            LaneProjectionResult
+        ] = None,
+    ) -> LaneFusionResult:
+
+        return self.fuse(
+            left_points=left_points,
+            right_points=right_points,
+            image_width=image_width,
+            image_height=image_height,
+            left_projection=left_projection,
+            right_projection=right_projection,
+        )
+
+
+# =============================================================================
 # FACTORY
-# ============================================================================
+# =============================================================================
 
-
-def create_default_fusion(
+def create_default_lane_fusion(
     **kwargs,
 ) -> LaneFusion:
 
-    return LaneFusion(
-        **kwargs
-    )
+    return LaneFusion(**kwargs)
 
 
 __all__ = [
     "LaneCenterPoint",
     "LaneFusionResult",
     "LaneFusion",
-    "create_default_fusion",
+    "create_default_lane_fusion",
 ]

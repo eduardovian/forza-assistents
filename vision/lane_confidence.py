@@ -1,541 +1,927 @@
 """
 vision/lane_confidence.py
 
-Avaliação centralizada da confiança da percepção de lanes.
+Avaliação de confiança da percepção de lanes.
 
 Responsabilidades:
-    LaneModel(s)
-        ↓
-    qualidade geométrica
-        +
-    confiança das lanes
-        +
-    estabilidade temporal
-        +
-    observação direta/projeção
-        ↓
-    LaneConfidenceResult
+    - avaliar qualidade das linhas;
+    - avaliar qualidade geométrica;
+    - avaliar estabilidade temporal;
+    - avaliar qualidade da projeção;
+    - produzir confiança global;
+    - determinar se a percepção é segura para ADAS.
 
-Este módulo NÃO:
-    - executa inferência;
-    - rastreia lanes;
-    - identifica a faixa atual;
-    - calcula posição do veículo;
-    - decide atuação ADAS;
-    - controla o veículo.
-
-A decisão de atuação será responsabilidade de:
-    adas_decision.py
-    safety_gate.py
+Não executa:
+    - inferência;
+    - tracking;
+    - projeção;
+    - associação;
+    - decisão ADAS.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from enum import IntEnum
+from typing import Optional, Sequence
 
 import numpy as np
 
-from .lane_types import LaneModel, LaneQuality
+from .lane_types import (
+    LaneGeometry,
+    LaneLine,
+    LaneModel,
+    LaneQuality,
+    ProjectionQuality,
+)
 
 
 # =============================================================================
 # CONFIGURAÇÃO
 # =============================================================================
 
-DEFAULT_MIN_SCORE = 0.55
-DEFAULT_MIN_OBSERVED_LANES = 1
-DEFAULT_MIN_STABLE_LANES = 1
+DEFAULT_MIN_CONFIDENCE = 0.55
+DEFAULT_SAFE_CONFIDENCE = 0.70
+DEFAULT_HIGH_CONFIDENCE = 0.85
+
+DEFAULT_MIN_POINTS = 5
+DEFAULT_GOOD_POINTS = 12
+DEFAULT_EXCELLENT_POINTS = 24
+
+DEFAULT_MAX_FIT_ERROR = 30.0
+DEFAULT_GOOD_FIT_ERROR = 15.0
+DEFAULT_EXCELLENT_FIT_ERROR = 7.5
+
+DEFAULT_MAX_MISSED_FRAMES = 5
+DEFAULT_MAX_AGE_FRAMES = 120
+
+DEFAULT_MIN_LANE_WIDTH = 30.0
+DEFAULT_MAX_LANE_WIDTH = 1800.0
+
+DEFAULT_MAX_OFFSET = 1.25
 
 
 # =============================================================================
-# RESULTADO
+# NÍVEIS
 # =============================================================================
 
+class ConfidenceLevel(IntEnum):
+    INVALID = 0
+    POOR = 1
+    PARTIAL = 2
+    GOOD = 3
+    HIGH = 4
 
-@dataclass(frozen=True)
+
+# =============================================================================
+# RESULTADOS
+# =============================================================================
+
+@dataclass
 class LaneConfidenceResult:
-    """
-    Resultado consolidado da avaliação de confiança das lanes.
+    confidence: float
+    level: ConfidenceLevel
 
-    score:
-        Confiança agregada [0, 1].
+    detection_score: float
+    geometry_score: float
+    tracking_score: float
+    projection_score: float
+    consistency_score: float
 
-    lane_count:
-        Quantidade de LaneModel válidos considerados.
+    valid: bool
+    safe_for_adas: bool
 
-    stable_count:
-        Quantidade de lanes consideradas estáveis.
+    reason: Optional[str] = None
 
-    observed_count:
-        Quantidade de lanes observadas diretamente.
 
-    projected_count:
-        Quantidade de lanes que possuem informação projetada.
+@dataclass
+class SceneConfidenceResult:
+    confidence: float
+    level: ConfidenceLevel
 
-    valid:
-        Indica se a percepção possui qualidade mínima.
+    lane_score: float
+    geometry_score: float
+    tracking_score: float
+    projection_score: float
+    consistency_score: float
 
-    safe_for_adas:
-        Indica se a percepção possui qualidade suficiente para
-        ser considerada pela camada de segurança.
+    valid: bool
+    safe_for_adas: bool
 
-    """
+    reason: Optional[str] = None
 
-    score: float = 0.0
 
-    lane_count: int = 0
+# =============================================================================
+# UTILITÁRIOS
+# =============================================================================
 
-    stable_count: int = 0
+def _clip01(value: float) -> float:
+    if not np.isfinite(value):
+        return 0.0
 
-    observed_count: int = 0
+    return float(
+        np.clip(value, 0.0, 1.0)
+    )
 
-    projected_count: int = 0
 
-    valid: bool = False
+def _mean_confidence(
+    points,
+) -> float:
 
-    safe_for_adas: bool = False
+    values = []
+
+    for point in points:
+
+        if not point.valid:
+            continue
+
+        value = float(
+            point.confidence
+        )
+
+        if np.isfinite(value):
+            values.append(
+                np.clip(
+                    value,
+                    0.0,
+                    1.0,
+                )
+            )
+
+    if not values:
+        return 0.0
+
+    return float(
+        np.mean(values)
+    )
 
 
 # =============================================================================
 # AVALIADOR
 # =============================================================================
 
-
-class LaneConfidenceEvaluator:
+class LaneConfidence:
     """
-    Avalia a confiabilidade global das lanes detectadas.
+    Calcula a confiança da percepção de lanes.
 
-    A avaliação combina:
+    A confiança é deliberadamente conservadora.
 
-        1. confiança dos LaneModel;
-        2. qualidade geométrica;
-        3. estabilidade temporal;
-        4. observação direta.
-
-    A confiança resultante NÃO representa uma probabilidade estatística.
-    É um score operacional para o pipeline ADAS.
+    Uma detecção pode ser visualmente plausível, mas ainda assim
+    não ser considerada segura para atuação do ADAS.
     """
 
     def __init__(
         self,
-        min_score: float = DEFAULT_MIN_SCORE,
-        min_observed_lanes: int = DEFAULT_MIN_OBSERVED_LANES,
-        min_stable_lanes: int = DEFAULT_MIN_STABLE_LANES,
+        min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+        safe_confidence: float = DEFAULT_SAFE_CONFIDENCE,
+        high_confidence: float = DEFAULT_HIGH_CONFIDENCE,
+        min_points: int = DEFAULT_MIN_POINTS,
+        good_points: int = DEFAULT_GOOD_POINTS,
+        excellent_points: int = DEFAULT_EXCELLENT_POINTS,
+        max_fit_error: float = DEFAULT_MAX_FIT_ERROR,
+        good_fit_error: float = DEFAULT_GOOD_FIT_ERROR,
+        excellent_fit_error: float = DEFAULT_EXCELLENT_FIT_ERROR,
+        max_missed_frames: int = DEFAULT_MAX_MISSED_FRAMES,
+        max_age_frames: int = DEFAULT_MAX_AGE_FRAMES,
+        min_lane_width: float = DEFAULT_MIN_LANE_WIDTH,
+        max_lane_width: float = DEFAULT_MAX_LANE_WIDTH,
+        max_offset: float = DEFAULT_MAX_OFFSET,
     ) -> None:
 
-        self.min_score = float(
+        self.min_confidence = float(
             np.clip(
-                min_score,
+                min_confidence,
                 0.0,
                 1.0,
             )
         )
 
-        self.min_observed_lanes = max(
-            0,
-            int(min_observed_lanes),
-        )
-
-        self.min_stable_lanes = max(
-            0,
-            int(min_stable_lanes),
-        )
-
-    # =========================================================================
-    # HELPERS
-    # =========================================================================
-
-    @staticmethod
-    def _clip01(
-        value: float,
-    ) -> float:
-        """
-        Limita um valor ao intervalo [0, 1].
-        """
-
-        try:
-            value = float(value)
-        except (
-            TypeError,
-            ValueError,
-        ):
-            return 0.0
-
-        if not np.isfinite(value):
-            return 0.0
-
-        return float(
+        self.safe_confidence = float(
             np.clip(
-                value,
-                0.0,
+                safe_confidence,
+                self.min_confidence,
                 1.0,
             )
         )
 
-    @staticmethod
-    def _quality_score(
-        quality: LaneQuality,
-    ) -> float:
-        """
-        Converte qualidade geométrica em score numérico.
-        """
+        self.high_confidence = float(
+            np.clip(
+                high_confidence,
+                self.safe_confidence,
+                1.0,
+            )
+        )
 
-        mapping = {
-            LaneQuality.NONE: 0.0,
-            LaneQuality.POOR: 0.25,
-            LaneQuality.PARTIAL: 0.50,
-            LaneQuality.GOOD: 0.78,
-            LaneQuality.EXCELLENT: 1.0,
+        self.min_points = max(
+            1,
+            int(min_points),
+        )
+
+        self.good_points = max(
+            self.min_points,
+            int(good_points),
+        )
+
+        self.excellent_points = max(
+            self.good_points,
+            int(excellent_points),
+        )
+
+        self.max_fit_error = max(
+            0.001,
+            float(max_fit_error),
+        )
+
+        self.good_fit_error = max(
+            0.001,
+            min(
+                float(good_fit_error),
+                self.max_fit_error,
+            ),
+        )
+
+        self.excellent_fit_error = max(
+            0.001,
+            min(
+                float(excellent_fit_error),
+                self.good_fit_error,
+            ),
+        )
+
+        self.max_missed_frames = max(
+            0,
+            int(max_missed_frames),
+        )
+
+        self.max_age_frames = max(
+            1,
+            int(max_age_frames),
+        )
+
+        self.min_lane_width = max(
+            1.0,
+            float(min_lane_width),
+        )
+
+        self.max_lane_width = max(
+            self.min_lane_width,
+            float(max_lane_width),
+        )
+
+        self.max_offset = max(
+            0.01,
+            float(max_offset),
+        )
+
+        self.last_result: Optional[
+            SceneConfidenceResult
+        ] = None
+
+    # =========================================================================
+    # LINHA
+    # =========================================================================
+
+    def _point_score(
+        self,
+        line: LaneLine,
+    ) -> float:
+
+        count = line.point_count()
+
+        if count < self.min_points:
+            return 0.0
+
+        if count >= self.excellent_points:
+            return 1.0
+
+        if count >= self.good_points:
+
+            ratio = (
+                count
+                - self.good_points
+            ) / max(
+                1,
+                self.excellent_points
+                - self.good_points,
+            )
+
+            return 0.75 + (
+                0.25 * _clip01(ratio)
+            )
+
+        ratio = (
+            count
+            - self.min_points
+        ) / max(
+            1,
+            self.good_points
+            - self.min_points,
+        )
+
+        return 0.50 + (
+            0.25 * _clip01(ratio)
+        )
+
+    def _direct_detection_score(
+        self,
+        line: LaneLine,
+    ) -> float:
+
+        if not line.valid:
+            return 0.0
+
+        confidence = _clip01(
+            float(line.confidence)
+        )
+
+        point_score = self._point_score(
+            line
+        )
+
+        direct_score = (
+            1.0
+            if line.detected_directly
+            else 0.55
+        )
+
+        return _clip01(
+            0.60 * confidence
+            + 0.25 * point_score
+            + 0.15 * direct_score
+        )
+
+    # =========================================================================
+    # MODELO
+    # =========================================================================
+
+    def _fit_score(
+        self,
+        model: LaneModel,
+    ) -> float:
+
+        polynomial = model.polynomial
+
+        if polynomial is None:
+            return 0.0
+
+        if not polynomial.valid:
+            return 0.0
+
+        error = float(
+            polynomial.fit_error
+        )
+
+        if not np.isfinite(error):
+            return 0.0
+
+        if error <= self.excellent_fit_error:
+            return 1.0
+
+        if error <= self.good_fit_error:
+
+            ratio = (
+                error
+                - self.excellent_fit_error
+            ) / (
+                self.good_fit_error
+                - self.excellent_fit_error
+            )
+
+            return 1.0 - (
+                0.25 * _clip01(ratio)
+            )
+
+        if error <= self.max_fit_error:
+
+            ratio = (
+                error
+                - self.good_fit_error
+            ) / (
+                self.max_fit_error
+                - self.good_fit_error
+            )
+
+            return 0.75 - (
+                0.50 * _clip01(ratio)
+            )
+
+        return 0.0
+
+    # =========================================================================
+    # TRACKING
+    # =========================================================================
+
+    def _tracking_score(
+        self,
+        line: LaneLine,
+    ) -> float:
+
+        if not line.valid:
+            return 0.0
+
+        missed = max(
+            0,
+            int(line.missed_frames),
+        )
+
+        age = max(
+            0,
+            int(line.age_frames),
+        )
+
+        if missed > self.max_missed_frames:
+            return 0.0
+
+        missed_score = (
+            1.0
+            - (
+                missed
+                / max(
+                    1,
+                    self.max_missed_frames + 1,
+                )
+            )
+        )
+
+        age_score = _clip01(
+            age
+            / max(
+                1,
+                self.max_age_frames,
+            )
+        )
+
+        if age == 0:
+            age_score = 0.5
+
+        tracked_score = (
+            1.0
+            if line.valid
+            else 0.0
+        )
+
+        return _clip01(
+            0.55 * tracked_score
+            + 0.30 * missed_score
+            + 0.15 * age_score
+        )
+
+    # =========================================================================
+    # PROJEÇÃO
+    # =========================================================================
+
+    def _projection_score(
+        self,
+        model: LaneModel,
+    ) -> float:
+
+        if not model.line.valid:
+            return 0.0
+
+        projection = model.projection
+
+        if projection is None:
+            return 0.0
+
+        if not projection.valid:
+            return 0.0
+
+        quality = projection.quality
+
+        values = {
+            "none": 0.0,
+            "low": 0.35,
+            "medium": 0.65,
+            "high": 0.90,
         }
 
-        return mapping.get(
-            quality,
+        return values.get(
+            getattr(
+                quality,
+                "value",
+                str(quality),
+            ),
             0.0,
         )
 
-    @staticmethod
-    def _is_directly_observed(
-        lane: LaneModel,
-    ) -> bool:
-        """
-        Determina se a lane possui observação direta.
-
-        A implementação aceita as estruturas atuais de LaneModel
-        sem depender de atributos opcionais inexistentes.
-        """
-
-        line = getattr(
-            lane,
-            "line",
-            None,
-        )
-
-        if line is None:
-            return False
-
-        projected = bool(
-            getattr(
-                line,
-                "projected",
-                False,
-            )
-        )
-
-        detected_directly = getattr(
-            line,
-            "detected_directly",
-            None,
-        )
-
-        if detected_directly is not None:
-            return bool(
-                detected_directly
-            )
-
-        return not projected
-
-    @staticmethod
-    def _is_projected(
-        lane: LaneModel,
-    ) -> bool:
-        """
-        Determina se existe informação projetada.
-        """
-
-        line = getattr(
-            lane,
-            "line",
-            None,
-        )
-
-        if line is not None and bool(
-            getattr(
-                line,
-                "projected",
-                False,
-            )
-        ):
-            return True
-
-        return getattr(
-            lane,
-            "projection",
-            None,
-        ) is not None
-
-    @staticmethod
-    def _is_stable(
-        lane: LaneModel,
-    ) -> bool:
-        """
-        Determina se a lane possui estabilidade temporal.
-
-        O atributo é tratado de forma compatível com a estrutura
-        atual do LaneModel.
-        """
-
-        return bool(
-            getattr(
-                lane,
-                "stable",
-                False,
-            )
-        )
-
     # =========================================================================
-    # AVALIAÇÃO
+    # LINHA COMPLETA
     # =========================================================================
 
-    def evaluate(
+    def evaluate_lane(
         self,
-        lanes: Iterable[LaneModel],
-        global_confidence: Optional[float] = None,
+        lane: LaneModel,
     ) -> LaneConfidenceResult:
-        """
-        Avalia um conjunto de LaneModel.
 
-        Parameters
-        ----------
-        lanes:
-            Lanes produzidas pela camada de modelagem.
-
-        global_confidence:
-            Confiança externa opcional, caso outra camada já tenha
-            produzido uma estimativa global.
-
-        Returns
-        -------
-        LaneConfidenceResult
-        """
-
-        valid_lanes = []
-
-        for lane in lanes:
-
-            if lane is None:
-                continue
-
-            if not bool(
-                getattr(
-                    lane,
-                    "valid",
-                    False,
-                )
-            ):
-                continue
-
-            valid_lanes.append(
-                lane
-            )
-
-        if not valid_lanes:
-            return LaneConfidenceResult()
-
-        # ---------------------------------------------------------------------
-        # Quantidades básicas
-        # ---------------------------------------------------------------------
-
-        observed_count = sum(
-            1
-            for lane in valid_lanes
-            if self._is_directly_observed(
-                lane
-            )
-        )
-
-        projected_count = sum(
-            1
-            for lane in valid_lanes
-            if self._is_projected(
-                lane
-            )
-        )
-
-        stable_count = sum(
-            1
-            for lane in valid_lanes
-            if self._is_stable(
-                lane
-            )
-        )
-
-        # ---------------------------------------------------------------------
-        # Confiança dos modelos
-        # ---------------------------------------------------------------------
-
-        model_confidences = []
-
-        quality_scores = []
-
-        for lane in valid_lanes:
-
-            line = getattr(
-                lane,
-                "line",
-                None,
-            )
-
-            if line is None:
-                continue
-
-            confidence = self._clip01(
-                getattr(
-                    line,
-                    "confidence",
-                    0.0,
-                )
-            )
-
-            model_confidences.append(
-                confidence
-            )
-
-            quality = getattr(
-                line,
-                "quality",
-                LaneQuality.NONE,
-            )
-
-            quality_scores.append(
-                self._quality_score(
-                    quality
-                )
-            )
-
-        if not model_confidences:
+        if lane is None:
             return LaneConfidenceResult(
-                lane_count=len(valid_lanes),
-                stable_count=stable_count,
-                observed_count=observed_count,
-                projected_count=projected_count,
+                confidence=0.0,
+                level=ConfidenceLevel.INVALID,
+                detection_score=0.0,
+                geometry_score=0.0,
+                tracking_score=0.0,
+                projection_score=0.0,
+                consistency_score=0.0,
                 valid=False,
                 safe_for_adas=False,
+                reason="Lane inexistente.",
             )
 
-        confidence_score = float(
-            np.mean(
-                model_confidences
-            )
-        )
-
-        quality_score = float(
-            np.mean(
-                quality_scores
+        detection_score = (
+            self._direct_detection_score(
+                lane.line
             )
         )
 
-        # ---------------------------------------------------------------------
-        # Estabilidade
-        # ---------------------------------------------------------------------
-
-        stability_score = (
-            stable_count
-            / max(
-                1,
-                len(valid_lanes),
+        geometry_score = (
+            self._fit_score(
+                lane
             )
         )
 
-        stability_score = self._clip01(
-            stability_score
-        )
-
-        # ---------------------------------------------------------------------
-        # Observação direta
-        #
-        # Observação direta recebe peso maior que projeção porque
-        # projeção é informação inferida.
-        # ---------------------------------------------------------------------
-
-        observation_score = (
-            observed_count
-            / max(
-                1,
-                len(valid_lanes),
+        tracking_score = (
+            self._tracking_score(
+                lane.line
             )
         )
 
-        observation_score = self._clip01(
-            observation_score
-        )
-
-        # ---------------------------------------------------------------------
-        # Score final
-        #
-        # Confiança do modelo:
-        #     35%
-        #
-        # Qualidade geométrica:
-        #     30%
-        #
-        # Estabilidade:
-        #     20%
-        #
-        # Observação direta:
-        #     15%
-        # ---------------------------------------------------------------------
-
-        score = (
-            0.35 * confidence_score
-            + 0.30 * quality_score
-            + 0.20 * stability_score
-            + 0.15 * observation_score
-        )
-
-        # ---------------------------------------------------------------------
-        # Confiança externa opcional
-        # ---------------------------------------------------------------------
-
-        if global_confidence is not None:
-
-            external_score = self._clip01(
-                global_confidence
+        projection_score = (
+            self._projection_score(
+                lane
             )
-
-            score = (
-                0.75 * score
-                + 0.25 * external_score
-            )
-
-        score = self._clip01(
-            score
         )
 
-        # ---------------------------------------------------------------------
-        # Validade
-        # ---------------------------------------------------------------------
+        consistency_score = _clip01(
+            (
+                detection_score
+                + geometry_score
+                + tracking_score
+            ) / 3.0
+        )
+
+        confidence = _clip01(
+            0.45 * detection_score
+            + 0.25 * geometry_score
+            + 0.20 * tracking_score
+            + 0.10 * projection_score
+        )
 
         valid = (
-            observed_count
-            >= self.min_observed_lanes
-            and score
-            >= self.min_score
+            lane.line.valid
+            and lane.line.point_count()
+            >= self.min_points
+            and confidence
+            >= self.min_confidence
+        )
+
+        if confidence >= self.high_confidence:
+            level = ConfidenceLevel.HIGH
+
+        elif confidence >= self.safe_confidence:
+            level = ConfidenceLevel.GOOD
+
+        elif confidence >= self.min_confidence:
+            level = ConfidenceLevel.PARTIAL
+
+        elif confidence > 0.0:
+            level = ConfidenceLevel.POOR
+
+        else:
+            level = ConfidenceLevel.INVALID
+
+        return LaneConfidenceResult(
+            confidence=confidence,
+            level=level,
+            detection_score=detection_score,
+            geometry_score=geometry_score,
+            tracking_score=tracking_score,
+            projection_score=projection_score,
+            consistency_score=consistency_score,
+            valid=valid,
+            safe_for_adas=(
+                valid
+                and confidence
+                >= self.safe_confidence
+            ),
+            reason=(
+                None
+                if valid
+                else "Confiança insuficiente."
+            ),
+        )
+
+    # =========================================================================
+    # GEOMETRIA
+    # =========================================================================
+
+    def _geometry_score(
+        self,
+        geometry: Optional[LaneGeometry],
+    ) -> float:
+
+        if geometry is None:
+            return 0.0
+
+        if not geometry.valid:
+            return 0.0
+
+        score = 1.0
+
+        width = geometry.lane_width
+
+        if width is None:
+            return 0.50
+
+        width = float(width)
+
+        if not np.isfinite(width):
+            return 0.0
+
+        if (
+            width < self.min_lane_width
+            or width > self.max_lane_width
+        ):
+            return 0.0
+
+        normalized_offset = (
+            geometry.normalized_offset
+        )
+
+        if normalized_offset is not None:
+
+            normalized_offset = float(
+                normalized_offset
+            )
+
+            if not np.isfinite(
+                normalized_offset
+            ):
+                return 0.0
+
+            if abs(
+                normalized_offset
+            ) > self.max_offset:
+                score *= 0.50
+
+        if geometry.heading_error is not None:
+
+            heading = abs(
+                float(
+                    geometry.heading_error
+                )
+            )
+
+            if np.isfinite(heading):
+
+                # Até ~10° é considerado
+                # geometricamente confortável.
+                score *= _clip01(
+                    1.0 - heading / 20.0
+                )
+
+        if geometry.confidence > 0.0:
+            score *= _clip01(
+                float(
+                    geometry.confidence
+                )
+            )
+
+        return _clip01(score)
+
+    # =========================================================================
+    # CENA
+    # =========================================================================
+
+    def evaluate_scene(
+        self,
+        lanes: Sequence[LaneModel],
+        geometry: Optional[LaneGeometry] = None,
+        require_two_lanes: bool = True,
+    ) -> SceneConfidenceResult:
+
+        valid_lanes = [
+            lane
+            for lane in lanes
+            if lane is not None
+        ]
+
+        if not valid_lanes:
+
+            result = SceneConfidenceResult(
+                confidence=0.0,
+                level=ConfidenceLevel.INVALID,
+                lane_score=0.0,
+                geometry_score=0.0,
+                tracking_score=0.0,
+                projection_score=0.0,
+                consistency_score=0.0,
+                valid=False,
+                safe_for_adas=False,
+                reason="Nenhuma lane disponível.",
+            )
+
+            self.last_result = result
+
+            return result
+
+        lane_results = [
+            self.evaluate_lane(
+                lane
+            )
+            for lane in valid_lanes
+        ]
+
+        lane_score = float(
+            np.mean(
+                [
+                    result.confidence
+                    for result in lane_results
+                ]
+            )
+        )
+
+        geometry_score = float(
+            np.mean(
+                [
+                    result.geometry_score
+                    for result in lane_results
+                ]
+            )
+        )
+
+        tracking_score = float(
+            np.mean(
+                [
+                    result.tracking_score
+                    for result in lane_results
+                ]
+            )
+        )
+
+        projection_score = float(
+            np.mean(
+                [
+                    result.projection_score
+                    for result in lane_results
+                ]
+            )
+        )
+
+        geometry_global = (
+            self._geometry_score(
+                geometry
+            )
+        )
+
+        if geometry is not None:
+            geometry_score = (
+                0.65 * geometry_score
+                + 0.35 * geometry_global
+            )
+
+        confidence_values = [
+            result.confidence
+            for result in lane_results
+        ]
+
+        consistency_score = _clip01(
+            1.0
+            - (
+                np.std(
+                    confidence_values
+                )
+                if len(
+                    confidence_values
+                ) > 1
+                else 0.0
+            )
+        )
+
+        confidence = _clip01(
+            0.40 * lane_score
+            + 0.25 * geometry_score
+            + 0.15 * tracking_score
+            + 0.10 * projection_score
+            + 0.10 * consistency_score
+        )
+
+        sufficient_lanes = (
+            len(valid_lanes) >= 2
+            if require_two_lanes
+            else len(valid_lanes) >= 1
+        )
+
+        valid = (
+            sufficient_lanes
+            and lane_score
+            >= self.min_confidence
         )
 
         safe_for_adas = (
             valid
-            and stable_count
-            >= self.min_stable_lanes
+            and confidence
+            >= self.safe_confidence
+            and geometry_global
+            >= self.min_confidence
         )
 
-        return LaneConfidenceResult(
-            score=score,
-            lane_count=len(valid_lanes),
-            stable_count=stable_count,
-            observed_count=observed_count,
-            projected_count=projected_count,
+        if confidence >= self.high_confidence:
+            level = ConfidenceLevel.HIGH
+
+        elif confidence >= self.safe_confidence:
+            level = ConfidenceLevel.GOOD
+
+        elif confidence >= self.min_confidence:
+            level = ConfidenceLevel.PARTIAL
+
+        elif confidence > 0.0:
+            level = ConfidenceLevel.POOR
+
+        else:
+            level = ConfidenceLevel.INVALID
+
+        reason = None
+
+        if not sufficient_lanes:
+            reason = (
+                "Quantidade insuficiente de lanes."
+            )
+
+        elif not valid:
+            reason = (
+                "Confiança das lanes insuficiente."
+            )
+
+        elif not safe_for_adas:
+            reason = (
+                "Percepção válida, porém "
+                "não suficientemente confiável "
+                "para ADAS."
+            )
+
+        result = SceneConfidenceResult(
+            confidence=confidence,
+            level=level,
+            lane_score=lane_score,
+            geometry_score=geometry_score,
+            tracking_score=tracking_score,
+            projection_score=projection_score,
+            consistency_score=consistency_score,
             valid=valid,
             safe_for_adas=safe_for_adas,
+            reason=reason,
+        )
+
+        self.last_result = result
+
+        return result
+
+    # =========================================================================
+    # API DE COMPATIBILIDADE
+    # =========================================================================
+
+    def evaluate(
+        self,
+        lanes: Sequence[LaneModel],
+        geometry: Optional[LaneGeometry] = None,
+        require_two_lanes: bool = True,
+    ) -> SceneConfidenceResult:
+
+        return self.evaluate_scene(
+            lanes=lanes,
+            geometry=geometry,
+            require_two_lanes=require_two_lanes,
+        )
+
+    def calculate(
+        self,
+        lanes: Sequence[LaneModel],
+        geometry: Optional[LaneGeometry] = None,
+        require_two_lanes: bool = True,
+    ) -> SceneConfidenceResult:
+
+        return self.evaluate_scene(
+            lanes=lanes,
+            geometry=geometry,
+            require_two_lanes=require_two_lanes,
         )
 
 
 # =============================================================================
-# API PÚBLICA
+# FACTORY
 # =============================================================================
+
+def create_default_lane_confidence(
+    **kwargs,
+) -> LaneConfidence:
+
+    return LaneConfidence(**kwargs)
 
 
 __all__ = [
+    "ConfidenceLevel",
     "LaneConfidenceResult",
-    "LaneConfidenceEvaluator",
+    "SceneConfidenceResult",
+    "LaneConfidence",
+    "create_default_lane_confidence",
 ]

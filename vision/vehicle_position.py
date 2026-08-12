@@ -3,52 +3,21 @@ vision/vehicle_position.py
 
 Estimativa da posição lateral do veículo dentro da faixa.
 
-Pipeline:
+Responsabilidades:
+    - localizar a faixa ocupada;
+    - calcular centro da faixa;
+    - calcular erro lateral;
+    - normalizar o erro pela largura;
+    - classificar a posição lateral;
+    - fornecer confiança;
+    - rejeitar estimativas insuficientes.
 
-    LaneTracker
-         ↓
-    LaneProjection
-         ↓
-    VehiclePosition
-         ↓
-    posição lateral do veículo
-
-Responsabilidades deste módulo:
-
-- identificar a faixa ocupada pelo veículo;
-- calcular o centro da faixa;
-- calcular o erro lateral em pixels;
-- normalizar o erro pela largura da faixa;
-- determinar a posição relativa do veículo;
-- fornecer confiança da estimativa;
-- rejeitar estimativas sem evidência suficiente.
-
-Este módulo NÃO:
-
-- executa YOLOP;
-- captura tela;
-- faz tracking temporal;
-- projeta lanes;
-- calcula controle do volante;
-- decide estado ADAS.
-
-Convenção:
-
-    erro_lateral > 0
-        veículo está à direita do centro.
-
-    erro_lateral < 0
-        veículo está à esquerda do centro.
-
-    erro_lateral = 0
-        veículo está no centro.
-
-A posição do veículo na imagem é representada pelo
-centro horizontal da imagem.
-
-Isso é apropriado para a câmera interna enquanto a
-calibração da câmera não fornecer um offset específico
-do veículo em relação ao eixo óptico.
+Não executa:
+    - inferência;
+    - tracking;
+    - projeção;
+    - associação;
+    - decisão ADAS.
 """
 
 from __future__ import annotations
@@ -62,175 +31,117 @@ import numpy as np
 
 from .lane_types import LanePoint
 
-
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
+# =============================================================================
 # CONFIGURAÇÃO
-# ============================================================================
+# =============================================================================
 
 DEFAULT_EVALUATION_Y_RATIO = 0.82
 
 DEFAULT_MIN_LANE_WIDTH = 30.0
-
 DEFAULT_MAX_LANE_WIDTH = 1800.0
 
-DEFAULT_MIN_VALID_WIDTH = 10.0
-
 DEFAULT_CENTER_TOLERANCE = 0.10
-
 DEFAULT_WARNING_TOLERANCE = 0.22
-
 DEFAULT_CRITICAL_TOLERANCE = 0.38
 
 DEFAULT_MIN_CONFIDENCE = 0.45
-
 DEFAULT_MIN_POINTS = 4
 
 
-# ============================================================================
-# ESTADO DA POSIÇÃO
-# ============================================================================
-
+# =============================================================================
+# ESTADO
+# =============================================================================
 
 class VehiclePositionState(str, Enum):
-    """
-    Estado lateral do veículo dentro da faixa.
-    """
-
     UNKNOWN = "unknown"
 
     CENTERED = "centered"
 
     LEFT = "left"
-
     RIGHT = "right"
 
     APPROACHING_LEFT = "approaching_left"
-
     APPROACHING_RIGHT = "approaching_right"
 
     WARNING_LEFT = "warning_left"
-
     WARNING_RIGHT = "warning_right"
 
     CRITICAL_LEFT = "critical_left"
-
     CRITICAL_RIGHT = "critical_right"
 
 
-# ============================================================================
+# =============================================================================
 # RESULTADO
-# ============================================================================
-
+# =============================================================================
 
 @dataclass
 class VehiclePositionResult:
-    """
-    Resultado da estimativa da posição do veículo.
-
-    lane_center_x:
-        Centro horizontal da faixa atual.
-
-    vehicle_center_x:
-        Centro horizontal estimado do veículo/câmera.
-
-    lateral_error:
-        Erro lateral em pixels.
-
-        Positivo = veículo à direita.
-        Negativo = veículo à esquerda.
-
-    normalized_error:
-        Erro normalizado pela largura da faixa.
-
-        Aproximadamente:
-
-            -1.0 = extremo esquerdo
-             0.0 = centro
-            +1.0 = extremo direito
-
-    lane_width:
-        Largura estimada da faixa no ponto de avaliação.
-
-    left_distance:
-        Distância do veículo à linha esquerda.
-
-    right_distance:
-        Distância do veículo à linha direita.
-
-    state:
-        Estado lateral do veículo.
-
-    confidence:
-        Confiança da estimativa.
-
-    valid:
-        Indica se a estimativa é suficientemente confiável.
-    """
-
     lane_index: Optional[int]
 
     lane_center_x: float
-
     vehicle_center_x: float
 
     lateral_error: float
-
     normalized_error: float
 
     lane_width: float
 
     left_distance: float
-
     right_distance: float
 
     state: VehiclePositionState
 
     confidence: float
-
     valid: bool
 
     evaluation_y: float
 
     error: Optional[str] = None
 
+    @property
+    def offset(self) -> float:
+        return self.normalized_error
 
-# ============================================================================
+    @property
+    def error_pixels(self) -> float:
+        return self.lateral_error
+
+    @property
+    def is_centered(self) -> bool:
+        return (
+            self.valid
+            and self.state
+            == VehiclePositionState.CENTERED
+        )
+
+
+# =============================================================================
 # VEHICLE POSITION
-# ============================================================================
-
+# =============================================================================
 
 class VehiclePosition:
     """
-    Calcula a posição do veículo dentro da faixa.
+    Calcula a posição lateral do veículo dentro da faixa.
 
-    A classe aceita:
+    Convenção:
 
-        left_lane
-        right_lane
+        lateral_error > 0
+            veículo à direita.
 
-    ou uma lista ordenada de lanes.
+        lateral_error < 0
+            veículo à esquerda.
 
-    O cálculo é realizado em uma linha horizontal da imagem,
-    normalmente próxima da região inferior, onde a posição
-    lateral do veículo é mais representativa.
+        normalized_error:
+            erro / (largura_da_faixa / 2)
 
-    Exemplo:
+        portanto:
 
-        esquerda = x=700
-        direita  = x=1200
-
-        centro = 950
-
-        veículo = x=1000
-
-        erro = +50
-
-    Portanto:
-
-        veículo está 50 px à direita do centro.
+            -1 = limite esquerdo
+             0 = centro
+            +1 = limite direito
     """
 
     def __init__(
@@ -305,16 +216,33 @@ class VehiclePosition:
             vehicle_x_offset
         )
 
-    # ========================================================================
+        self.last_result: Optional[
+            VehiclePositionResult
+        ] = None
+
+    # =========================================================================
     # UTILIDADES
-    # ========================================================================
+    # =========================================================================
+
+    @staticmethod
+    def _clip01(value: float) -> float:
+        if not np.isfinite(value):
+            return 0.0
+
+        return float(
+            np.clip(
+                value,
+                0.0,
+                1.0,
+            )
+        )
 
     @staticmethod
     def _valid_points(
         points: Sequence[LanePoint],
     ) -> List[LanePoint]:
 
-        result: List[LanePoint] = []
+        result = []
 
         for point in points:
 
@@ -331,40 +259,51 @@ class VehiclePosition:
 
         return result
 
-    @staticmethod
+    def _has_enough_points(
+        self,
+        points: Sequence[LanePoint],
+    ) -> bool:
+
+        return len(
+            self._valid_points(points)
+        ) >= self.min_points
+
+    @classmethod
     def _interpolate_x(
+        cls,
         points: Sequence[LanePoint],
         y: float,
     ) -> Optional[float]:
-        """
-        Obtém X da lane para um determinado Y.
 
-        Utiliza interpolação linear entre os pontos observados.
-
-        Não extrapola fora do intervalo observado.
-        """
-
-        valid = VehiclePosition._valid_points(
-            points
-        )
+        valid = cls._valid_points(points)
 
         if len(valid) < 2:
             return None
 
-        ordered = sorted(
-            valid,
-            key=lambda point: point.y,
+        valid.sort(
+            key=lambda point: point.y
         )
 
         ys = np.asarray(
-            [point.y for point in ordered],
+            [point.y for point in valid],
             dtype=np.float64,
         )
 
         xs = np.asarray(
-            [point.x for point in ordered],
+            [point.x for point in valid],
             dtype=np.float64,
         )
+
+        unique_y, indices = np.unique(
+            ys,
+            return_index=True,
+        )
+
+        ys = unique_y
+        xs = xs[indices]
+
+        if len(ys) < 2:
+            return None
 
         if y < ys[0] or y > ys[-1]:
             return None
@@ -377,14 +316,13 @@ class VehiclePosition:
             )
         )
 
-    @staticmethod
+    @classmethod
     def _lane_confidence(
+        cls,
         points: Sequence[LanePoint],
     ) -> float:
 
-        valid = VehiclePosition._valid_points(
-            points
-        )
+        valid = cls._valid_points(points)
 
         if not valid:
             return 0.0
@@ -393,14 +331,14 @@ class VehiclePosition:
 
         for point in valid:
 
-            confidence = float(
+            value = float(
                 point.confidence
             )
 
-            if np.isfinite(confidence):
+            if np.isfinite(value):
                 values.append(
                     np.clip(
-                        confidence,
+                        value,
                         0.0,
                         1.0,
                     )
@@ -413,13 +351,15 @@ class VehiclePosition:
             np.mean(values)
         )
 
-    # ========================================================================
+    # =========================================================================
     # ESCOLHA DA FAIXA
-    # ========================================================================
+    # =========================================================================
 
     def _find_current_lane(
         self,
-        lanes: Sequence[Sequence[LanePoint]],
+        lanes: Sequence[
+            Sequence[LanePoint]
+        ],
         vehicle_x: float,
         evaluation_y: float,
     ) -> Tuple[
@@ -428,39 +368,11 @@ class VehiclePosition:
         Optional[float],
         float,
     ]:
-        """
-        Procura a faixa que contém o veículo.
-
-        Para cada par de lanes consecutivas:
-
-            left_lane
-            right_lane
-
-        calcula:
-
-            left_x
-            right_x
-            center_x
-
-        e verifica se o veículo está dentro desse intervalo.
-
-        Retorna:
-
-            lane_index
-            left_x
-            right_x
-            confidence
-        """
 
         if len(lanes) < 2:
-            return (
-                None,
-                None,
-                None,
-                0.0,
-            )
+            return None, None, None, 0.0
 
-        best_candidate = None
+        candidates = []
 
         for index in range(
             len(lanes) - 1
@@ -468,6 +380,16 @@ class VehiclePosition:
 
             left_lane = lanes[index]
             right_lane = lanes[index + 1]
+
+            if not self._has_enough_points(
+                left_lane
+            ):
+                continue
+
+            if not self._has_enough_points(
+                right_lane
+            ):
+                continue
 
             left_x = self._interpolate_x(
                 left_lane,
@@ -486,15 +408,12 @@ class VehiclePosition:
                 continue
 
             if right_x < left_x:
-
                 left_x, right_x = (
                     right_x,
                     left_x,
                 )
 
-            width = (
-                right_x - left_x
-            )
+            width = right_x - left_x
 
             if (
                 width < self.min_lane_width
@@ -502,90 +421,73 @@ class VehiclePosition:
             ):
                 continue
 
-            if (
-                vehicle_x < left_x
-                or vehicle_x > right_x
-            ):
-                continue
-
             center_x = (
                 left_x + right_x
             ) / 2.0
 
-            left_confidence = (
+            confidence = (
                 self._lane_confidence(
                     left_lane
                 )
-            )
-
-            right_confidence = (
-                self._lane_confidence(
+                + self._lane_confidence(
                     right_lane
                 )
-            )
-
-            confidence = (
-                left_confidence
-                + right_confidence
             ) / 2.0
 
-            distance_from_center = abs(
+            distance_to_interval = 0.0
+
+            if vehicle_x < left_x:
+                distance_to_interval = (
+                    left_x - vehicle_x
+                )
+            elif vehicle_x > right_x:
+                distance_to_interval = (
+                    vehicle_x - right_x
+                )
+
+            distance_to_center = abs(
                 vehicle_x - center_x
             )
 
-            candidate = (
-                distance_from_center,
-                index,
-                left_x,
-                right_x,
-                confidence,
+            inside = (
+                left_x
+                <= vehicle_x
+                <= right_x
             )
 
-            if (
-                best_candidate is None
-                or candidate[0]
-                < best_candidate[0]
-            ):
-                best_candidate = candidate
-
-        if best_candidate is None:
-
-            return (
-                None,
-                None,
-                None,
-                0.0,
+            candidates.append(
+                (
+                    0 if inside else 1,
+                    distance_to_interval,
+                    distance_to_center,
+                    -confidence,
+                    index,
+                    left_x,
+                    right_x,
+                    confidence,
+                )
             )
 
-        (
-            _,
-            index,
-            left_x,
-            right_x,
-            confidence,
-        ) = best_candidate
+        if not candidates:
+            return None, None, None, 0.0
+
+        best = min(candidates)
 
         return (
-            index,
-            left_x,
-            right_x,
-            confidence,
+            best[4],
+            best[5],
+            best[6],
+            best[7],
         )
 
-    # ========================================================================
-    # ESTADO
-    # ========================================================================
+    # =========================================================================
+    # CLASSIFICAÇÃO
+    # =========================================================================
 
     def _classify_state(
         self,
         normalized_error: float,
     ) -> VehiclePositionState:
-        """
-        Classifica a posição lateral.
-
-        O valor absoluto do erro determina a severidade.
-        O sinal determina o lado.
-        """
 
         magnitude = abs(
             normalized_error
@@ -595,13 +497,9 @@ class VehiclePosition:
             magnitude
             <= self.center_tolerance
         ):
-            return (
-                VehiclePositionState.CENTERED
-            )
+            return VehiclePositionState.CENTERED
 
-        if (
-            normalized_error < 0
-        ):
+        if normalized_error < 0.0:
 
             if (
                 magnitude
@@ -643,9 +541,90 @@ class VehiclePosition:
             VehiclePositionState.APPROACHING_RIGHT
         )
 
-    # ========================================================================
-    # RESULTADO INVÁLIDO
-    # ========================================================================
+    # =========================================================================
+    # CONFIANÇA
+    # =========================================================================
+
+    def _calculate_confidence(
+        self,
+        left_lane: Sequence[LanePoint],
+        right_lane: Sequence[LanePoint],
+        lane_width: float,
+        image_width: int,
+    ) -> float:
+
+        left_confidence = (
+            self._lane_confidence(
+                left_lane
+            )
+        )
+
+        right_confidence = (
+            self._lane_confidence(
+                right_lane
+            )
+        )
+
+        detection_confidence = (
+            left_confidence
+            + right_confidence
+        ) / 2.0
+
+        left_count = len(
+            self._valid_points(
+                left_lane
+            )
+        )
+
+        right_count = len(
+            self._valid_points(
+                right_lane
+            )
+        )
+
+        point_confidence = self._clip01(
+            min(
+                left_count,
+                right_count,
+            )
+            / max(
+                self.min_points * 2,
+                1,
+            )
+        )
+
+        expected_width = (
+            image_width * 0.35
+        )
+
+        if expected_width <= 0.0:
+            width_confidence = 0.0
+        else:
+            width_ratio = (
+                lane_width
+                / expected_width
+            )
+
+            width_confidence = self._clip01(
+                1.0
+                - abs(
+                    1.0 - width_ratio
+                )
+            )
+
+        confidence = (
+            0.65 * detection_confidence
+            + 0.20 * point_confidence
+            + 0.15 * width_confidence
+        )
+
+        return self._clip01(
+            confidence
+        )
+
+    # =========================================================================
+    # INVALID
+    # =========================================================================
 
     @staticmethod
     def _invalid_result(
@@ -674,9 +653,9 @@ class VehiclePosition:
             error=error,
         )
 
-    # ========================================================================
-    # API PRINCIPAL
-    # ========================================================================
+    # =========================================================================
+    # API
+    # =========================================================================
 
     def estimate(
         self,
@@ -688,104 +667,70 @@ class VehiclePosition:
         vehicle_x: Optional[float] = None,
         evaluation_y: Optional[float] = None,
     ) -> VehiclePositionResult:
-        """
-        Estima a posição do veículo.
 
-        Parameters
-        ----------
-        lanes:
-            Lista ordenada das linhas da pista.
+        if image_width <= 0:
+            result = self._invalid_result(
+                0.0,
+                0.0,
+                "image_width inválido.",
+            )
+            self.last_result = result
+            return result
 
-            Exemplo:
+        if image_height <= 0:
+            result = self._invalid_result(
+                0.0,
+                0.0,
+                "image_height inválido.",
+            )
+            self.last_result = result
+            return result
 
-                [
-                    acostamento_esquerdo,
-                    faixa_1_esquerda,
-                    faixa_1_direita,
-                    faixa_2_direita,
-                    ...
-                ]
-
-            Na arquitetura atual, o ideal é passar somente
-            as lanes de marcação que representam limites
-            consecutivos da pista.
-
-        image_width:
-            Largura do frame.
-
-        image_height:
-            Altura do frame.
-
-        vehicle_x:
-            Posição X do veículo.
-
-            Se não fornecida, utiliza o centro da imagem.
-
-        evaluation_y:
-            Altura onde a posição será calculada.
-
-            Se não fornecida:
-
-                image_height * evaluation_y_ratio
-        """
-
-        try:
-
-            if image_width <= 0:
-                return self._invalid_result(
-                    0.0,
-                    0.0,
-                    "image_width inválido.",
-                )
-
-            if image_height <= 0:
-                return self._invalid_result(
-                    0.0,
-                    0.0,
-                    "image_height inválido.",
-                )
-
-            if vehicle_x is None:
-
-                vehicle_x = (
-                    image_width / 2.0
-                    + self.vehicle_x_offset
-                )
-
-            else:
-
-                vehicle_x = float(
-                    vehicle_x
-                )
-
-            if evaluation_y is None:
-
-                evaluation_y = (
-                    image_height
-                    * self.evaluation_y_ratio
-                )
-
-            else:
-
-                evaluation_y = float(
-                    evaluation_y
-                )
-
-            evaluation_y = float(
-                np.clip(
-                    evaluation_y,
-                    0.0,
-                    image_height - 1,
-                )
+        if vehicle_x is None:
+            vehicle_x = (
+                image_width / 2.0
+                + self.vehicle_x_offset
             )
 
-            if len(lanes) < 2:
+        vehicle_x = float(vehicle_x)
 
-                return self._invalid_result(
-                    vehicle_x,
-                    evaluation_y,
-                    "Menos de duas lanes disponíveis.",
-                )
+        if not np.isfinite(vehicle_x):
+            result = self._invalid_result(
+                image_width / 2.0,
+                0.0,
+                "vehicle_x inválido.",
+            )
+            self.last_result = result
+            return result
+
+        if evaluation_y is None:
+            evaluation_y = (
+                image_height
+                * self.evaluation_y_ratio
+            )
+
+        evaluation_y = float(
+            evaluation_y
+        )
+
+        if not np.isfinite(evaluation_y):
+            result = self._invalid_result(
+                vehicle_x,
+                0.0,
+                "evaluation_y inválido.",
+            )
+            self.last_result = result
+            return result
+
+        evaluation_y = float(
+            np.clip(
+                evaluation_y,
+                0.0,
+                image_height - 1,
+            )
+        )
+
+        try:
 
             lane_index, left_x, right_x, confidence = (
                 self._find_current_lane(
@@ -795,40 +740,32 @@ class VehiclePosition:
                 )
             )
 
-            if lane_index is None:
-
-                return self._invalid_result(
+            if (
+                lane_index is None
+                or left_x is None
+                or right_x is None
+            ):
+                result = self._invalid_result(
                     vehicle_x,
                     evaluation_y,
-                    "Não foi possível identificar "
-                    "a faixa ocupada pelo veículo.",
+                    "Não foi possível determinar "
+                    "a faixa atual.",
                 )
-
-            if confidence < self.min_confidence:
-
-                return self._invalid_result(
-                    vehicle_x,
-                    evaluation_y,
-                    (
-                        "Confiança das lanes abaixo "
-                        "do limite mínimo."
-                    ),
-                )
-
-            assert left_x is not None
-            assert right_x is not None
+                self.last_result = result
+                return result
 
             lane_width = (
                 right_x - left_x
             )
 
-            if lane_width < self.min_lane_width:
-
-                return self._invalid_result(
+            if lane_width <= 0.0:
+                result = self._invalid_result(
                     vehicle_x,
                     evaluation_y,
                     "Largura da faixa inválida.",
                 )
+                self.last_result = result
+                return result
 
             lane_center_x = (
                 left_x + right_x
@@ -839,38 +776,60 @@ class VehiclePosition:
                 - lane_center_x
             )
 
-            half_width = (
-                lane_width / 2.0
-            )
-
             normalized_error = (
                 lateral_error
-                / half_width
+                / (lane_width / 2.0)
             )
 
             normalized_error = float(
                 np.clip(
                     normalized_error,
-                    -2.0,
-                    2.0,
+                    -1.5,
+                    1.5,
                 )
             )
 
             left_distance = (
-                vehicle_x
-                - left_x
+                vehicle_x - left_x
             )
 
             right_distance = (
-                right_x
-                - vehicle_x
+                right_x - vehicle_x
+            )
+
+            confidence = (
+                self._calculate_confidence(
+                    lanes[lane_index],
+                    lanes[lane_index + 1],
+                    lane_width,
+                    image_width,
+                )
+            )
+
+            # Mantém a confiança calculada internamente
+            # como fonte principal.
+            confidence = min(
+                confidence,
+                self._clip01(
+                    confidence
+                ),
             )
 
             state = self._classify_state(
                 normalized_error
             )
 
-            return VehiclePositionResult(
+            valid = (
+                confidence
+                >= self.min_confidence
+            )
+
+            if not valid:
+                state = (
+                    VehiclePositionState.UNKNOWN
+                )
+
+            result = VehiclePositionResult(
                 lane_index=lane_index,
                 lane_center_x=float(
                     lane_center_x
@@ -897,53 +856,90 @@ class VehiclePosition:
                 confidence=float(
                     confidence
                 ),
-                valid=True,
+                valid=valid,
                 evaluation_y=float(
                     evaluation_y
                 ),
                 error=None,
             )
 
+            self.last_result = result
+
+            return result
+
         except Exception as exc:
 
+            error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
             logger.exception(
-                "[VEHICLE POSITION] "
+                "[VEHICLE_POSITION] "
                 "Falha na estimativa."
             )
 
-            return self._invalid_result(
-                (
-                    float(vehicle_x)
-                    if vehicle_x is not None
-                    else image_width / 2.0
-                ),
-                (
-                    float(evaluation_y)
-                    if evaluation_y is not None
-                    else image_height
-                    * self.evaluation_y_ratio
-                ),
-                f"{type(exc).__name__}: {exc}",
+            result = self._invalid_result(
+                vehicle_x,
+                evaluation_y,
+                error,
             )
 
+            self.last_result = result
 
-# ============================================================================
+            return result
+
+    # =========================================================================
+    # COMPATIBILIDADE
+    # =========================================================================
+
+    def update(
+        self,
+        lanes: Sequence[
+            Sequence[LanePoint]
+        ],
+        image_width: int,
+        image_height: int,
+        vehicle_x: Optional[float] = None,
+        evaluation_y: Optional[float] = None,
+    ) -> VehiclePositionResult:
+
+        return self.estimate(
+            lanes=lanes,
+            image_width=image_width,
+            image_height=image_height,
+            vehicle_x=vehicle_x,
+            evaluation_y=evaluation_y,
+        )
+
+    def process(
+        self,
+        lanes: Sequence[
+            Sequence[LanePoint]
+        ],
+        image_width: int,
+        image_height: int,
+        vehicle_x: Optional[float] = None,
+        evaluation_y: Optional[float] = None,
+    ) -> VehiclePositionResult:
+
+        return self.estimate(
+            lanes=lanes,
+            image_width=image_width,
+            image_height=image_height,
+            vehicle_x=vehicle_x,
+            evaluation_y=evaluation_y,
+        )
+
+
+# =============================================================================
 # FACTORY
-# ============================================================================
-
+# =============================================================================
 
 def create_default_vehicle_position(
     **kwargs,
 ) -> VehiclePosition:
 
-    return VehiclePosition(
-        **kwargs
-    )
-
-
-# ============================================================================
-# EXPORTS
-# ============================================================================
+    return VehiclePosition(**kwargs)
 
 
 __all__ = [
