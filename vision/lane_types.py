@@ -1,93 +1,72 @@
 """
 vision/lane_types.py
 
-Tipos fundamentais do sistema de reconhecimento de faixas.
+Tipos fundamentais utilizados pelo sistema de detecção e projeção
+de faixas.
 
-Este módulo NÃO executa:
-    - inferência YOLOP
-    - processamento de imagem
-    - cálculo de geometria
-    - controle do veículo
-    - decisões ADAS
+Responsabilidade deste módulo:
 
-Ele define apenas os dados utilizados entre as diferentes
-camadas do sistema.
-
-Fluxo:
-
-    YOLOP
-      ↓
-    LaneDetectionResult
-      ↓
+    LanePoint
+        ↓
+    LaneLine
+        ↓
     LaneModel
-      ↓
-    LaneTracker
-      ↓
-    LaneAssociation
-      ↓
-    LaneGeometry
-      ↓
-    ADASState
+        ↓
+    LanePolynomial
+        ↓
+    LaneProjection
+
+Este módulo NÃO:
+    - executa inferência;
+    - realiza tracking;
+    - identifica a faixa atual;
+    - calcula posição do veículo;
+    - toma decisões ADAS.
+
+Observação importante:
+    Os dataclasses deste módulo são deliberadamente MUTÁVEIS.
+    Os testes e alguns estágios do pipeline precisam poder alterar
+    valores de pontos após sua criação.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+import math
 
 
-# ============================================================================
-# ENUMERAÇÕES
-# ============================================================================
+# =============================================================================
+# UTILITÁRIOS
+# =============================================================================
 
 
-class LaneSide(str, Enum):
+def _finite(value: float) -> bool:
+    """Retorna True quando o valor é numérico e finito."""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _clip01(value: float) -> float:
+    """Limita um valor ao intervalo [0, 1]."""
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# =============================================================================
+# QUALIDADE DA PROJEÇÃO
+# =============================================================================
+
+
+class ProjectionQuality(Enum):
     """
-    Relação de uma faixa com a faixa ocupada pelo veículo.
-    """
-
-    LEFT = "left"
-    CURRENT_LEFT = "current_left"
-    CURRENT = "current"
-    CURRENT_RIGHT = "current_right"
-    RIGHT = "right"
-    UNKNOWN = "unknown"
-
-
-class LaneType(str, Enum):
-    """
-    Tipo lógico de uma faixa detectada.
-
-    Por enquanto o YOLOP não fornece diretamente essa informação.
-    O sistema poderá inferi-la posteriormente a partir da geometria
-    e do comportamento temporal da linha.
-    """
-
-    UNKNOWN = "unknown"
-    SOLID = "solid"
-    DASHED = "dashed"
-
-
-class LaneQuality(str, Enum):
-    """
-    Qualidade atual da informação disponível sobre uma faixa.
-    """
-
-    NONE = "none"
-    POOR = "poor"
-    PARTIAL = "partial"
-    GOOD = "good"
-    EXCELLENT = "excellent"
-
-
-class ProjectionQuality(str, Enum):
-    """
-    Qualidade da projeção da faixa para regiões que não foram
-    diretamente observadas pelo detector.
-
-    A projeção será fundamental para curvas, mas o ADAS só poderá
-    utilizá-la quando houver informação suficiente para sustentá-la.
+    Qualidade estimada de uma projeção de faixa.
     """
 
     NONE = "none"
@@ -96,61 +75,121 @@ class ProjectionQuality(str, Enum):
     HIGH = "high"
 
 
-# ============================================================================
-# PONTO
-# ============================================================================
+# =============================================================================
+# PONTO DE FAIXA
+# =============================================================================
 
 
-@dataclass(frozen=True)
+@dataclass
 class LanePoint:
     """
-    Ponto de uma faixa no frame original.
+    Ponto pertencente a uma linha de faixa.
 
-    x:
-        Coordenada horizontal em pixels.
+    IMPORTANTE:
+        Esta classe NÃO é frozen.
 
-    y:
-        Coordenada vertical em pixels.
+    Os testes do projeto e estágios de processamento podem fazer:
 
-    confidence:
-        Confiança do detector nesse ponto.
+        point.valid = False
+        point.x = float("nan")
+        point.y = float("inf")
 
-    valid:
-        Indica se o ponto pode ser utilizado pelos módulos posteriores.
+    O projetor é responsável por rejeitar esses valores inválidos.
     """
 
     x: float
     y: float
-    confidence: float
+    confidence: float = 0.0
     valid: bool = True
 
+    def __post_init__(self) -> None:
+        """
+        Normalização mínima dos tipos.
 
-# ============================================================================
-# LINHA DETECTADA
-# ============================================================================
+        Não rejeitamos NaN/inf aqui.
+
+        Isso é intencional: pontos inválidos precisam poder existir
+        para que as camadas superiores possam filtrá-los.
+        """
+
+        try:
+            self.x = float(self.x)
+        except (TypeError, ValueError):
+            self.x = float("nan")
+
+        try:
+            self.y = float(self.y)
+        except (TypeError, ValueError):
+            self.y = float("nan")
+
+        try:
+            self.confidence = float(self.confidence)
+        except (TypeError, ValueError):
+            self.confidence = 0.0
+
+        self.valid = bool(self.valid)
+
+    @property
+    def is_finite(self) -> bool:
+        """Indica se x, y e confidence são finitos."""
+        return (
+            _finite(self.x)
+            and _finite(self.y)
+            and _finite(self.confidence)
+        )
+
+    @property
+    def is_valid(self) -> bool:
+        """
+        Indica se o ponto está marcado como válido e possui
+        valores numéricos finitos.
+        """
+        return (
+            self.valid
+            and self.is_finite
+        )
+
+    def distance_to(
+        self,
+        other: "LanePoint",
+    ) -> float:
+        """Calcula a distância euclidiana até outro ponto."""
+
+        if other is None:
+            return float("inf")
+
+        try:
+            dx = float(self.x) - float(other.x)
+            dy = float(self.y) - float(other.y)
+
+            return float(
+                math.hypot(dx, dy)
+            )
+
+        except (TypeError, ValueError):
+            return float("inf")
+
+    def copy(self) -> "LanePoint":
+        """Retorna uma cópia independente do ponto."""
+
+        return LanePoint(
+            x=self.x,
+            y=self.y,
+            confidence=self.confidence,
+            valid=self.valid,
+        )
+
+
+# =============================================================================
+# LINHA DE FAIXA
+# =============================================================================
 
 
 @dataclass
 class LaneLine:
     """
-    Representação de uma linha de faixa detectada.
-
-    Uma LaneLine representa UMA marcação longitudinal da pista.
-
-    Exemplo de uma pista com três faixas:
-
-        |       |       |
-        L0      L1      L2
-        |       |       |
-        L3      L4      L5
-
-    O sistema não assume que duas linhas consecutivas são
-    necessariamente a faixa ocupada pelo veículo.
-
-    Essa associação será responsabilidade do LaneAssociation.
+    Representa uma linha de faixa composta por vários pontos.
     """
-
-    lane_id: Optional[int] = None
 
     points: List[LanePoint] = field(
         default_factory=list
@@ -158,71 +197,226 @@ class LaneLine:
 
     confidence: float = 0.0
 
-    quality: LaneQuality = LaneQuality.NONE
+    valid: bool = True
 
-    lane_type: LaneType = LaneType.UNKNOWN
+    lane_id: Optional[int] = None
 
-    side: LaneSide = LaneSide.UNKNOWN
+    def __post_init__(self) -> None:
 
-    detected_directly: bool = True
+        if self.points is None:
+            self.points = []
 
-    projected: bool = False
+        else:
+            self.points = list(self.points)
 
-    projection_quality: ProjectionQuality = (
-        ProjectionQuality.NONE
-    )
+        try:
+            self.confidence = float(
+                self.confidence
+            )
+        except (TypeError, ValueError):
+            self.confidence = 0.0
 
-    age_frames: int = 0
+        self.valid = bool(
+            self.valid
+        )
 
-    missed_frames: int = 0
-
-    valid: bool = False
-
+    @property
     def point_count(self) -> int:
-        """
-        Quantidade de pontos válidos.
-        """
+        """Quantidade de pontos da linha."""
 
-        return sum(
-            1
-            for point in self.points
-            if point.valid
+        return len(self.points)
+
+    @property
+    def valid_points(self) -> List[LanePoint]:
+        """Retorna somente pontos válidos."""
+
+        result: List[LanePoint] = []
+
+        for point in self.points:
+
+            if point is None:
+                continue
+
+            if getattr(
+                point,
+                "is_valid",
+                False,
+            ):
+                result.append(point)
+
+        return result
+
+    @property
+    def y_min(self) -> Optional[float]:
+        """Menor coordenada Y entre os pontos válidos."""
+
+        points = self.valid_points
+
+        if not points:
+            return None
+
+        return float(
+            min(point.y for point in points)
         )
 
-    def is_observable(self) -> bool:
-        """
-        Indica se existem pontos diretamente observados.
-        """
+    @property
+    def y_max(self) -> Optional[float]:
+        """Maior coordenada Y entre os pontos válidos."""
 
-        return (
-            self.detected_directly
-            and self.point_count() > 0
+        points = self.valid_points
+
+        if not points:
+            return None
+
+        return float(
+            max(point.y for point in points)
+        )
+
+    @property
+    def x_min(self) -> Optional[float]:
+        """Menor coordenada X entre os pontos válidos."""
+
+        points = self.valid_points
+
+        if not points:
+            return None
+
+        return float(
+            min(point.x for point in points)
+        )
+
+    @property
+    def x_max(self) -> Optional[float]:
+        """Maior coordenada X entre os pontos válidos."""
+
+        points = self.valid_points
+
+        if not points:
+            return None
+
+        return float(
+            max(point.x for point in points)
+        )
+
+    def add_point(
+        self,
+        point: LanePoint,
+    ) -> None:
+        """Adiciona um ponto à linha."""
+
+        if point is None:
+            return
+
+        self.points.append(point)
+
+    def copy(self) -> "LaneLine":
+        """Cria uma cópia independente da linha."""
+
+        return LaneLine(
+            points=[
+                point.copy()
+                for point in self.points
+                if point is not None
+            ],
+            confidence=self.confidence,
+            valid=self.valid,
+            lane_id=self.lane_id,
         )
 
 
-# ============================================================================
-# MODELO GEOMÉTRICO DA FAIXA
-# ============================================================================
+# =============================================================================
+# MODELO DE FAIXA
+# =============================================================================
+
+
+@dataclass
+class LaneModel:
+    """
+    Modelo lógico de uma faixa detectada.
+
+    A estrutura mantém a linha original separada das informações
+    de confiança e identificação.
+    """
+
+    line: Optional[LaneLine] = None
+
+    confidence: float = 0.0
+
+    valid: bool = True
+
+    lane_id: Optional[int] = None
+
+    def __post_init__(self) -> None:
+
+        try:
+            self.confidence = float(
+                self.confidence
+            )
+        except (TypeError, ValueError):
+            self.confidence = 0.0
+
+        self.valid = bool(
+            self.valid
+        )
+
+    @property
+    def points(self) -> List[LanePoint]:
+        """Acesso conveniente aos pontos da linha."""
+
+        if self.line is None:
+            return []
+
+        return self.line.points
+
+    @property
+    def point_count(self) -> int:
+        """Quantidade de pontos do modelo."""
+
+        return len(self.points)
+
+    def copy(self) -> "LaneModel":
+        """Cria uma cópia independente."""
+
+        return LaneModel(
+            line=(
+                self.line.copy()
+                if self.line is not None
+                else None
+            ),
+            confidence=self.confidence,
+            valid=self.valid,
+            lane_id=self.lane_id,
+        )
+
+
+# =============================================================================
+# POLINÔMIO DA FAIXA
+# =============================================================================
 
 
 @dataclass
 class LanePolynomial:
     """
-    Modelo polinomial de uma linha de faixa.
-
-    Representa:
+    Polinômio x(y):
 
         x(y) = a*y³ + b*y² + c*y + d
 
-    O uso de x em função de y é intencional.
+    Para polinômios de grau inferior, os coeficientes ausentes
+    permanecem zero.
 
-    Em uma imagem de câmera automotiva, y representa profundidade
-    aproximada no plano da imagem. Isso permite modelar curvas
-    sem obrigar o sistema a assumir que a faixa é uma reta.
+    Exemplo:
 
-    O modelo de terceiro grau será utilizado apenas quando houver
-    pontos suficientes e estabilidade suficiente para justificar
-    esse grau.
+        linha reta:
+            a = 0
+            b = 0
+            c = constante
+            d = offset
+
+        curva quadrática:
+            a = 0
+            b != 0
+            c != 0
+            d != 0
     """
 
     a: float = 0.0
@@ -239,67 +433,153 @@ class LanePolynomial:
     confidence: float = 0.0
 
     y_min: float = 0.0
+
     y_max: float = 0.0
 
-    def evaluate(self, y: float) -> float:
+    def __post_init__(self) -> None:
+
+        for attribute in (
+            "a",
+            "b",
+            "c",
+            "d",
+            "fit_error",
+            "confidence",
+            "y_min",
+            "y_max",
+        ):
+            try:
+                setattr(
+                    self,
+                    attribute,
+                    float(
+                        getattr(
+                            self,
+                            attribute,
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                if attribute == "fit_error":
+                    setattr(
+                        self,
+                        attribute,
+                        float("inf"),
+                    )
+                else:
+                    setattr(
+                        self,
+                        attribute,
+                        0.0,
+                    )
+
+        try:
+            self.sample_count = int(
+                self.sample_count
+            )
+        except (TypeError, ValueError):
+            self.sample_count = 0
+
+        self.valid = bool(
+            self.valid
+        )
+
+        self.confidence = _clip01(
+            self.confidence
+        )
+
+    def evaluate(
+        self,
+        y: float,
+    ) -> float:
         """
         Avalia x(y).
         """
 
-        return (
-            self.a * y ** 3
-            + self.b * y ** 2
-            + self.c * y
+        y = float(y)
+
+        return float(
+            (
+                (
+                    self.a * y
+                    + self.b
+                )
+                * y
+                + self.c
+            )
+            * y
             + self.d
         )
 
-    def derivative(self, y: float) -> float:
+    def derivative(
+        self,
+        y: float,
+    ) -> float:
         """
-        Primeira derivada dx/dy.
+        Calcula dx/dy.
         """
 
-        return (
-            3.0 * self.a * y ** 2
+        y = float(y)
+
+        return float(
+            3.0 * self.a * y * y
             + 2.0 * self.b * y
             + self.c
         )
 
-    def second_derivative(self, y: float) -> float:
+    def second_derivative(
+        self,
+        y: float,
+    ) -> float:
         """
-        Segunda derivada d²x/dy².
+        Calcula d²x/dy².
         """
 
-        return (
+        y = float(y)
+
+        return float(
             6.0 * self.a * y
             + 2.0 * self.b
         )
 
+    def coefficients(
+        self,
+    ) -> Tuple[float, float, float, float]:
+        """Retorna os coeficientes em ordem a,b,c,d."""
 
-# ============================================================================
+        return (
+            float(self.a),
+            float(self.b),
+            float(self.c),
+            float(self.d),
+        )
+
+    def copy(self) -> "LanePolynomial":
+        """Cria uma cópia independente."""
+
+        return LanePolynomial(
+            a=self.a,
+            b=self.b,
+            c=self.c,
+            d=self.d,
+            valid=self.valid,
+            fit_error=self.fit_error,
+            sample_count=self.sample_count,
+            confidence=self.confidence,
+            y_min=self.y_min,
+            y_max=self.y_max,
+        )
+
+
+# =============================================================================
 # PROJEÇÃO
-# ============================================================================
+# =============================================================================
 
 
 @dataclass
 class LaneProjection:
     """
-    Resultado da extrapolação de uma faixa.
-
-    A projeção representa a continuação matemática de uma faixa
-    parcialmente observada.
-
-    Importante:
-
-    Projeção NÃO significa que a faixa foi realmente detectada.
-
-    O sistema deve distinguir:
-
-        observado
-        projetado
-        observado + projetado
-
-    para impedir que uma previsão matemática seja tratada como
-    informação visual real.
+    Resultado estrutural da projeção de uma linha de faixa.
     """
 
     polynomial: Optional[LanePolynomial] = None
@@ -318,336 +598,142 @@ class LaneProjection:
 
     horizon_y: Optional[float] = None
 
-
-# ============================================================================
-# FAIXA COMPLETA
-# ============================================================================
-
-
-@dataclass
-class LaneModel:
-    """
-    Modelo completo de uma linha de faixa.
-
-    Junta:
-
-        detecção
-        histórico
-        modelo matemático
-        projeção
-        identificação lógica
-    """
-
-    lane_id: int
-
-    line: LaneLine = field(
-        default_factory=LaneLine
-    )
-
-    polynomial: Optional[LanePolynomial] = None
-
-    projection: Optional[LaneProjection] = None
-
-    tracked: bool = False
-
-    stable: bool = False
-
-    valid: bool = False
-
-
-# ============================================================================
-# FAIXA OCUPADA PELO VEÍCULO
-# ============================================================================
-
-
-@dataclass
-class CurrentLane:
-    """
-    Representa a faixa atualmente ocupada pelo veículo.
-
-    left_boundary:
-        Linha que limita a faixa pelo lado esquerdo.
-
-    right_boundary:
-        Linha que limita a faixa pelo lado direito.
-
-    center_x:
-        Centro estimado da faixa no ponto analisado.
-
-    lateral_offset:
-        Distância horizontal do centro do veículo para o centro
-        da faixa.
-
-    normalized_offset:
-        Offset normalizado pela largura da faixa.
-
-        -1.0 ≈ limite esquerdo
-         0.0 ≈ centro
-        +1.0 ≈ limite direito
-    """
-
-    left_boundary: Optional[LaneModel] = None
-
-    right_boundary: Optional[LaneModel] = None
-
-    center_x: Optional[float] = None
-
-    lane_width: Optional[float] = None
-
-    lateral_offset: Optional[float] = None
-
-    normalized_offset: Optional[float] = None
-
-    confidence: float = 0.0
-
-    valid: bool = False
-
-
-# ============================================================================
-# RESULTADO DA ASSOCIAÇÃO
-# ============================================================================
-
-
-@dataclass
-class LaneAssociationResult:
-    """
-    Resultado da identificação de todas as faixas em relação
-    ao veículo.
-
-    Exemplo:
-
-        esquerda        atual        direita
-           |              |             |
-           |      CARRO   |             |
-           |        ↓     |             |
-        Lane 0          Lane 1        Lane 2
-
-    Com no máximo três faixas + acostamento, esse objeto permitirá
-    manter a identificação mesmo quando uma linha desaparecer
-    temporariamente.
-    """
-
-    lanes: List[LaneModel] = field(
-        default_factory=list
-    )
-
-    current_lane: Optional[CurrentLane] = None
-
-    current_lane_id: Optional[int] = None
-
-    left_lanes: List[LaneModel] = field(
-        default_factory=list
-    )
-
-    right_lanes: List[LaneModel] = field(
-        default_factory=list
-    )
-
-    valid: bool = False
-
-    confidence: float = 0.0
-
-
-# ============================================================================
-# GEOMETRIA
-# ============================================================================
-
-
-@dataclass
-class LaneGeometry:
-    """
-    Informações geométricas da faixa atual.
-
-    Não representa apenas a posição atual.
-
-    Também armazena informações necessárias para prever
-    como a faixa continuará à frente.
-    """
-
-    current_center_x: Optional[float] = None
-
-    lookahead_center_x: Optional[float] = None
-
-    lane_width: Optional[float] = None
-
-    lateral_offset: Optional[float] = None
-
-    normalized_offset: Optional[float] = None
-
-    heading_error: Optional[float] = None
-
-    curvature: Optional[float] = None
-
-    curvature_direction: Optional[float] = None
-
-    valid: bool = False
-
-    confidence: float = 0.0
-
-
-# ============================================================================
-# ESTADO VISUAL DA FAIXA
-# ============================================================================
-
-
-class LaneProximity(str, Enum):
-    """
-    Proximidade do veículo em relação ao centro da faixa.
-    """
-
-    CENTERED = "centered"
-    APPROACHING_LEFT = "approaching_left"
-    APPROACHING_RIGHT = "approaching_right"
-    NEAR_LEFT = "near_left"
-    NEAR_RIGHT = "near_right"
-    VERY_NEAR_LEFT = "very_near_left"
-    VERY_NEAR_RIGHT = "very_near_right"
-    UNKNOWN = "unknown"
-
-
-@dataclass
-class LaneWarning:
-    """
-    Estado de advertência relacionado à posição lateral.
-    """
-
-    proximity: LaneProximity = LaneProximity.UNKNOWN
-
-    warning_level: int = 0
-
-    correction_allowed: bool = False
-
-    confidence: float = 0.0
-
-    valid: bool = False
-
-
-# ============================================================================
-# SNAPSHOT COMPLETO
-# ============================================================================
-
-
-@dataclass
-class LaneFrame:
-    """
-    Snapshot completo de uma análise de faixas em um frame.
-
-    Esse será o objeto principal transportado entre as camadas
-    do sistema.
-    """
-
-    frame_index: int = 0
-
-    timestamp: float = 0.0
-
-    detected_lanes: List[LaneModel] = field(
-        default_factory=list
-    )
-
-    association: Optional[
-        LaneAssociationResult
-    ] = None
-
-    current_lane: Optional[
-        CurrentLane
-    ] = None
-
-    geometry: Optional[
-        LaneGeometry
-    ] = None
-
-    warning: Optional[
-        LaneWarning
-    ] = None
-
-    valid: bool = False
-
-    enough_information: bool = False
-
-    safe_for_adas: bool = False
-
-    error: Optional[str] = None
-
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-
-def lane_points_to_xy(
-    points: List[LanePoint],
-) -> List[Tuple[float, float]]:
-    """
-    Converte LanePoint para pares (x, y).
-    """
-
-    return [
-        (point.x, point.y)
-        for point in points
-        if point.valid
-    ]
-
-
-def calculate_lane_center(
-    left_x: float,
-    right_x: float,
-) -> float:
-    """
-    Calcula o centro horizontal entre duas linhas.
-
-        centro = (esquerda + direita) / 2
-    """
-
-    return (
-        left_x + right_x
-    ) / 2.0
-
-
-def calculate_normalized_offset(
-    vehicle_x: float,
-    center_x: float,
-    lane_width: float,
-) -> Optional[float]:
-    """
-    Calcula o deslocamento lateral normalizado.
-
-    Resultado:
-
-        0.0  -> centro da faixa
-        <0   -> esquerda do centro
-        >0   -> direita do centro
-
-    A normalização pela largura da faixa torna o valor
-    independente da resolução da imagem.
-    """
-
-    if lane_width <= 0.0:
-        return None
-
-    return (
-        vehicle_x - center_x
-    ) / (
-        lane_width / 2.0
-    )
+    def __post_init__(self) -> None:
+
+        if self.points is None:
+            self.points = []
+
+        else:
+            self.points = list(
+                self.points
+            )
+
+        if not isinstance(
+            self.quality,
+            ProjectionQuality,
+        ):
+            try:
+                self.quality = (
+                    ProjectionQuality(
+                        self.quality
+                    )
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                self.quality = (
+                    ProjectionQuality.NONE
+                )
+
+        self.extrapolated = bool(
+            self.extrapolated
+        )
+
+        self.valid = bool(
+            self.valid
+        )
+
+        if self.horizon_y is not None:
+            try:
+                self.horizon_y = float(
+                    self.horizon_y
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                self.horizon_y = None
+
+    @property
+    def point_count(self) -> int:
+        """Quantidade de pontos projetados."""
+
+        return len(self.points)
+
+    @property
+    def confidence(self) -> float:
+        """Confiança do polinômio associado."""
+
+        if self.polynomial is None:
+            return 0.0
+
+        return float(
+            self.polynomial.confidence
+        )
+
+    @property
+    def fit_error(self) -> float:
+        """Erro do ajuste polinomial."""
+
+        if self.polynomial is None:
+            return float("inf")
+
+        return float(
+            self.polynomial.fit_error
+        )
+
+    def evaluate(
+        self,
+        y: float,
+    ) -> Optional[float]:
+        """
+        Avalia diretamente o polinômio da projeção.
+        """
+
+        if (
+            self.polynomial is None
+            or not self.polynomial.valid
+        ):
+            return None
+
+        try:
+            value = self.polynomial.evaluate(
+                y
+            )
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            return None
+
+        if not _finite(value):
+            return None
+
+        return float(value)
+
+    def copy(self) -> "LaneProjection":
+        """Cria uma cópia independente da projeção."""
+
+        return LaneProjection(
+            polynomial=(
+                self.polynomial.copy()
+                if self.polynomial is not None
+                else None
+            ),
+            points=[
+                point.copy()
+                for point in self.points
+                if point is not None
+            ],
+            quality=self.quality,
+            extrapolated=self.extrapolated,
+            valid=self.valid,
+            horizon_y=self.horizon_y,
+        )
+
+
+# =============================================================================
+# EXPORTAÇÕES
+# =============================================================================
 
 
 __all__ = [
-    "LaneSide",
-    "LaneType",
-    "LaneQuality",
     "ProjectionQuality",
-    "LaneProximity",
     "LanePoint",
     "LaneLine",
+    "LaneModel",
     "LanePolynomial",
     "LaneProjection",
-    "LaneModel",
-    "CurrentLane",
-    "LaneAssociationResult",
-    "LaneGeometry",
-    "LaneWarning",
-    "LaneFrame",
-    "lane_points_to_xy",
-    "calculate_lane_center",
-    "calculate_normalized_offset",
 ]

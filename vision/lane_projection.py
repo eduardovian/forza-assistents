@@ -9,19 +9,21 @@ Responsabilidade:
         ↓
     LaneProjectionEngine
         ↓
-    projeção x(y)
+    validação dos pontos
         ↓
-    LaneProjection
+    ajuste polinomial x(y)
+        ↓
+    extrapolação controlada
+        ↓
+    LaneProjectionResult
 
 Este módulo NÃO:
+
     - executa YOLOP;
     - realiza tracking;
     - identifica a faixa atual;
     - calcula posição do veículo;
     - toma decisões ADAS.
-
-A estrutura LaneProjection utilizada como resultado pertence
-a vision.lane_types.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ DEFAULT_MAX_EXTRAPOLATION = 0.35
 DEFAULT_SAMPLE_STEP = 8
 DEFAULT_POLYNOMIAL_DEGREE = 3
 DEFAULT_MIN_CONFIDENCE = 0.45
+DEFAULT_MAX_PROJECTION_DISTANCE = None
 
 
 # =============================================================================
@@ -60,41 +63,91 @@ DEFAULT_MIN_CONFIDENCE = 0.45
 # =============================================================================
 
 def _clip01(value: float) -> float:
-    return float(
-        np.clip(
-            value,
-            0.0,
-            1.0,
-        )
-    )
+    """
+    Limita um valor ao intervalo [0, 1].
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if not np.isfinite(value):
+        return 0.0
+
+    return float(np.clip(value, 0.0, 1.0))
 
 
-def _finite_array(
-    values: np.ndarray,
-) -> bool:
-    return bool(
-        np.all(
-            np.isfinite(values)
-        )
-    )
+def _is_finite_scalar(value: object) -> bool:
+    """
+    Verifica se um valor pode ser convertido para float e é finito.
+    """
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _finite_array(values: np.ndarray) -> bool:
+    """
+    Verifica se todos os elementos de um array são finitos.
+    """
+    if values is None:
+        return False
+
+    try:
+        return bool(np.all(np.isfinite(values)))
+    except (TypeError, ValueError):
+        return False
 
 
 # =============================================================================
-# RESULTADO LEGACY
+# RESULTADO
 # =============================================================================
 
 class LaneProjectionResult:
     """
-    Resultado detalhado da projeção.
+    Resultado detalhado da projeção de uma linha de faixa.
 
-    Mantido para compatibilidade com testes e código
-    que utilizavam a implementação anterior.
+    Attributes
+    ----------
+    points:
+        Pontos resultantes da projeção.
+
+    coefficients:
+        Coeficientes do polinômio normalizado utilizado no ajuste.
+
+    degree:
+        Grau efetivamente utilizado no ajuste.
+
+    fitted:
+        Indica se o ajuste polinomial foi realizado.
+
+    extrapolated:
+        Indica se houve extrapolação além dos dados observados.
+
+    confidence:
+        Confiança final da projeção.
+
+    fit_error:
+        Erro do ajuste em pixels.
+
+    source_y_min/source_y_max:
+        Limites verticais dos dados originais.
+
+    projected_y_min/projected_y_max:
+        Limites verticais efetivamente projetados.
+
+    valid:
+        Indica se a projeção é válida.
+
+    error:
+        Descrição do erro quando a projeção é rejeitada.
     """
 
     def __init__(
         self,
         points: Optional[List[LanePoint]] = None,
-        coefficients: Tuple[float, ...] = tuple(),
+        coefficients: Tuple[float, ...] = (),
         degree: int = 0,
         fitted: bool = False,
         extrapolated: bool = False,
@@ -108,54 +161,66 @@ class LaneProjectionResult:
         error: Optional[str] = None,
     ) -> None:
 
-        self.points = (
-            points
-            if points is not None
-            else []
+        self.points = list(points) if points is not None else []
+
+        self.coefficients = tuple(
+            float(value)
+            for value in coefficients
         )
 
-        self.coefficients = coefficients
         self.degree = int(degree)
         self.fitted = bool(fitted)
-        self.extrapolated = bool(
-            extrapolated
-        )
-        self.confidence = float(
-            confidence
-        )
-        self.fit_error = float(
-            fit_error
-        )
-        self.source_y_min = float(
-            source_y_min
-        )
-        self.source_y_max = float(
-            source_y_max
-        )
-        self.projected_y_min = float(
-            projected_y_min
-        )
-        self.projected_y_max = float(
-            projected_y_max
-        )
+        self.extrapolated = bool(extrapolated)
+
+        self.confidence = float(confidence)
+        self.fit_error = float(fit_error)
+
+        self.source_y_min = float(source_y_min)
+        self.source_y_max = float(source_y_max)
+
+        self.projected_y_min = float(projected_y_min)
+        self.projected_y_max = float(projected_y_max)
+
         self.valid = bool(valid)
         self.error = error
 
+    @property
+    def quality(self) -> ProjectionQuality:
+        """
+        Classificação qualitativa da projeção.
+        """
+
+        if not self.valid:
+            return ProjectionQuality.NONE
+
+        if self.confidence >= 0.80:
+            return ProjectionQuality.HIGH
+
+        if self.confidence >= 0.60:
+            return ProjectionQuality.MEDIUM
+
+        if self.confidence >= 0.40:
+            return ProjectionQuality.LOW
+
+        return ProjectionQuality.NONE
+
 
 # =============================================================================
-# PROJETOR
+# MOTOR
 # =============================================================================
 
 class LaneProjectionEngine:
     """
-    Motor de projeção das linhas de faixa.
+    Motor responsável por ajustar e projetar uma linha de faixa.
 
-    O modelo matemático utilizado é:
+    Modelo:
 
         x(y) = a*y³ + b*y² + c*y + d
 
-    O ajuste é realizado em coordenadas Y normalizadas para
-    melhorar a estabilidade numérica.
+    O ajuste interno utiliza Y normalizado para melhorar
+    a estabilidade numérica.
+
+    A projeção final é limitada à imagem.
     """
 
     def __init__(
@@ -167,15 +232,22 @@ class LaneProjectionEngine:
         sample_step: int = DEFAULT_SAMPLE_STEP,
         polynomial_degree: int = DEFAULT_POLYNOMIAL_DEGREE,
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+        degree: Optional[int] = None,
+        max_projection_distance: Optional[float] = (
+            DEFAULT_MAX_PROJECTION_DISTANCE
+        ),
     ) -> None:
 
+        if degree is not None:
+            polynomial_degree = degree
+
         self.min_points = max(
-            4,
+            2,
             int(min_points),
         )
 
         self.min_vertical_span = max(
-            1.0,
+            0.0,
             float(min_vertical_span),
         )
 
@@ -184,9 +256,20 @@ class LaneProjectionEngine:
             float(max_fit_error),
         )
 
+        self.degree = int(
+            np.clip(
+                int(polynomial_degree),
+                1,
+                3,
+            )
+        )
+
+        # Compatibilidade.
+        self.polynomial_degree = self.degree
+
         self.max_extrapolation = float(
             np.clip(
-                max_extrapolation,
+                float(max_extrapolation),
                 0.0,
                 2.0,
             )
@@ -197,46 +280,80 @@ class LaneProjectionEngine:
             int(sample_step),
         )
 
-        self.polynomial_degree = int(
-            np.clip(
-                polynomial_degree,
-                1,
-                3,
-            )
+        self.min_confidence = _clip01(
+            min_confidence,
         )
 
-        self.min_confidence = _clip01(
-            min_confidence
-        )
+        if max_projection_distance is None:
+            self.max_projection_distance = None
+        else:
+            self.max_projection_distance = max(
+                0.0,
+                float(max_projection_distance),
+            )
 
     # =========================================================================
-    # FILTRAGEM
+    # VALIDAÇÃO DE PONTOS
     # =========================================================================
 
     @staticmethod
     def _valid_points(
         points: Iterable[LanePoint],
     ) -> List[LanePoint]:
+        """
+        Filtra pontos inválidos sem modificar os objetos originais.
+        """
+
+        if points is None:
+            return []
 
         result: List[LanePoint] = []
 
-        for point in points:
+        try:
+            iterator = iter(points)
+        except TypeError:
+            return []
 
-            if not point.valid:
+        for point in iterator:
+
+            if point is None:
+                continue
+
+            try:
+                if not bool(
+                    getattr(
+                        point,
+                        "valid",
+                        True,
+                    )
+                ):
+                    continue
+
+                x = float(point.x)
+                y = float(point.y)
+                confidence = float(point.confidence)
+
+            except (
+                AttributeError,
+                TypeError,
+                ValueError,
+            ):
                 continue
 
             if not (
-                np.isfinite(point.x)
-                and np.isfinite(point.y)
-                and np.isfinite(
-                    point.confidence
-                )
+                np.isfinite(x)
+                and np.isfinite(y)
+                and np.isfinite(confidence)
             ):
                 continue
 
             result.append(point)
 
         return result
+
+    # =========================================================================
+    # PREPARAÇÃO
+    # =========================================================================
 
     def _prepare_points(
         self,
@@ -246,30 +363,29 @@ class LaneProjectionEngine:
         np.ndarray,
         np.ndarray,
     ]:
+        """
+        Valida, filtra, ordena e consolida os pontos.
+        """
 
-        valid = self._valid_points(
-            points
-        )
+        valid = self._valid_points(points)
 
         valid = [
             point
             for point in valid
-            if point.confidence
+            if float(point.confidence)
             >= self.min_confidence
         ]
 
         if len(valid) < self.min_points:
             raise ValueError(
-                "Pontos insuficientes "
-                "para projeção."
+                "Pontos insuficientes para projeção."
             )
 
         valid.sort(
-            key=lambda point: point.y
+            key=lambda point: float(point.y)
         )
 
-        # Agrupa pontos com Y praticamente igual.
-        groups: dict[float, List[LanePoint]] = {}
+        groups = {}
 
         for point in valid:
 
@@ -281,106 +397,117 @@ class LaneProjectionEngine:
             groups.setdefault(
                 key,
                 [],
-            ).append(point)
+            ).append(
+                point
+            )
 
-        unique_points: List[
-            LanePoint
-        ] = []
+        unique_x: List[float] = []
+        unique_y: List[float] = []
+        unique_confidence: List[float] = []
 
         for group in groups.values():
 
-            confidence_sum = sum(
-                point.confidence
-                for point in group
+            xs = np.asarray(
+                [
+                    float(point.x)
+                    for point in group
+                ],
+                dtype=np.float64,
             )
 
-            if confidence_sum <= 0.0:
-                confidence_sum = float(
-                    len(group)
+            ys = np.asarray(
+                [
+                    float(point.y)
+                    for point in group
+                ],
+                dtype=np.float64,
+            )
+
+            weights = np.asarray(
+                [
+                    max(
+                        0.0,
+                        float(point.confidence),
+                    )
+                    for point in group
+                ],
+                dtype=np.float64,
+            )
+
+            if not (
+                _finite_array(xs)
+                and _finite_array(ys)
+                and _finite_array(weights)
+            ):
+                continue
+
+            if np.sum(weights) <= 0.0:
+                weights = np.ones_like(weights)
+
+            unique_x.append(
+                float(
+                    np.average(
+                        xs,
+                        weights=weights,
+                    )
                 )
-
-            x = sum(
-                point.x
-                * point.confidence
-                for point in group
-            ) / confidence_sum
-
-            y = sum(
-                point.y
-                * point.confidence
-                for point in group
-            ) / confidence_sum
-
-            confidence = max(
-                point.confidence
-                for point in group
             )
 
-            unique_points.append(
-                LanePoint(
-                    x=float(x),
-                    y=float(y),
-                    confidence=float(
-                        confidence
-                    ),
-                    valid=True,
+            unique_y.append(
+                float(
+                    np.average(
+                        ys,
+                        weights=weights,
+                    )
                 )
             )
 
-        unique_points.sort(
-            key=lambda point: point.y
-        )
+            unique_confidence.append(
+                float(
+                    np.mean(weights)
+                )
+            )
 
-        if len(unique_points) < self.min_points:
+        if len(unique_x) < self.min_points:
             raise ValueError(
                 "Pontos verticais insuficientes."
             )
 
         x = np.asarray(
-            [
-                point.x
-                for point in unique_points
-            ],
+            unique_x,
             dtype=np.float64,
         )
 
         y = np.asarray(
-            [
-                point.y
-                for point in unique_points
-            ],
+            unique_y,
             dtype=np.float64,
         )
 
         confidence = np.asarray(
-            [
-                point.confidence
-                for point in unique_points
-            ],
+            unique_confidence,
             dtype=np.float64,
         )
 
         if not (
             _finite_array(x)
             and _finite_array(y)
-            and _finite_array(
-                confidence
-            )
+            and _finite_array(confidence)
         ):
             raise ValueError(
-                "Pontos possuem valores "
-                "não finitos."
+                "Pontos possuem valores não finitos."
             )
 
+        order = np.argsort(y)
+
+        x = x[order]
+        y = y[order]
+        confidence = confidence[order]
+
         vertical_span = float(
-            np.max(y)
-            - np.min(y)
+            y[-1] - y[0]
         )
 
-        if (
-            vertical_span
-            < self.min_vertical_span
-        ):
+        if vertical_span < self.min_vertical_span:
             raise ValueError(
                 "Extensão vertical insuficiente."
             )
@@ -392,7 +519,7 @@ class LaneProjectionEngine:
         )
 
     # =========================================================================
-    # AJUSTE
+    # AJUSTE POLINOMIAL
     # =========================================================================
 
     def _fit(
@@ -406,62 +533,92 @@ class LaneProjectionEngine:
         float,
         int,
     ]:
+        """
+        Ajusta x(y) em coordenadas Y normalizadas.
+        """
+
+        if len(x) < 2:
+            raise ValueError(
+                "Pontos insuficientes para ajuste."
+            )
 
         degree = min(
-            self.polynomial_degree,
+            self.degree,
             len(x) - 1,
         )
 
         if degree < 1:
             raise ValueError(
-                "Não foi possível ajustar "
-                "o polinômio."
+                "Grau polinomial inválido."
             )
 
-        y_center = float(
+        center = float(
             np.mean(y)
         )
 
-        y_scale = float(
+        scale = float(
             np.max(
                 np.abs(
-                    y - y_center
+                    y - center
                 )
             )
         )
 
-        if y_scale < 1e-6:
+        if not np.isfinite(scale) or scale < 1e-9:
             raise ValueError(
                 "Escala vertical inválida."
             )
 
-        yn = (
-            y - y_center
-        ) / y_scale
+        normalized_y = (
+            y - center
+        ) / scale
 
-        coefficients = np.polyfit(
-            yn,
-            x,
-            degree,
-        )
+        if not _finite_array(normalized_y):
+            raise ValueError(
+                "Normalização vertical inválida."
+            )
+
+        try:
+            coefficients = np.polyfit(
+                normalized_y,
+                x,
+                degree,
+            )
+        except (
+            TypeError,
+            ValueError,
+            np.linalg.LinAlgError,
+        ) as exc:
+            raise ValueError(
+                f"Falha no ajuste polinomial: {exc}"
+            ) from exc
+
+        if not _finite_array(coefficients):
+            raise ValueError(
+                "Coeficientes polinomiais inválidos."
+            )
 
         predicted = np.polyval(
             coefficients,
-            yn,
+            normalized_y,
         )
+
+        if not _finite_array(predicted):
+            raise ValueError(
+                "Predição polinomial inválida."
+            )
 
         residuals = (
             x - predicted
         )
 
-        abs_residuals = np.abs(
-            residuals
-        )
-
-        median_error = float(
-            np.median(
-                abs_residuals
+        if not _finite_array(residuals):
+            raise ValueError(
+                "Resíduos inválidos."
             )
+
+        absolute_residuals = np.abs(
+            residuals
         )
 
         rmse = float(
@@ -472,21 +629,32 @@ class LaneProjectionEngine:
             )
         )
 
+        median_error = float(
+            np.median(
+                absolute_residuals
+            )
+        )
+
         fit_error = max(
             median_error,
             rmse * 0.75,
         )
 
+        if not np.isfinite(fit_error):
+            raise ValueError(
+                "Erro do ajuste inválido."
+            )
+
         return (
             coefficients,
             fit_error,
-            y_center,
-            y_scale,
+            center,
+            scale,
             degree,
         )
 
     # =========================================================================
-    # CONVERSÃO PARA LanePolynomial
+    # COEFICIENTES ABSOLUTOS
     # =========================================================================
 
     @staticmethod
@@ -503,139 +671,159 @@ class LaneProjectionEngine:
         """
         Converte:
 
-            x = p(z)
-            z = (y-center)/scale
+            p((y-center)/scale)
 
         para:
 
-            x = a*y³+b*y²+c*y+d
+            a*y³ + b*y² + c*y + d
         """
+
+        if not (
+            _is_finite_scalar(center)
+            and _is_finite_scalar(scale)
+            and float(scale) > 0.0
+        ):
+            raise ValueError(
+                "Centro ou escala inválidos."
+            )
+
+        coefficients = np.asarray(
+            coefficients,
+            dtype=np.float64,
+        )
+
+        if not _finite_array(coefficients):
+            raise ValueError(
+                "Coeficientes inválidos."
+            )
 
         if len(coefficients) == 4:
 
-            an, bn, cn, dn = (
-                float(value)
-                for value in coefficients
-            )
+            an, bn, cn, dn = coefficients
 
             a = (
                 an
-                / scale ** 3
+                / scale**3
             )
 
             b = (
                 -3.0
                 * an
                 * center
-                / scale ** 3
+                / scale**3
                 + bn
-                / scale ** 2
+                / scale**2
             )
 
             c = (
                 3.0
                 * an
-                * center ** 2
-                / scale ** 3
+                * center**2
+                / scale**3
                 - 2.0
                 * bn
                 * center
-                / scale ** 2
+                / scale**2
                 + cn
                 / scale
             )
 
             d = (
                 -an
-                * center ** 3
-                / scale ** 3
+                * center**3
+                / scale**3
                 + bn
-                * center ** 2
-                / scale ** 2
+                * center**2
+                / scale**2
                 - cn
                 * center
                 / scale
                 + dn
             )
 
-            return (
+            result = (
                 float(a),
                 float(b),
                 float(c),
                 float(d),
             )
 
-        if len(coefficients) == 3:
+        elif len(coefficients) == 3:
 
-            a2, b2, c2 = (
-                float(value)
-                for value in coefficients
-            )
+            an, bn, cn = coefficients
 
             a = 0.0
 
             b = (
-                a2
-                / scale ** 2
+                an
+                / scale**2
             )
 
             c = (
                 -2.0
-                * a2
+                * an
                 * center
-                / scale ** 2
-                + b2
+                / scale**2
+                + bn
                 / scale
             )
 
             d = (
-                a2
-                * center ** 2
-                / scale ** 2
-                - b2
+                an
+                * center**2
+                / scale**2
+                - bn
                 * center
                 / scale
-                + c2
+                + cn
             )
 
-            return (
-                a,
-                b,
-                c,
-                d,
+            result = (
+                float(a),
+                float(b),
+                float(c),
+                float(d),
             )
 
-        if len(coefficients) == 2:
+        elif len(coefficients) == 2:
 
-            a1, b1 = (
-                float(value)
-                for value in coefficients
-            )
+            an, bn = coefficients
 
-            return (
+            result = (
                 0.0,
                 0.0,
-                a1 / scale,
-                b1
-                - a1
-                * center
-                / scale,
-            )
-
-        if len(coefficients) == 1:
-
-            return (
-                0.0,
-                0.0,
-                0.0,
+                float(an / scale),
                 float(
-                    coefficients[0]
+                    bn
+                    - an
+                    * center
+                    / scale
                 ),
             )
 
-        raise ValueError(
-            "Coeficientes inválidos."
-        )
+        elif len(coefficients) == 1:
+
+            result = (
+                0.0,
+                0.0,
+                0.0,
+                float(coefficients[0]),
+            )
+
+        else:
+            raise ValueError(
+                "Quantidade de coeficientes inválida."
+            )
+
+        if not all(
+            np.isfinite(value)
+            for value in result
+        ):
+            raise ValueError(
+                "Coeficientes absolutos inválidos."
+            )
+
+        return result
 
     # =========================================================================
     # CONFIANÇA
@@ -648,6 +836,14 @@ class LaneProjectionEngine:
         fit_error: float,
         point_confidence: float,
     ) -> float:
+        """
+        Calcula confiança combinando:
+
+        - quantidade de pontos;
+        - extensão vertical;
+        - erro do ajuste;
+        - confiança média da detecção.
+        """
 
         count_score = _clip01(
             point_count / 25.0
@@ -657,9 +853,7 @@ class LaneProjectionEngine:
             vertical_span / 400.0
         )
 
-        if not np.isfinite(
-            fit_error
-        ):
+        if not np.isfinite(fit_error):
             error_score = 0.0
         else:
             error_score = float(
@@ -668,25 +862,199 @@ class LaneProjectionEngine:
                 )
             )
 
-        return _clip01(
+        confidence = (
             0.30 * count_score
             + 0.25 * span_score
             + 0.25 * error_score
-            + 0.20 * point_confidence
+            + 0.20 * _clip01(
+                point_confidence
+            )
+        )
+
+        return _clip01(
+            confidence
         )
 
     # =========================================================================
-    # PROJEÇÃO
+    # QUALIDADE
+    # =========================================================================
+
+    @staticmethod
+    def _quality(
+        confidence: float,
+    ) -> ProjectionQuality:
+
+        confidence = _clip01(
+            confidence
+        )
+
+        if confidence >= 0.80:
+            return ProjectionQuality.HIGH
+
+        if confidence >= 0.60:
+            return ProjectionQuality.MEDIUM
+
+        if confidence >= 0.40:
+            return ProjectionQuality.LOW
+
+        return ProjectionQuality.NONE
+
+    # =========================================================================
+    # INTERVALO DE PROJEÇÃO
+    # =========================================================================
+
+    def _projection_interval(
+        self,
+        source_y_min: float,
+        source_y_max: float,
+        image_height: int,
+    ) -> Tuple[
+        float,
+        float,
+    ]:
+        """
+        Calcula o intervalo vertical da projeção.
+
+        max_projection_distance, quando definido, limita a distância
+        de qualquer ponto projetado em relação a source_y_max.
+        """
+
+        if (
+            not np.isfinite(source_y_min)
+            or not np.isfinite(source_y_max)
+        ):
+            raise ValueError(
+                "Limites verticais inválidos."
+            )
+
+        if source_y_max <= source_y_min:
+            raise ValueError(
+                "Intervalo vertical inválido."
+            )
+
+        if self.max_projection_distance is not None:
+
+            distance = (
+                self.max_projection_distance
+            )
+
+            projected_y_min = max(
+                0.0,
+                source_y_max
+                - distance,
+            )
+
+            projected_y_max = min(
+                float(image_height - 1),
+                source_y_max,
+            )
+
+        else:
+
+            vertical_span = (
+                source_y_max
+                - source_y_min
+            )
+
+            extrapolation = (
+                vertical_span
+                * self.max_extrapolation
+            )
+
+            projected_y_min = max(
+                0.0,
+                source_y_min
+                - extrapolation,
+            )
+
+            projected_y_max = min(
+                float(image_height - 1),
+                source_y_max
+                + extrapolation,
+            )
+
+        if (
+            projected_y_max
+            <= projected_y_min
+        ):
+            raise ValueError(
+                "Intervalo de projeção inválido."
+            )
+
+        return (
+            float(projected_y_min),
+            float(projected_y_max),
+        )
+
+    # =========================================================================
+    # AMOSTRAGEM
+    # =========================================================================
+
+    def _sample_y(
+        self,
+        y_min: float,
+        y_max: float,
+    ) -> np.ndarray:
+        """
+        Gera amostras verticais incluindo obrigatoriamente o limite final.
+        """
+
+        if y_max <= y_min:
+            return np.empty(
+                0,
+                dtype=np.float64,
+            )
+
+        ys = np.arange(
+            y_min,
+            y_max + self.sample_step,
+            self.sample_step,
+            dtype=np.float64,
+        )
+
+        if ys.size == 0:
+            return np.asarray(
+                [y_min, y_max],
+                dtype=np.float64,
+            )
+
+        if ys[-1] < y_max:
+            ys = np.append(
+                ys,
+                y_max,
+            )
+
+        else:
+            ys[-1] = min(
+                ys[-1],
+                y_max,
+            )
+
+        return ys
+
+    # =========================================================================
+    # PROJEÇÃO PRINCIPAL
     # =========================================================================
 
     def project(
         self,
         points: Sequence[LanePoint],
-        image_height: int,
-        image_width: int,
+        image_height: int = 480,
+        image_width: int = 640,
     ) -> LaneProjectionResult:
+        """
+        Ajusta e projeta uma linha de faixa.
+        """
 
         try:
+
+            image_height = int(
+                image_height
+            )
+
+            image_width = int(
+                image_width
+            )
 
             if image_height <= 0:
                 raise ValueError(
@@ -718,71 +1086,37 @@ class LaneProjectionEngine:
             )
 
             if (
-                not np.isfinite(
-                    fit_error
-                )
-                or fit_error
-                > self.max_fit_error
+                fit_error > self.max_fit_error
             ):
                 raise ValueError(
-                    "Erro do ajuste acima "
-                    "do limite permitido."
+                    "Erro do ajuste acima do limite permitido."
                 )
 
             source_y_min = float(
-                np.min(y)
+                y[0]
             )
 
             source_y_max = float(
-                np.max(y)
+                y[-1]
             )
 
-            vertical_span = (
-                source_y_max
-                - source_y_min
-            )
-
-            extrapolation = (
-                vertical_span
-                * self.max_extrapolation
-            )
-
-            projected_y_min = max(
-                0.0,
-                source_y_min
-                - extrapolation,
-            )
-
-            projected_y_max = min(
-                float(image_height - 1),
-                source_y_max
-                + extrapolation,
-            )
-
-            if (
-                projected_y_max
-                <= projected_y_min
-            ):
-                raise ValueError(
-                    "Intervalo de projeção inválido."
-                )
-
-            projected_y = np.arange(
+            (
                 projected_y_min,
-                projected_y_max
-                + self.sample_step,
-                self.sample_step,
-                dtype=np.float64,
+                projected_y_max,
+            ) = self._projection_interval(
+                source_y_min,
+                source_y_max,
+                image_height,
             )
 
-            if (
-                projected_y.size == 0
-                or projected_y[-1]
-                < projected_y_max
-            ):
-                projected_y = np.append(
-                    projected_y,
-                    projected_y_max,
+            projected_y = self._sample_y(
+                projected_y_min,
+                projected_y_max,
+            )
+
+            if projected_y.size < 2:
+                raise ValueError(
+                    "Amostragem vertical insuficiente."
                 )
 
             normalized_y = (
@@ -790,27 +1124,28 @@ class LaneProjectionEngine:
                 - y_center
             ) / y_scale
 
+            if not _finite_array(
+                normalized_y
+            ):
+                raise ValueError(
+                    "Coordenadas normalizadas inválidas."
+                )
+
             projected_x = np.polyval(
                 coefficients,
                 normalized_y,
             )
 
-            finite = (
-                np.isfinite(
-                    projected_x
+            if not _finite_array(
+                projected_x
+            ):
+                raise ValueError(
+                    "Projeção produziu valores inválidos."
                 )
-                & np.isfinite(
-                    projected_y
-                )
-            )
 
-            projected_x = (
-                projected_x[finite]
-            )
-
-            projected_y = (
-                projected_y[finite]
-            )
+            # -----------------------------------------------------------------
+            # Mantém somente pontos dentro da imagem.
+            # -----------------------------------------------------------------
 
             inside = (
                 (projected_x >= 0.0)
@@ -818,6 +1153,15 @@ class LaneProjectionEngine:
                     projected_x
                     <= float(
                         image_width - 1
+                    )
+                )
+                & (
+                    projected_y >= 0.0
+                )
+                & (
+                    projected_y
+                    <= float(
+                        image_height - 1
                     )
                 )
             )
@@ -832,8 +1176,7 @@ class LaneProjectionEngine:
 
             if len(projected_x) < 2:
                 raise ValueError(
-                    "A projeção não possui "
-                    "pontos dentro da imagem."
+                    "A projeção não possui pontos suficientes dentro da imagem."
                 )
 
             mean_confidence = _clip01(
@@ -844,57 +1187,51 @@ class LaneProjectionEngine:
                 )
             )
 
+            vertical_span = (
+                source_y_max
+                - source_y_min
+            )
+
             confidence = self._confidence(
-                len(x),
-                vertical_span,
-                fit_error,
-                mean_confidence,
+                point_count=len(x),
+                vertical_span=vertical_span,
+                fit_error=fit_error,
+                point_confidence=mean_confidence,
             )
 
-            if confidence >= 0.80:
-                quality = (
-                    ProjectionQuality.HIGH
+            if confidence < self.min_confidence:
+                raise ValueError(
+                    "Confiança da projeção abaixo do limite."
                 )
 
-            elif confidence >= 0.60:
-                quality = (
-                    ProjectionQuality.MEDIUM
+            quality = self._quality(
+                confidence
+            )
+
+            if quality == ProjectionQuality.NONE:
+                raise ValueError(
+                    "Qualidade da projeção inválida."
                 )
 
-            elif confidence >= 0.40:
-                quality = (
-                    ProjectionQuality.LOW
-                )
-
-            else:
-                quality = (
-                    ProjectionQuality.NONE
-                )
-
-            polynomial = (
-                LanePolynomial(
-                    a=0.0,
-                    b=0.0,
-                    c=0.0,
-                    d=0.0,
-                    valid=True,
-                    fit_error=fit_error,
-                    sample_count=len(x),
-                    confidence=confidence,
-                    y_min=source_y_min,
-                    y_max=source_y_max,
+            absolute_coefficients = (
+                self._to_absolute_coefficients(
+                    coefficients,
+                    y_center,
+                    y_scale,
                 )
             )
 
-            (
-                polynomial.a,
-                polynomial.b,
-                polynomial.c,
-                polynomial.d,
-            ) = self._to_absolute_coefficients(
-                coefficients,
-                y_center,
-                y_scale,
+            polynomial = LanePolynomial(
+                a=absolute_coefficients[0],
+                b=absolute_coefficients[1],
+                c=absolute_coefficients[2],
+                d=absolute_coefficients[3],
+                valid=True,
+                fit_error=fit_error,
+                sample_count=len(x),
+                confidence=confidence,
+                y_min=source_y_min,
+                y_max=source_y_max,
             )
 
             result_points = [
@@ -910,18 +1247,30 @@ class LaneProjectionEngine:
                 )
             ]
 
+            result_points.sort(
+                key=lambda point: point.y
+            )
+
+            actual_y_min = float(
+                result_points[0].y
+            )
+
+            actual_y_max = float(
+                result_points[-1].y
+            )
+
+            extrapolated = bool(
+                actual_y_min < source_y_min
+                or actual_y_max > source_y_max
+            )
+
             projection = LaneProjection(
                 polynomial=polynomial,
                 points=result_points,
                 quality=quality,
-                extrapolated=True,
-                valid=(
-                    quality
-                    != ProjectionQuality.NONE
-                ),
-                horizon_y=(
-                    projected_y_min
-                ),
+                extrapolated=extrapolated,
+                valid=True,
+                horizon_y=actual_y_min,
             )
 
             return LaneProjectionResult(
@@ -932,37 +1281,36 @@ class LaneProjectionEngine:
                 ),
                 degree=degree,
                 fitted=True,
-                extrapolated=True,
+                extrapolated=projection.extrapolated,
                 confidence=confidence,
                 fit_error=fit_error,
                 source_y_min=source_y_min,
                 source_y_max=source_y_max,
-                projected_y_min=float(
-                    np.min(projected_y)
-                ),
-                projected_y_max=float(
-                    np.max(projected_y)
-                ),
-                valid=projection.valid,
+                projected_y_min=actual_y_min,
+                projected_y_max=actual_y_max,
+                valid=True,
                 error=None,
             )
 
         except Exception as exc:
 
             logger.debug(
-                "[LANE PROJECTION] "
-                "Projeção rejeitada: %s",
+                "[LANE PROJECTION] Projeção rejeitada: %s",
                 exc,
             )
 
             return LaneProjectionResult(
                 points=[],
-                coefficients=tuple(),
+                coefficients=(),
                 degree=0,
                 fitted=False,
                 extrapolated=False,
                 confidence=0.0,
                 fit_error=float("inf"),
+                source_y_min=0.0,
+                source_y_max=0.0,
+                projected_y_min=0.0,
+                projected_y_max=0.0,
                 valid=False,
                 error=(
                     f"{type(exc).__name__}: {exc}"
@@ -970,15 +1318,18 @@ class LaneProjectionEngine:
             )
 
     # =========================================================================
-    # PROJEÇÃO A PARTIR DE LaneModel
+    # LaneModel
     # =========================================================================
 
     def project_model(
         self,
         model: LaneModel,
-        image_height: int,
-        image_width: int,
+        image_height: int = 480,
+        image_width: int = 640,
     ) -> LaneProjectionResult:
+        """
+        Projeta uma linha contida em um LaneModel.
+        """
 
         if model is None:
             return LaneProjectionResult(
@@ -986,14 +1337,36 @@ class LaneProjectionEngine:
                 error="LaneModel é None.",
             )
 
+        try:
+            line = model.line
+        except AttributeError:
+            return LaneProjectionResult(
+                valid=False,
+                error="LaneModel não possui atributo 'line'.",
+            )
+
+        if line is None:
+            return LaneProjectionResult(
+                valid=False,
+                error="LaneModel não possui LaneLine.",
+            )
+
+        try:
+            points = line.points
+        except AttributeError:
+            return LaneProjectionResult(
+                valid=False,
+                error="LaneLine não possui pontos.",
+            )
+
         return self.project(
-            model.line.points,
-            image_height,
-            image_width,
+            points,
+            image_height=image_height,
+            image_width=image_width,
         )
 
     # =========================================================================
-    # PROJEÇÃO DIRETA DE POLINÔMIO
+    # AVALIAÇÃO
     # =========================================================================
 
     @staticmethod
@@ -1001,21 +1374,42 @@ class LaneProjectionEngine:
         polynomial: LanePolynomial,
         y: float,
     ) -> Optional[float]:
+        """
+        Avalia um LanePolynomial em Y.
+        """
 
         if polynomial is None:
             return None
 
-        if not polynomial.valid:
+        try:
+            if not polynomial.valid:
+                return None
+        except AttributeError:
             return None
 
-        value = polynomial.evaluate(
-            float(y)
-        )
+        if not _is_finite_scalar(y):
+            return None
+
+        try:
+            value = polynomial.evaluate(
+                float(y)
+            )
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            return None
 
         if not np.isfinite(value):
             return None
 
         return float(value)
+
+    # =========================================================================
+    # AMOSTRAGEM DE POLINÔMIO
+    # =========================================================================
 
     @staticmethod
     def sample_polynomial(
@@ -1025,19 +1419,42 @@ class LaneProjectionEngine:
         step: float = DEFAULT_SAMPLE_STEP,
         confidence: Optional[float] = None,
     ) -> List[LanePoint]:
+        """
+        Amostra um LanePolynomial em um intervalo vertical.
+        """
 
         if polynomial is None:
             return []
 
-        if not polynomial.valid:
+        try:
+            if not polynomial.valid:
+                return []
+        except AttributeError:
             return []
+
+        if not (
+            _is_finite_scalar(y_min)
+            and _is_finite_scalar(y_max)
+        ):
+            return []
+
+        y_min = float(y_min)
+        y_max = float(y_max)
 
         if y_max <= y_min:
             return []
 
+        try:
+            step = float(step)
+        except (TypeError, ValueError):
+            return []
+
+        if not np.isfinite(step):
+            return []
+
         step = max(
             1.0,
-            float(step),
+            step,
         )
 
         ys = np.arange(
@@ -1047,30 +1464,51 @@ class LaneProjectionEngine:
             dtype=np.float64,
         )
 
-        if (
-            ys.size == 0
-            or ys[-1] < y_max
-        ):
+        if ys.size == 0:
+            ys = np.asarray(
+                [y_min, y_max],
+                dtype=np.float64,
+            )
+
+        elif ys[-1] < y_max:
             ys = np.append(
                 ys,
                 y_max,
             )
 
-        point_confidence = (
-            polynomial.confidence
-            if confidence is None
-            else _clip01(
+        else:
+            ys[-1] = min(
+                ys[-1],
+                y_max,
+            )
+
+        if confidence is None:
+            try:
+                point_confidence = _clip01(
+                    polynomial.confidence
+                )
+            except AttributeError:
+                point_confidence = 0.0
+        else:
+            point_confidence = _clip01(
                 confidence
             )
-        )
 
-        result = []
+        result: List[LanePoint] = []
 
         for y in ys:
 
-            x = polynomial.evaluate(
-                float(y)
-            )
+            try:
+                x = polynomial.evaluate(
+                    float(y)
+                )
+            except (
+                AttributeError,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ):
+                continue
 
             if not np.isfinite(x):
                 continue
@@ -1079,9 +1517,7 @@ class LaneProjectionEngine:
                 LanePoint(
                     x=float(x),
                     y=float(y),
-                    confidence=(
-                        point_confidence
-                    ),
+                    confidence=point_confidence,
                     valid=True,
                 )
             )
@@ -1095,37 +1531,37 @@ class LaneProjectionEngine:
 
 def project_lane(
     points: Sequence[LanePoint],
-    image_height: int,
-    image_width: int,
+    image_height: int = 480,
+    image_width: int = 640,
     **kwargs,
 ) -> LaneProjectionResult:
 
-    projector = LaneProjectionEngine(
+    engine = LaneProjectionEngine(
         **kwargs
     )
 
-    return projector.project(
+    return engine.project(
         points,
-        image_height,
-        image_width,
+        image_height=image_height,
+        image_width=image_width,
     )
 
 
 def project_lane_model(
     model: LaneModel,
-    image_height: int,
-    image_width: int,
+    image_height: int = 480,
+    image_width: int = 640,
     **kwargs,
 ) -> LaneProjectionResult:
 
-    projector = LaneProjectionEngine(
+    engine = LaneProjectionEngine(
         **kwargs
     )
 
-    return projector.project_model(
+    return engine.project_model(
         model,
-        image_height,
-        image_width,
+        image_height=image_height,
+        image_width=image_width,
     )
 
 
@@ -1145,6 +1581,10 @@ def create_default_projection(
 LaneProjector = LaneProjectionEngine
 
 
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
 __all__ = [
     "LaneProjectionResult",
     "LaneProjectionEngine",
@@ -1152,4 +1592,12 @@ __all__ = [
     "project_lane",
     "project_lane_model",
     "create_default_projection",
+    "DEFAULT_MIN_POINTS",
+    "DEFAULT_MIN_VERTICAL_SPAN",
+    "DEFAULT_MAX_FIT_ERROR",
+    "DEFAULT_MAX_EXTRAPOLATION",
+    "DEFAULT_SAMPLE_STEP",
+    "DEFAULT_POLYNOMIAL_DEGREE",
+    "DEFAULT_MIN_CONFIDENCE",
+    "DEFAULT_MAX_PROJECTION_DISTANCE",
 ]
