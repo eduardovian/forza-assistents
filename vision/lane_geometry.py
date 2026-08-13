@@ -2,11 +2,11 @@
 vision/lane_geometry.py
 
 Forza Horizon ADAS/LKA
-Geometria OBSERVADA das faixas.
+Geometria OBSERVADA das faixas usando YOLOP.
 
 Responsabilidade deste módulo:
 
-    LaneDetectionResult
+    YOLOP LaneDetectionResult
             ↓
     coordenadas da tela
             ↓
@@ -47,23 +47,18 @@ A previsão/extrapolação pertence ao:
     vision/lane_projection.py
 
 A geometria aqui representa somente aquilo que foi
-efetivamente observado pelo detector/tracker.
+efetivamente observado pelo YOLOP/tracker.
 """
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .yolop_detector import (
-    LaneDetectionResult,
-    LanePoint,
-)
-
-logger = logging.getLogger(__name__)
+from .lane_types import LanePoint
+from .yolop_detector import LaneDetectionResult
 
 
 # ============================================================================
@@ -82,30 +77,16 @@ class LaneGeometryResult:
     """
     Resultado da geometria observada.
 
-    Todos os pontos representam informação realmente
-    observada no frame atual.
+    Todos os pontos representam informação observada.
 
-    Nenhum ponto deste resultado deve ser interpretado
-    como extrapolação futura.
+    Nenhum ponto deste resultado representa extrapolação futura.
     """
-
-    # ------------------------------------------------------------------
-    # Centro observado da faixa atual
-    # ------------------------------------------------------------------
 
     lane_center_x: float
     lane_center_y: float
 
-    # ------------------------------------------------------------------
-    # Centro da imagem
-    # ------------------------------------------------------------------
-
     image_center_x: float
     image_center_y: float
-
-    # ------------------------------------------------------------------
-    # Métricas
-    # ------------------------------------------------------------------
 
     lateral_error: float
     heading_error: float
@@ -113,41 +94,17 @@ class LaneGeometryResult:
     lane_width: float
     curvature: float
 
-    # ------------------------------------------------------------------
-    # Linha central observada
-    # ------------------------------------------------------------------
-
     center_line: List[Point]
 
-    # ------------------------------------------------------------------
-    # Validade
-    # ------------------------------------------------------------------
-
     valid: bool
-
-    # ------------------------------------------------------------------
-    # Limites da faixa atual
-    # ------------------------------------------------------------------
 
     left_lane_screen: List[Point]
     right_lane_screen: List[Point]
 
-    # ------------------------------------------------------------------
-    # Outras linhas da pista
-    # ------------------------------------------------------------------
-
     additional_lanes_screen: List[List[Point]]
-
-    # ------------------------------------------------------------------
-    # Índices das lanes
-    # ------------------------------------------------------------------
 
     selected_left_index: int
     selected_right_index: int
-
-    # ------------------------------------------------------------------
-    # Qualidade da geometria observada
-    # ------------------------------------------------------------------
 
     geometry_confidence: float = 0.0
 
@@ -165,31 +122,18 @@ class LaneGeometryResult:
 
 class LaneGeometry:
     """
-    Processador da geometria observada das faixas.
+    Processa exclusivamente a geometria observada pelo YOLOP.
 
-    Este módulo não prevê.
+    Não realiza:
 
-    Pipeline:
+    - tracking;
+    - previsão;
+    - extrapolação;
+    - identificação temporal da faixa;
+    - controle do veículo.
 
-        YOLOP / Tracker
-              ↓
-        conversão para tela
-              ↓
-        validação
-              ↓
-        remoção de outliers
-              ↓
-        ordenação
-              ↓
-        seleção da faixa atual
-              ↓
-        centro observado
-              ↓
-        métricas
-              ↓
-        qualidade geométrica
-
-    A previsão fica exclusivamente no LaneProjection.
+    A associação temporal pertence ao LaneTracker.
+    A projeção pertence ao LaneProjection.
     """
 
     def __init__(
@@ -213,6 +157,14 @@ class LaneGeometry:
         min_observed_span: float = 80.0,
         outlier_threshold: float = 100.0,
         projection_min_span: float = 180.0,
+        # ------------------------------------------------------------------
+        # Compatibilidade com testes/consumidores antigos.
+        #
+        # Estes nomes NÃO fazem parte da arquitetura YOLOP.
+        # São apenas aliases para detector_width/height.
+        # ------------------------------------------------------------------
+        ufld_width: Optional[int] = None,
+        ufld_height: Optional[int] = None,
     ) -> None:
 
         self.screen_width = int(screen_width)
@@ -225,6 +177,18 @@ class LaneGeometry:
             self.roi_bottom,
         ) = map(int, roi)
 
+        if self.roi_right <= self.roi_left:
+            raise ValueError(
+                "ROI inválida: roi_right deve ser maior "
+                "que roi_left."
+            )
+
+        if self.roi_bottom <= self.roi_top:
+            raise ValueError(
+                "ROI inválida: roi_bottom deve ser maior "
+                "que roi_top."
+            )
+
         self.roi_width = float(
             self.roi_right - self.roi_left
         )
@@ -233,6 +197,18 @@ class LaneGeometry:
             self.roi_bottom - self.roi_top
         )
 
+        # ------------------------------------------------------------------
+        # YOLOP é a referência atual.
+        #
+        # Os aliases ufld_* só existem para não quebrar testes antigos.
+        # ------------------------------------------------------------------
+
+        if ufld_width is not None:
+            detector_width = ufld_width
+
+        if ufld_height is not None:
+            detector_height = ufld_height
+
         self.detector_width = float(
             detector_width
         )
@@ -240,6 +216,16 @@ class LaneGeometry:
         self.detector_height = float(
             detector_height
         )
+
+        if self.detector_width <= 0.0:
+            raise ValueError(
+                "detector_width deve ser maior que zero."
+            )
+
+        if self.detector_height <= 0.0:
+            raise ValueError(
+                "detector_height deve ser maior que zero."
+            )
 
         self.near_weight = float(
             np.clip(
@@ -275,8 +261,22 @@ class LaneGeometry:
             max_lane_width
         )
 
+        if self.min_lane_width <= 0.0:
+            raise ValueError(
+                "min_lane_width deve ser maior que zero."
+            )
+
+        if self.max_lane_width < self.min_lane_width:
+            raise ValueError(
+                "max_lane_width deve ser maior ou igual "
+                "a min_lane_width."
+            )
+
         self.min_observed_span = float(
-            min_observed_span
+            max(
+                1.0,
+                min_observed_span,
+            )
         )
 
         self.outlier_threshold = float(
@@ -301,37 +301,43 @@ class LaneGeometry:
             self.screen_height / 2.0
         )
 
-    # ======================================================================
+    # =========================================================================
     # COORDENADAS
-    # ======================================================================
+    # =========================================================================
 
     def _detector_to_screen(
         self,
         x: float,
         y: float,
+        detector_width: Optional[float] = None,
+        detector_height: Optional[float] = None,
     ) -> Point:
         """
-        Converte coordenadas do detector para tela.
+        Converte coordenadas YOLOP para coordenadas da tela.
 
-        O detector trabalha dentro da ROI.
+        Não extrapola nem modifica a observação.
         """
+
+        width = (
+            self.detector_width
+            if detector_width is None
+            else float(detector_width)
+        )
+
+        height = (
+            self.detector_height
+            if detector_height is None
+            else float(detector_height)
+        )
 
         screen_x = (
             self.roi_left
-            + (
-                x
-                / self.detector_width
-            )
-            * self.roi_width
+            + (x / width) * self.roi_width
         )
 
         screen_y = (
             self.roi_top
-            + (
-                y
-                / self.detector_height
-            )
-            * self.roi_height
+            + (y / height) * self.roi_height
         )
 
         return (
@@ -339,57 +345,132 @@ class LaneGeometry:
             float(screen_y),
         )
 
+    def _get_detection_dimensions(
+        self,
+        detection: LaneDetectionResult,
+    ) -> Tuple[float, float]:
+        """
+        Obtém as dimensões utilizadas pelo YOLOP.
+
+        O LaneDetectionResult atual carrega input_width/input_height.
+        Caso algum objeto legado não possua esses atributos,
+        utiliza as dimensões configuradas no geometry.
+        """
+
+        width = getattr(
+            detection,
+            "input_width",
+            self.detector_width,
+        )
+
+        height = getattr(
+            detection,
+            "input_height",
+            self.detector_height,
+        )
+
+        try:
+            width = float(width)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            width = self.detector_width
+
+        try:
+            height = float(height)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            height = self.detector_height
+
+        if not np.isfinite(width) or width <= 0.0:
+            width = self.detector_width
+
+        if not np.isfinite(height) or height <= 0.0:
+            height = self.detector_height
+
+        return width, height
+
     def _convert_lane(
         self,
         lane: Sequence[LanePoint],
+        detector_width: Optional[float] = None,
+        detector_height: Optional[float] = None,
     ) -> List[Point]:
         """
-        Converte uma lane para coordenadas da tela.
+        Converte uma lane YOLOP para coordenadas da tela.
 
-        Somente pontos válidos entram na geometria.
+        Somente pontos válidos são utilizados.
         """
 
         points: List[Point] = []
+
+        if lane is None:
+            return points
+
+        width = (
+            self.detector_width
+            if detector_width is None
+            else float(detector_width)
+        )
+
+        height = (
+            self.detector_height
+            if detector_height is None
+            else float(detector_height)
+        )
 
         for point in lane:
 
             if point is None:
                 continue
 
-            if not point.valid:
+            try:
+                valid = bool(point.valid)
+            except AttributeError:
                 continue
 
-            if not np.isfinite(
-                point.confidence
-            ):
+            if not valid:
                 continue
 
-            if point.confidence <= 0.0:
-                continue
-
-            if not np.isfinite(point.x):
-                continue
-
-            if not np.isfinite(point.y):
-                continue
-
-            if (
-                point.x < 0.0
-                or point.x > self.detector_width
-            ):
-                continue
-
-            if (
-                point.y < 0.0
-                or point.y > self.detector_height
-            ):
-                continue
-
-            sx, sy = (
-                self._detector_to_screen(
-                    point.x,
-                    point.y,
+            try:
+                confidence = float(
+                    point.confidence
                 )
+                x = float(point.x)
+                y = float(point.y)
+            except (
+                AttributeError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            if not np.isfinite(confidence):
+                continue
+
+            if confidence <= 0.0:
+                continue
+
+            if not np.isfinite(x):
+                continue
+
+            if not np.isfinite(y):
+                continue
+
+            if x < 0.0 or x > width:
+                continue
+
+            if y < 0.0 or y > height:
+                continue
+
+            sx, sy = self._detector_to_screen(
+                x,
+                y,
+                detector_width=width,
+                detector_height=height,
             )
 
             if not np.isfinite(sx):
@@ -406,29 +487,25 @@ class LaneGeometry:
             )
 
         points.sort(
-            key=lambda p: p[1]
+            key=lambda point: point[1]
         )
 
         return points
 
-    # ======================================================================
+    # =========================================================================
     # OUTLIERS
-    # ======================================================================
+    # =========================================================================
 
     def _remove_outliers(
         self,
         points: Sequence[Point],
     ) -> List[Point]:
         """
-        Remove pontos claramente incompatíveis
-        com a tendência local da lane.
+        Remove pontos claramente incompatíveis.
 
-        IMPORTANTE:
+        Utiliza somente uma tendência linear para limpeza.
 
-        Isto não cria uma curva.
-
-        O objetivo é apenas impedir que um ponto
-        completamente absurdo contamine a geometria.
+        Não cria novos pontos.
         """
 
         if len(points) < 4:
@@ -448,30 +525,24 @@ class LaneGeometry:
         x = arr[:, 0]
         y = arr[:, 1]
 
-        y_range = float(
-            np.ptp(y)
-        )
-
-        if y_range < 1.0:
+        if not np.all(
+            np.isfinite(arr)
+        ):
             return list(points)
 
-        # --------------------------------------------------------------
-        # Para remoção de outliers usamos apenas uma tendência
-        # linear local.
-        #
-        # Não usamos grau 2/3 aqui porque isso começaria a misturar
-        # limpeza com modelagem/predição.
-        # --------------------------------------------------------------
+        if float(np.ptp(y)) < 1.0:
+            return list(points)
+
+        y_std = float(
+            np.std(y)
+        )
 
         y_norm = (
-            y - np.mean(y)
-        ) / max(
-            np.std(y),
-            1.0,
+            (y - np.mean(y))
+            / max(y_std, 1.0)
         )
 
         try:
-
             coeff = np.polyfit(
                 y_norm,
                 x,
@@ -500,8 +571,7 @@ class LaneGeometry:
         mad = float(
             np.median(
                 np.abs(
-                    residual
-                    - median
+                    residual - median
                 )
             )
         )
@@ -509,27 +579,23 @@ class LaneGeometry:
         threshold = max(
             self.outlier_threshold,
             median
-            + 4.0
-            * max(
+            + 4.0 * max(
                 mad,
                 1.0,
             ),
         )
 
         keep = (
-            residual
-            <= threshold
+            residual <= threshold
         )
 
         filtered = [
             (
-                float(arr[i, 0]),
-                float(arr[i, 1]),
+                float(arr[index, 0]),
+                float(arr[index, 1]),
             )
-            for i in range(
-                len(arr)
-            )
-            if keep[i]
+            for index in range(len(arr))
+            if keep[index]
         ]
 
         if len(filtered) < self.min_points:
@@ -537,19 +603,18 @@ class LaneGeometry:
 
         return filtered
 
-    # ======================================================================
-    # NORMALIZAÇÃO DOS PONTOS
-    # ======================================================================
+    # =========================================================================
+    # PREPARAÇÃO
+    # =========================================================================
 
     def _prepare_lane(
         self,
         lane: Sequence[Point],
     ) -> List[Point]:
         """
-        Prepara uma lane observada.
+        Normaliza uma lane observada.
 
-        Não extrapola.
-        Não ajusta curva.
+        Não extrapola e não ajusta curva.
         """
 
         if len(lane) < self.min_points:
@@ -562,14 +627,7 @@ class LaneGeometry:
         if len(clean) < self.min_points:
             return []
 
-        # --------------------------------------------------------------
-        # Remove Y duplicado.
-        #
-        # Como a geometria é x=f(y), cada Y deve aparecer apenas uma
-        # vez.
-        # --------------------------------------------------------------
-
-        by_y = {}
+        by_y: dict[float, List[float]] = {}
 
         for x, y in clean:
 
@@ -595,13 +653,9 @@ class LaneGeometry:
             if not xs:
                 continue
 
-            x = float(
-                np.median(xs)
-            )
-
             points.append(
                 (
-                    x,
+                    float(np.median(xs)),
                     float(y),
                 )
             )
@@ -611,9 +665,9 @@ class LaneGeometry:
 
         return points
 
-    # ======================================================================
-    # INTERPOLAÇÃO OBSERVADA
-    # ======================================================================
+    # =========================================================================
+    # INTERPOLAÇÃO
+    # =========================================================================
 
     @staticmethod
     def _x_at_y(
@@ -621,14 +675,9 @@ class LaneGeometry:
         y: float,
     ) -> Optional[float]:
         """
-        Obtém X por interpolação.
+        Interpolação x=f(y).
 
-        IMPORTANTE:
-
-        A função NÃO extrapola.
-
-        Se Y estiver fora da região observada,
-        retorna None.
+        Nunca extrapola.
         """
 
         if len(lane) < 2:
@@ -639,21 +688,23 @@ class LaneGeometry:
             dtype=np.float64,
         )
 
-        if arr.ndim != 2:
+        if arr.ndim != 2 or arr.shape[1] != 2:
             return None
 
-        ys = arr[:, 1]
         xs = arr[:, 0]
+        ys = arr[:, 1]
 
         if not np.all(
-            np.isfinite(ys)
+            np.isfinite(arr)
         ):
             return None
 
-        if not np.all(
-            np.isfinite(xs)
+        if np.any(
+            np.diff(ys) < 0.0
         ):
-            return None
+            order = np.argsort(ys)
+            ys = ys[order]
+            xs = xs[order]
 
         if y < ys[0] or y > ys[-1]:
             return None
@@ -666,18 +717,16 @@ class LaneGeometry:
             )
         )
 
-    # ======================================================================
-    # ORDENAÇÃO DAS LANES
-    # ======================================================================
+    # =========================================================================
+    # ORDENAÇÃO
+    # =========================================================================
 
     def _sort_lanes(
         self,
         lanes: Sequence[List[Point]],
     ) -> List[List[Point]]:
         """
-        Ordena todas as lanes da esquerda para direita.
-
-        A ordenação é feita em uma região próxima ao veículo.
+        Ordena lanes espacialmente da esquerda para direita.
         """
 
         reference_y = (
@@ -695,11 +744,12 @@ class LaneGeometry:
             )
 
             if x is None:
-                # Se não houver observação nesse Y,
-                # usamos o ponto mais próximo do fundo.
+
                 if not lane:
                     continue
 
+                # Somente fallback para uma observação
+                # que realmente existe.
                 x = lane[-1][0]
 
             positioned.append(
@@ -718,22 +768,18 @@ class LaneGeometry:
             for _, index in positioned
         ]
 
-    # ======================================================================
+    # =========================================================================
     # SELEÇÃO DA FAIXA ATUAL
-    # ======================================================================
+    # =========================================================================
 
     def _select_current_lane(
         self,
         lanes: Sequence[List[Point]],
     ) -> Optional[Tuple[int, int]]:
         """
-        Seleciona a faixa onde o veículo provavelmente está.
+        Seleciona a faixa mais compatível com o centro da tela.
 
-        Consideramos no máximo a informação geométrica
-        observada neste frame.
-
-        Procuramos duas linhas consecutivas cuja região
-        central esteja próxima do centro da imagem.
+        A decisão usa somente a geometria observada no frame.
         """
 
         if len(lanes) < 2:
@@ -746,30 +792,35 @@ class LaneGeometry:
 
         candidates = []
 
-        for i in range(
+        for index in range(
             len(lanes) - 1
         ):
 
-            left = lanes[i]
-            right = lanes[i + 1]
+            left = lanes[index]
+            right = lanes[index + 1]
 
-            lx = self._x_at_y(
+            left_x = self._x_at_y(
                 left,
                 reference_y,
             )
 
-            rx = self._x_at_y(
+            right_x = self._x_at_y(
                 right,
                 reference_y,
             )
 
-            if lx is None or rx is None:
+            if (
+                left_x is None
+                or right_x is None
+            ):
                 continue
 
-            if rx <= lx:
+            if right_x <= left_x:
                 continue
 
-            width = rx - lx
+            width = (
+                right_x - left_x
+            )
 
             if not (
                 self.min_lane_width
@@ -779,7 +830,7 @@ class LaneGeometry:
                 continue
 
             center = (
-                lx + rx
+                left_x + right_x
             ) * 0.5
 
             distance = abs(
@@ -790,8 +841,8 @@ class LaneGeometry:
             candidates.append(
                 (
                     distance,
-                    i,
-                    i + 1,
+                    index,
+                    index + 1,
                 )
             )
 
@@ -811,9 +862,9 @@ class LaneGeometry:
             right_index,
         )
 
-    # ======================================================================
-    # CENTRO OBSERVADO
-    # ======================================================================
+    # =========================================================================
+    # CENTRO
+    # =========================================================================
 
     def _compute_center_line(
         self,
@@ -821,10 +872,8 @@ class LaneGeometry:
         right: Sequence[Point],
     ) -> List[Point]:
         """
-        Calcula o centro entre duas lanes observadas.
-
-        Somente utiliza a região em que ambas as linhas
-        realmente existem.
+        Calcula o centro somente na região observada
+        simultaneamente pelas duas lanes.
         """
 
         if (
@@ -843,20 +892,26 @@ class LaneGeometry:
             dtype=np.float64,
         )
 
+        if (
+            left_arr.ndim != 2
+            or right_arr.ndim != 2
+        ):
+            return []
+
         left_y_min = float(
-            left_arr[:, 1].min()
+            np.min(left_arr[:, 1])
         )
 
         left_y_max = float(
-            left_arr[:, 1].max()
+            np.max(left_arr[:, 1])
         )
 
         right_y_min = float(
-            right_arr[:, 1].min()
+            np.min(right_arr[:, 1])
         )
 
         right_y_max = float(
-            right_arr[:, 1].max()
+            np.max(right_arr[:, 1])
         )
 
         y_min = max(
@@ -888,26 +943,30 @@ class LaneGeometry:
 
         for y in ys:
 
-            lx = self._x_at_y(
+            left_x = self._x_at_y(
                 left,
                 float(y),
             )
 
-            rx = self._x_at_y(
+            right_x = self._x_at_y(
                 right,
                 float(y),
             )
 
-            if lx is None or rx is None:
+            if (
+                left_x is None
+                or right_x is None
+            ):
                 continue
 
-            if rx <= lx:
+            if right_x <= left_x:
                 continue
 
             center.append(
                 (
                     float(
-                        (lx + rx) * 0.5
+                        (left_x + right_x)
+                        * 0.5
                     ),
                     float(y),
                 )
@@ -915,9 +974,9 @@ class LaneGeometry:
 
         return center
 
-    # ======================================================================
+    # =========================================================================
     # LARGURA
-    # ======================================================================
+    # =========================================================================
 
     def _compute_lane_width(
         self,
@@ -925,9 +984,7 @@ class LaneGeometry:
         right: Sequence[Point],
     ) -> float:
         """
-        Calcula a largura observada da faixa.
-
-        Não extrapola.
+        Calcula a largura média/mediana observada.
         """
 
         if not left or not right:
@@ -944,13 +1001,13 @@ class LaneGeometry:
         )
 
         y_min = max(
-            float(left_arr[:, 1].min()),
-            float(right_arr[:, 1].min()),
+            float(np.min(left_arr[:, 1])),
+            float(np.min(right_arr[:, 1])),
         )
 
         y_max = min(
-            float(left_arr[:, 1].max()),
-            float(right_arr[:, 1].max()),
+            float(np.max(left_arr[:, 1])),
+            float(np.max(right_arr[:, 1])),
         )
 
         if y_max <= y_min:
@@ -966,20 +1023,25 @@ class LaneGeometry:
 
         for y in ys:
 
-            lx = self._x_at_y(
+            left_x = self._x_at_y(
                 left,
                 float(y),
             )
 
-            rx = self._x_at_y(
+            right_x = self._x_at_y(
                 right,
                 float(y),
             )
 
-            if lx is None or rx is None:
+            if (
+                left_x is None
+                or right_x is None
+            ):
                 continue
 
-            width = rx - lx
+            width = (
+                right_x - left_x
+            )
 
             if (
                 self.min_lane_width
@@ -997,9 +1059,9 @@ class LaneGeometry:
             np.median(widths)
         )
 
-    # ======================================================================
+    # =========================================================================
     # ERRO LATERAL
-    # ======================================================================
+    # =========================================================================
 
     def _compute_lateral_error(
         self,
@@ -1008,7 +1070,12 @@ class LaneGeometry:
         """
         Erro lateral normalizado.
 
-        A referência é uma região próxima ao veículo.
+        Positivo:
+            centro da faixa está à direita
+            do centro da tela.
+
+        Negativo:
+            centro da faixa está à esquerda.
         """
 
         if not center_line:
@@ -1019,19 +1086,17 @@ class LaneGeometry:
             - self.roi_height * 0.12
         )
 
-        x = self._x_at_y(
+        center_x = self._x_at_y(
             center_line,
             reference_y,
         )
 
-        if x is None:
+        if center_x is None:
             # Não extrapolar.
-            # Utilizamos somente o ponto observado
-            # mais próximo do fundo.
-            x = center_line[-1][0]
+            center_x = center_line[-1][0]
 
         error = (
-            x
+            center_x
             - self.image_center_x
         )
 
@@ -1048,21 +1113,18 @@ class LaneGeometry:
             )
         )
 
-    # ======================================================================
-    # HEADING OBSERVADO
-    # ======================================================================
+    # =========================================================================
+    # HEADING
+    # =========================================================================
 
     def _compute_heading_error(
         self,
         center_line: Sequence[Point],
     ) -> float:
         """
-        Estima o heading observado da faixa.
+        Calcula o heading observado.
 
-        Não tenta prever a curva.
-
-        Utiliza apenas a inclinação local
-        da linha central observada.
+        Não prevê a direção futura.
         """
 
         if len(center_line) < 5:
@@ -1073,13 +1135,14 @@ class LaneGeometry:
             dtype=np.float64,
         )
 
-        # Utilizamos a parte inferior da geometria,
-        # onde a informação está mais próxima do veículo.
+        if not np.all(
+            np.isfinite(arr)
+        ):
+            return 0.0
+
         start = max(
             0,
-            int(
-                len(arr) * 0.55
-            ),
+            int(len(arr) * 0.55),
         )
 
         local = arr[start:]
@@ -1090,43 +1153,29 @@ class LaneGeometry:
         x = local[:, 0]
         y = local[:, 1]
 
+        dy = np.diff(y)
+        dx = np.diff(x)
+
+        valid = (
+            np.abs(dy) > 1e-6
+        )
+
+        if not np.any(valid):
+            return 0.0
+
+        slopes = (
+            dx[valid]
+            / dy[valid]
+        )
+
         if not np.all(
-            np.isfinite(x)
+            np.isfinite(slopes)
         ):
             return 0.0
 
-        if not np.all(
-            np.isfinite(y)
-        ):
-            return 0.0
-
-        try:
-
-            dx = np.diff(x)
-            dy = np.diff(y)
-
-            valid = (
-                np.abs(dy)
-                > 1e-6
-            )
-
-            if not np.any(valid):
-                return 0.0
-
-            slopes = (
-                dx[valid]
-                / dy[valid]
-            )
-
-            slope = float(
-                np.median(slopes)
-            )
-
-        except (
-            ValueError,
-            FloatingPointError,
-        ):
-            return 0.0
+        slope = float(
+            np.median(slopes)
+        )
 
         angle = np.arctan(
             slope
@@ -1144,23 +1193,18 @@ class LaneGeometry:
             )
         )
 
-    # ======================================================================
+    # =========================================================================
     # CURVATURA OBSERVADA
-    # ======================================================================
+    # =========================================================================
 
     def _compute_curvature(
         self,
         center_line: Sequence[Point],
     ) -> float:
         """
-        Mede a curvatura LOCAL observada.
+        Mede curvatura local observada.
 
-        Atenção:
-
-        Este valor não é utilizado para projetar
-        a faixa.
-
-        A projeção futura pertence ao LaneProjection.
+        Não é usada para extrapolação.
         """
 
         if len(center_line) < 7:
@@ -1171,27 +1215,17 @@ class LaneGeometry:
             dtype=np.float64,
         )
 
+        if not np.all(
+            np.isfinite(arr)
+        ):
+            return 0.0
+
         x = arr[:, 0]
         y = arr[:, 1]
 
-        if not np.all(
-            np.isfinite(x)
-        ):
+        if float(np.ptp(y)) < 20.0:
             return 0.0
 
-        if not np.all(
-            np.isfinite(y)
-        ):
-            return 0.0
-
-        y_range = float(
-            np.ptp(y)
-        )
-
-        if y_range < 20.0:
-            return 0.0
-
-        # Derivadas numéricas locais.
         try:
 
             dx_dy = np.gradient(
@@ -1222,47 +1256,40 @@ class LaneGeometry:
         if not np.any(valid):
             return 0.0
 
-        curvature_values = (
+        values = (
             np.abs(
                 d2x_dy2[valid]
             )
             / denominator[valid]
         )
 
-        if curvature_values.size == 0:
+        if values.size == 0:
             return 0.0
 
         curvature = float(
-            np.median(
-                curvature_values
-            )
-        )
-
-        # Normalização conservadora.
-        normalized = (
-            curvature * 500.0
+            np.median(values)
         )
 
         return float(
             np.clip(
-                normalized,
+                curvature * 500.0,
                 0.0,
                 1.0,
             )
         )
 
-    # ======================================================================
+    # =========================================================================
     # CENTRO PONDERADO
-    # ======================================================================
+    # =========================================================================
 
     def _compute_weighted_center(
         self,
         center_line: Sequence[Point],
     ) -> Tuple[float, float]:
         """
-        Calcula posição representativa do centro observado.
+        Calcula um ponto representativo do centro observado.
 
-        Dá maior peso à região próxima ao veículo.
+        Dá maior peso à região inferior da imagem.
         """
 
         if not center_line:
@@ -1276,10 +1303,11 @@ class LaneGeometry:
         for _, y in center_line:
 
             relative_y = (
-                y - self.roi_top
-            ) / max(
-                self.roi_height,
-                1.0,
+                (y - self.roi_top)
+                / max(
+                    self.roi_height,
+                    1.0,
+                )
             )
 
             relative_y = float(
@@ -1312,8 +1340,7 @@ class LaneGeometry:
                     weights_np
                 )
             )
-            or np.sum(weights_np)
-            <= 0.0
+            or np.sum(weights_np) <= 0.0
         ):
             weights_np = np.ones(
                 len(center_line),
@@ -1327,9 +1354,8 @@ class LaneGeometry:
         center_x = float(
             np.average(
                 [
-                    p[0]
-                    for p
-                    in center_line
+                    point[0]
+                    for point in center_line
                 ],
                 weights=weights_np,
             )
@@ -1338,9 +1364,8 @@ class LaneGeometry:
         center_y = float(
             np.average(
                 [
-                    p[1]
-                    for p
-                    in center_line
+                    point[1]
+                    for point in center_line
                 ],
                 weights=weights_np,
             )
@@ -1351,9 +1376,9 @@ class LaneGeometry:
             center_y,
         )
 
-    # ======================================================================
-    # QUALIDADE
-    # ======================================================================
+    # =========================================================================
+    # CONFIANÇA
+    # =========================================================================
 
     def _compute_geometry_confidence(
         self,
@@ -1363,9 +1388,7 @@ class LaneGeometry:
         lane_width: float,
     ) -> float:
         """
-        Calcula confiança da geometria OBSERVADA.
-
-        Não representa confiança da previsão.
+        Calcula confiança somente da geometria observada.
         """
 
         if (
@@ -1382,10 +1405,6 @@ class LaneGeometry:
         ):
             return 0.0
 
-        # --------------------------------------------------------------
-        # Quantidade de pontos.
-        # --------------------------------------------------------------
-
         point_score = min(
             1.0,
             min(
@@ -1400,20 +1419,17 @@ class LaneGeometry:
             ),
         )
 
-        # --------------------------------------------------------------
-        # Extensão observada.
-        # --------------------------------------------------------------
-
         y_values = [
-            p[1]
-            for p in center
+            point[1]
+            for point in center
         ]
+
+        if not y_values:
+            return 0.0
 
         observed_span = (
             max(y_values)
             - min(y_values)
-            if y_values
-            else 0.0
         )
 
         span_score = float(
@@ -1428,10 +1444,6 @@ class LaneGeometry:
             )
         )
 
-        # --------------------------------------------------------------
-        # Largura plausível.
-        # --------------------------------------------------------------
-
         ideal_width = (
             self.min_lane_width
             + self.max_lane_width
@@ -1442,7 +1454,7 @@ class LaneGeometry:
             - self.min_lane_width
         )
 
-        if width_range <= 0:
+        if width_range <= 0.0:
             width_score = 0.0
         else:
             width_score = 1.0 - min(
@@ -1451,9 +1463,9 @@ class LaneGeometry:
                     lane_width
                     - ideal_width
                 )
-                / (
-                    width_range
-                    * 0.5
+                / max(
+                    width_range * 0.5,
+                    1.0,
                 ),
             )
 
@@ -1471,21 +1483,17 @@ class LaneGeometry:
             )
         )
 
-    # ======================================================================
+    # =========================================================================
     # RESULTADO INVÁLIDO
-    # ======================================================================
+    # =========================================================================
 
     def _invalid_result(
         self,
         additional_lanes: Optional[
             List[List[Point]]
         ] = None,
-        left: Optional[
-            List[Point]
-        ] = None,
-        right: Optional[
-            List[Point]
-        ] = None,
+        left: Optional[List[Point]] = None,
+        right: Optional[List[Point]] = None,
     ) -> LaneGeometryResult:
 
         return LaneGeometryResult(
@@ -1499,10 +1507,16 @@ class LaneGeometry:
             curvature=0.0,
             center_line=[],
             valid=False,
-            left_lane_screen=left or [],
-            right_lane_screen=right or [],
+            left_lane_screen=(
+                left if left is not None else []
+            ),
+            right_lane_screen=(
+                right if right is not None else []
+            ),
             additional_lanes_screen=(
-                additional_lanes or []
+                additional_lanes
+                if additional_lanes is not None
+                else []
             ),
             selected_left_index=-1,
             selected_right_index=-1,
@@ -1513,166 +1527,163 @@ class LaneGeometry:
             enough_for_projection=False,
         )
 
-    # ======================================================================
+    # =========================================================================
     # PIPELINE PRINCIPAL
-    # ======================================================================
+    # =========================================================================
 
     def compute(
         self,
         detection: LaneDetectionResult,
     ) -> LaneGeometryResult:
         """
-        Processa exclusivamente a geometria observada.
+        Processa uma detecção YOLOP.
 
-        Nenhuma extrapolação é realizada.
+        A geometria utiliza somente observações do frame atual.
         """
 
         if detection is None:
             return self._invalid_result()
 
-        raw_lanes: List[List[Point]] = []
+        # ------------------------------------------------------------------
+        # Dimensões reais utilizadas pelo YOLOP neste resultado.
+        # ------------------------------------------------------------------
 
-        # --------------------------------------------------------------
-        # Lane esquerda
-        # --------------------------------------------------------------
-
-        left = self._convert_lane(
-            detection.left_lane
+        detector_width, detector_height = (
+            self._get_detection_dimensions(
+                detection
+            )
         )
 
+        raw_lanes: List[List[Point]] = []
+
+        # ------------------------------------------------------------------
+        # Lane esquerda
+        # ------------------------------------------------------------------
+
         left = self._prepare_lane(
-            left
+            self._convert_lane(
+                getattr(
+                    detection,
+                    "left_lane",
+                    [],
+                ),
+                detector_width,
+                detector_height,
+            )
         )
 
         if len(left) >= self.min_points:
             raw_lanes.append(left)
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Lanes adicionais
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
 
-        for lane in (
-            detection.additional_lanes
-        ):
-
-            converted = (
-                self._convert_lane(
-                    lane
-                )
-            )
-
-            prepared = (
-                self._prepare_lane(
-                    converted
-                )
-            )
-
-            if (
-                len(prepared)
-                >= self.min_points
-            ):
-                raw_lanes.append(
-                    prepared
-                )
-
-        # --------------------------------------------------------------
-        # Lane direita
-        # --------------------------------------------------------------
-
-        right = self._convert_lane(
-            detection.right_lane
+        additional_lanes = getattr(
+            detection,
+            "additional_lanes",
+            [],
         )
 
+        if additional_lanes is None:
+            additional_lanes = []
+
+        for lane in additional_lanes:
+
+            prepared = self._prepare_lane(
+                self._convert_lane(
+                    lane,
+                    detector_width,
+                    detector_height,
+                )
+            )
+
+            if len(prepared) >= self.min_points:
+                raw_lanes.append(prepared)
+
+        # ------------------------------------------------------------------
+        # Lane direita
+        # ------------------------------------------------------------------
+
         right = self._prepare_lane(
-            right
+            self._convert_lane(
+                getattr(
+                    detection,
+                    "right_lane",
+                    [],
+                ),
+                detector_width,
+                detector_height,
+            )
         )
 
         if len(right) >= self.min_points:
             raw_lanes.append(right)
 
-        # --------------------------------------------------------------
-        # Precisamos de pelo menos duas linhas observadas.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Precisamos de duas linhas observadas.
+        # ------------------------------------------------------------------
 
         if len(raw_lanes) < 2:
             return self._invalid_result()
 
-        # --------------------------------------------------------------
-        # Ordenação esquerda → direita.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Ordenação espacial.
+        # ------------------------------------------------------------------
 
-        ordered_lanes = (
-            self._sort_lanes(
-                raw_lanes
-            )
+        ordered_lanes = self._sort_lanes(
+            raw_lanes
         )
 
         if len(ordered_lanes) < 2:
             return self._invalid_result()
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Seleção da faixa atual.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
 
-        selected = (
-            self._select_current_lane(
-                ordered_lanes
-            )
+        selected = self._select_current_lane(
+            ordered_lanes
         )
 
         if selected is None:
-
             return self._invalid_result(
                 additional_lanes=ordered_lanes
             )
 
-        left_index, right_index = (
-            selected
-        )
+        left_index, right_index = selected
 
-        selected_left = (
-            ordered_lanes[
-                left_index
-            ]
-        )
+        selected_left = ordered_lanes[
+            left_index
+        ]
 
-        selected_right = (
-            ordered_lanes[
-                right_index
-            ]
-        )
+        selected_right = ordered_lanes[
+            right_index
+        ]
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Centro observado.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
 
-        center_line = (
-            self._compute_center_line(
-                selected_left,
-                selected_right,
-            )
+        center_line = self._compute_center_line(
+            selected_left,
+            selected_right,
         )
 
-        if (
-            len(center_line)
-            < self.min_points
-        ):
-
+        if len(center_line) < self.min_points:
             return self._invalid_result(
                 additional_lanes=ordered_lanes,
                 left=selected_left,
                 right=selected_right,
             )
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Largura observada.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
 
-        lane_width = (
-            self._compute_lane_width(
-                selected_left,
-                selected_right,
-            )
+        lane_width = self._compute_lane_width(
+            selected_left,
+            selected_right,
         )
 
         if not (
@@ -1680,33 +1691,26 @@ class LaneGeometry:
             <= lane_width
             <= self.max_lane_width
         ):
-
             return self._invalid_result(
                 additional_lanes=ordered_lanes,
                 left=selected_left,
                 right=selected_right,
             )
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Métricas observadas.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
 
-        lateral_error = (
-            self._compute_lateral_error(
-                center_line
-            )
+        lateral_error = self._compute_lateral_error(
+            center_line
         )
 
-        heading_error = (
-            self._compute_heading_error(
-                center_line
-            )
+        heading_error = self._compute_heading_error(
+            center_line
         )
 
-        curvature = (
-            self._compute_curvature(
-                center_line
-            )
+        curvature = self._compute_curvature(
+            center_line
         )
 
         center_x, center_y = (
@@ -1715,21 +1719,21 @@ class LaneGeometry:
             )
         )
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Extensão observada.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
 
         observed_y_min = float(
             min(
-                p[1]
-                for p in center_line
+                point[1]
+                for point in center_line
             )
         )
 
         observed_y_max = float(
             max(
-                p[1]
-                for p in center_line
+                point[1]
+                for point in center_line
             )
         )
 
@@ -1738,9 +1742,9 @@ class LaneGeometry:
             - observed_y_min
         )
 
-        # --------------------------------------------------------------
-        # Qualidade.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Confiança.
+        # ------------------------------------------------------------------
 
         geometry_confidence = (
             self._compute_geometry_confidence(
@@ -1751,13 +1755,10 @@ class LaneGeometry:
             )
         )
 
-        # --------------------------------------------------------------
-        # A geometria pode fornecer dados suficientes
-        # para o futuro LaneProjection?
-        #
-        # Isto NÃO significa que a projeção já foi feita.
-        # Apenas informamos que existe matéria-prima suficiente.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Indica somente se há informação suficiente
+        # para o LaneProjection trabalhar.
+        # ------------------------------------------------------------------
 
         enough_for_projection = bool(
             geometry_confidence >= 0.55
@@ -1767,14 +1768,13 @@ class LaneGeometry:
             >= self.min_points
         )
 
-        # --------------------------------------------------------------
-        # Lanes restantes.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Lanes não selecionadas.
+        # ------------------------------------------------------------------
 
-        additional = [
+        remaining_lanes = [
             lane
-            for index, lane
-            in enumerate(
+            for index, lane in enumerate(
                 ordered_lanes
             )
             if index not in (
@@ -1796,7 +1796,7 @@ class LaneGeometry:
             valid=True,
             left_lane_screen=selected_left,
             right_lane_screen=selected_right,
-            additional_lanes_screen=additional,
+            additional_lanes_screen=remaining_lanes,
             selected_left_index=left_index,
             selected_right_index=right_index,
             geometry_confidence=geometry_confidence,
