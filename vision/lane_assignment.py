@@ -1,197 +1,132 @@
 """
 vision/lane_assignment.py
 
-Associação semântica das linhas de faixa.
+Semantic lane assignment.
 
-Responsabilidade:
+YOLOP / Tracker / Geometry / LaneModel detect and model lane boundaries.
 
-    LaneProjection
-        ↓
-    ordenação espacial das linhas
-        ↓
-    construção dos corredores
-        ↓
-    identificação da faixa atual
-        ↓
-    identificação das faixas adjacentes
-        ↓
-    LaneAssignmentResult
+This module determines which corridor between adjacent lane boundaries
+contains the vehicle.
 
-IMPORTANTE
-----------
-YOLOP / Tracker / Geometry / Projection identificam e modelam LINHAS.
-
-Este módulo identifica FAIXAS.
-
-Exemplo:
+Example with four detected boundaries:
 
     L0        L1        L2        L3
-     │         │         │         │
-     │   C0    │   C1    │   C2    │
-     │         │         │         │
+     |         |         |         |
+     |   C0    |   C1    |   C2    |
+     |         |         |         |
 
-Com 4 linhas existem 3 corredores possíveis.
+Four boundaries create three possible lanes/corridors:
 
-O veículo ocupa um desses corredores.
+    C0 = L0-L1
+    C1 = L1-L2
+    C2 = L2-L3
 
-Este módulo NÃO:
-- executa YOLOP;
-- realiza tracking;
-- ajusta polinômios;
-- projeta linhas;
-- toma decisões ADAS;
-- controla o veículo.
+The current lane is the corridor containing the vehicle center.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, Optional, Sequence
 
 import numpy as np
 
 
-# =============================================================================
-# RESULTADO
-# =============================================================================
+# ============================================================================
+# RESULT
+# ============================================================================
 
 
 @dataclass(frozen=True)
 class LaneAssignmentResult:
     """
-    Resultado da associação semântica das linhas.
+    Semantic assignment result.
 
-    lanes:
-        Linhas ordenadas da esquerda para a direita.
+    current_lane_id:
+        Zero-based corridor index.
 
-    current_lane_index:
-        Índice da faixa atual no conjunto de corredores.
+        With four boundaries:
 
-        Exemplo com 4 linhas:
+            L0-L1 -> 0
+            L1-L2 -> 1
+            L2-L3 -> 2
 
-            L0 | L1 | L2 | L3
+    left_boundary_id:
+        Index of the left boundary of the current lane.
 
-        corredores:
-
-            0 = L0-L1
-            1 = L1-L2
-            2 = L2-L3
-
-    left_boundary_index:
-        Índice da linha esquerda da faixa atual.
-
-    right_boundary_index:
-        Índice da linha direita da faixa atual.
-
-    left_lanes:
-        Linhas/corredores à esquerda da faixa atual.
-
-    right_lanes:
-        Linhas/corredores à direita da faixa atual.
-
-    lane_center_x:
-        Centro da faixa atual na referência usada.
-
-    vehicle_x:
-        Centro/referência lateral do veículo.
-
-    lateral_offset:
-        Offset lateral normalizado.
-
-        < 0 = esquerda
-        > 0 = direita
-
-    lane_width:
-        Distância entre as duas linhas que delimitam a faixa.
-
-    confidence:
-        Confiança da associação.
-
-    valid:
-        Indica se a associação é utilizável.
+    right_boundary_id:
+        Index of the right boundary of the current lane.
     """
 
-    lanes: Tuple[Any, ...] = ()
+    valid: bool = False
 
-    current_lane_index: int = -1
+    current_lane_id: Optional[int] = None
 
-    left_boundary_index: int = -1
-    right_boundary_index: int = -1
-
-    left_lanes: Tuple[Any, ...] = ()
-    right_lanes: Tuple[Any, ...] = ()
+    left_boundary_id: Optional[int] = None
+    right_boundary_id: Optional[int] = None
 
     lane_center_x: float = 0.0
     vehicle_x: float = 0.0
 
+    lane_width: float = 0.0
+
     lateral_offset: float = 0.0
     normalized_offset: float = 0.0
 
-    lane_width: float = 0.0
-
     confidence: float = 0.0
 
-    valid: bool = False
+    lane_count: int = 0
+
+    left_lane_count: int = 0
+    right_lane_count: int = 0
 
     reason: Optional[str] = None
 
     @property
-    def current_lane(self) -> Optional[Any]:
-        """Retorna a faixa atual quando disponível."""
-        if self.current_lane_index < 0:
-            return None
-
-        if self.current_lane_index >= len(self.lanes) - 1:
-            return None
-
-        return (
-            self.lanes[self.current_lane_index],
-            self.lanes[self.current_lane_index + 1],
-        )
-
-    @property
-    def left_boundary(self) -> Optional[Any]:
-        """Linha esquerda da faixa atual."""
-        if self.left_boundary_index < 0:
-            return None
-
-        if self.left_boundary_index >= len(self.lanes):
-            return None
-
-        return self.lanes[self.left_boundary_index]
-
-    @property
-    def right_boundary(self) -> Optional[Any]:
-        """Linha direita da faixa atual."""
-        if self.right_boundary_index < 0:
-            return None
-
-        if self.right_boundary_index >= len(self.lanes):
-            return None
-
-        return self.lanes[self.right_boundary_index]
-
-    @property
-    def lane_count(self) -> int:
-        """Quantidade de linhas disponíveis."""
-        return len(self.lanes)
-
-    @property
     def corridor_count(self) -> int:
-        """Quantidade de corredores possíveis."""
-        return max(0, len(self.lanes) - 1)
+        """Number of possible corridors."""
+        return max(0, self.lane_count - 1)
+
+    @property
+    def current_lane_index(self) -> int:
+        """Compatibility alias."""
+        if self.current_lane_id is None:
+            return -1
+
+        return int(self.current_lane_id)
+
+    @property
+    def left_boundary_index(self) -> int:
+        """Compatibility alias."""
+        if self.left_boundary_id is None:
+            return -1
+
+        return int(self.left_boundary_id)
+
+    @property
+    def right_boundary_index(self) -> int:
+        """Compatibility alias."""
+        if self.right_boundary_id is None:
+            return -1
+
+        return int(self.right_boundary_id)
+
+    @property
+    def is_valid(self) -> bool:
+        """Compatibility alias."""
+        return bool(self.valid)
 
 
-# =============================================================================
-# UTILITÁRIOS
-# =============================================================================
+# ============================================================================
+# INTERNAL HELPERS
+# ============================================================================
 
 
-def _safe_float(
+def _finite_float(
     value: Any,
-    default: float = 0.0,
-) -> float:
-    """Converte valor para float sem permitir NaN/inf."""
+    default: Optional[float] = None,
+) -> Optional[float]:
+    """Convert a value to a finite float."""
 
     try:
         result = float(value)
@@ -204,29 +139,29 @@ def _safe_float(
     return result
 
 
-def _clip01(value: float) -> float:
-    """Limita valor ao intervalo [0, 1]."""
+def _clip01(value: Any) -> float:
+    """Clamp value to [0, 1]."""
+
+    result = _finite_float(value, 0.0)
+
+    if result is None:
+        return 0.0
 
     return float(
         np.clip(
-            _safe_float(value),
+            result,
             0.0,
             1.0,
         )
     )
 
 
-def _get_attr(
+def _first_attr(
     obj: Any,
     names: Sequence[str],
     default: Any = None,
 ) -> Any:
-    """
-    Obtém o primeiro atributo disponível.
-
-    Isso mantém o assignment compatível com diferentes versões
-    de LaneProjection / LaneModel.
-    """
+    """Return the first existing non-None attribute."""
 
     if obj is None:
         return default
@@ -241,440 +176,494 @@ def _get_attr(
     return default
 
 
-def _extract_points(obj: Any) -> list[Any]:
-    """Obtém pontos de um objeto de projeção/modelo."""
+def _extract_xy(
+    point: Any,
+) -> Optional[tuple[float, float]]:
+    """Extract an (x, y) point from common representations."""
 
-    points = _get_attr(
-        obj,
-        (
-            "points",
-            "projected_points",
-            "projection_points",
-        ),
-        None,
-    )
+    if point is None:
+        return None
 
-    if points is None:
-        return []
+    if isinstance(point, np.ndarray):
+        point = point.tolist()
 
-    try:
-        return list(points)
-    except TypeError:
-        return []
+    if isinstance(point, (list, tuple)):
 
+        if len(point) < 2:
+            return None
 
-def _point_x(point: Any) -> Optional[float]:
-    """Obtém X de um ponto."""
+        x = _finite_float(point[0])
+        y = _finite_float(point[1])
 
-    value = _get_attr(
+        if x is None or y is None:
+            return None
+
+        return x, y
+
+    x = _first_attr(
         point,
         (
             "x",
             "screen_x",
             "image_x",
         ),
-        None,
     )
 
-    if value is None:
-        return None
-
-    result = _safe_float(
-        value,
-        float("nan"),
-    )
-
-    if not np.isfinite(result):
-        return None
-
-    return result
-
-
-def _point_y(point: Any) -> Optional[float]:
-    """Obtém Y de um ponto."""
-
-    value = _get_attr(
+    y = _first_attr(
         point,
         (
             "y",
             "screen_y",
             "image_y",
         ),
-        None,
     )
 
-    if value is None:
+    x = _finite_float(x)
+    y = _finite_float(y)
+
+    if x is None or y is None:
         return None
 
-    result = _safe_float(
-        value,
-        float("nan"),
-    )
-
-    if not np.isfinite(result):
-        return None
-
-    return result
+    return x, y
 
 
-# =============================================================================
+# ============================================================================
 # ENGINE
-# =============================================================================
+# ============================================================================
 
 
-class LaneAssignmentEngine:
+class LaneAssignment:
     """
-    Motor de associação semântica.
+    Assign detected lane boundaries to semantic lane corridors.
 
-    O algoritmo principal é:
+    API intentionally matches the current main.py:
 
-        1. obter posição representativa de cada linha;
-        2. ordenar esquerda → direita;
-        3. formar corredores entre linhas adjacentes;
-        4. determinar qual corredor contém o veículo;
-        5. calcular offset relativo ao centro;
-        6. identificar corredores vizinhos;
-        7. aplicar continuidade temporal.
+        LaneAssignment(
+            max_lanes=...,
+            min_lane_width_px=...,
+            max_lane_width_px=...,
+            vehicle_x_ratio=...,
+        )
 
-    A posição do veículo é definida por ``vehicle_x``.
+    and:
 
-    Se não for fornecida explicitamente, o engine utiliza
-    ``image_center_x``.
+        assign(
+            models,
+            frame_width=...,
+            frame_height=...,
+        )
     """
 
     def __init__(
         self,
-        expected_lane_width: float = 312.0,
-        lane_width_tolerance: float = 0.45,
-        minimum_confidence: float = 0.40,
-        minimum_lane_separation: float = 80.0,
-        maximum_lane_separation: float = 900.0,
-        maximum_lateral_offset_ratio: float = 1.25,
-        center_reference_ratio: float = 0.50,
-        max_left_lanes: int = 8,
-        max_right_lanes: int = 8,
-        enable_multi_lane_assignment: bool = True,
+        max_lanes: int = 8,
+        min_lane_width_px: float = 80.0,
+        max_lane_width_px: float = 900.0,
+        vehicle_x_ratio: float = 0.5,
+        **kwargs: Any,
     ) -> None:
 
-        self.expected_lane_width = max(
+        self.max_lanes = max(
+            2,
+            int(max_lanes),
+        )
+
+        self.min_lane_width_px = max(
             1.0,
-            float(expected_lane_width),
+            float(min_lane_width_px),
         )
 
-        self.lane_width_tolerance = max(
-            0.0,
-            float(lane_width_tolerance),
+        self.max_lane_width_px = max(
+            self.min_lane_width_px,
+            float(max_lane_width_px),
         )
 
-        self.minimum_confidence = _clip01(
-            minimum_confidence
-        )
-
-        self.minimum_lane_separation = max(
-            0.0,
-            float(minimum_lane_separation),
-        )
-
-        self.maximum_lane_separation = max(
-            self.minimum_lane_separation,
-            float(maximum_lane_separation),
-        )
-
-        self.maximum_lateral_offset_ratio = max(
-            0.1,
-            float(maximum_lateral_offset_ratio),
-        )
-
-        self.center_reference_ratio = float(
+        self.vehicle_x_ratio = float(
             np.clip(
-                center_reference_ratio,
+                vehicle_x_ratio,
                 0.0,
                 1.0,
             )
         )
 
-        self.max_left_lanes = max(
-            0,
-            int(max_left_lanes),
+        # Optional compatibility parameters.
+        self.expected_lane_width = _finite_float(
+            kwargs.get(
+                "expected_lane_width",
+            )
         )
 
-        self.max_right_lanes = max(
-            0,
-            int(max_right_lanes),
+        self.lane_width_tolerance = _finite_float(
+            kwargs.get(
+                "lane_width_tolerance",
+            ),
+            0.45,
         )
 
-        self.enable_multi_lane_assignment = bool(
-            enable_multi_lane_assignment
+        self.minimum_confidence = _clip01(
+            kwargs.get(
+                "minimum_confidence",
+                0.35,
+            )
         )
 
-        # ------------------------------------------------------------------
-        # Histórico
-        # ------------------------------------------------------------------
+        self.maximum_lateral_offset_ratio = max(
+            0.5,
+            float(
+                kwargs.get(
+                    "maximum_lateral_offset_ratio",
+                    1.25,
+                )
+            ),
+        )
 
-        self._previous_lane_index: Optional[int] = None
+        # Temporal state.
+        self._previous_lane_id: Optional[int] = None
+        self._previous_center_x: Optional[float] = None
 
     # =========================================================================
-    # POSIÇÃO DA LINHA
+    # MODEL X EXTRACTION
     # =========================================================================
 
-    def _line_x(
+    def _model_points(
         self,
-        lane: Any,
-        reference_y: Optional[float] = None,
+        model: Any,
+    ) -> list[Any]:
+        """
+        Extract points from LaneModel.
+
+        Supports several representations used by the project.
+        """
+
+        points = _first_attr(
+            model,
+            (
+                "points",
+                "lane_points",
+                "samples",
+                "projected_points",
+                "projection_points",
+            ),
+            None,
+        )
+
+        if points is None:
+            return []
+
+        try:
+            return list(points)
+        except TypeError:
+            return []
+
+    def _model_x_at_y(
+        self,
+        model: Any,
+        target_y: float,
     ) -> Optional[float]:
         """
-        Obtém a posição X representativa da linha.
+        Evaluate a lane model at target_y.
 
-        Prioridade:
-
-        1. método/atributo explícito em reference_x;
-        2. ponto próximo ao reference_y;
-        3. ponto inferior da projeção;
-        4. centro médio dos pontos;
-        5. atributos x/center_x.
+        Supports explicit model evaluation methods and
+        point-based models.
         """
 
         # ------------------------------------------------------------------
-        # X explícito
+        # Explicit evaluation methods.
         # ------------------------------------------------------------------
 
-        explicit_x = _get_attr(
-            lane,
-            (
-                "reference_x",
-                "bottom_x",
-                "near_x",
-                "x_at_bottom",
-                "center_x",
-            ),
-            None,
-        )
+        for method_name in (
+            "x_at_y",
+            "evaluate_x",
+            "get_x",
+            "predict_x",
+        ):
 
-        if explicit_x is not None:
-            value = _safe_float(
-                explicit_x,
-                float("nan"),
+            method = getattr(
+                model,
+                method_name,
+                None,
             )
 
-            if np.isfinite(value):
-                return value
-
-        # ------------------------------------------------------------------
-        # Pontos
-        # ------------------------------------------------------------------
-
-        points = _extract_points(lane)
-
-        valid_points: list[tuple[float, float]] = []
-
-        for point in points:
-            x = _point_x(point)
-            y = _point_y(point)
-
-            if x is None or y is None:
-                continue
-
-            valid_points.append(
-                (x, y)
-            )
-
-        if valid_points:
-
-            # --------------------------------------------------------------
-            # Procurar ponto mais próximo da referência inferior
-            # --------------------------------------------------------------
-
-            if reference_y is not None:
+            if callable(method):
 
                 try:
-                    target_y = float(reference_y)
-
-                    nearest = min(
-                        valid_points,
-                        key=lambda item: abs(
-                            item[1] - target_y
-                        ),
+                    value = method(
+                        target_y
                     )
+                except TypeError:
+                    try:
+                        value = method(
+                            y=target_y
+                        )
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
 
-                    return float(nearest[0])
+                value = _finite_float(value)
 
-                except (TypeError, ValueError):
-                    pass
-
-            # --------------------------------------------------------------
-            # Sem referência:
-            # utilizar o ponto de maior Y.
-            # --------------------------------------------------------------
-
-            bottom = max(
-                valid_points,
-                key=lambda item: item[1],
-            )
-
-            return float(bottom[0])
+                if value is not None:
+                    return value
 
         # ------------------------------------------------------------------
-        # Fallbacks
+        # Polynomial coefficients.
         # ------------------------------------------------------------------
 
-        value = _get_attr(
-            lane,
+        coefficients = _first_attr(
+            model,
             (
-                "x",
-                "screen_x",
+                "coefficients",
+                "coeffs",
+                "poly_coeffs",
+                "polynomial",
             ),
             None,
         )
 
-        if value is not None:
-            result = _safe_float(
-                value,
-                float("nan"),
+        if coefficients is not None:
+
+            try:
+                coefficients = list(
+                    coefficients
+                )
+
+                if coefficients:
+
+                    value = np.polyval(
+                        np.asarray(
+                            coefficients,
+                            dtype=float,
+                        ),
+                        target_y,
+                    )
+
+                    value = _finite_float(
+                        value
+                    )
+
+                    if value is not None:
+                        return value
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        # ------------------------------------------------------------------
+        # Point interpolation.
+        # ------------------------------------------------------------------
+
+        points = self._model_points(
+            model
+        )
+
+        xy_points: list[
+            tuple[float, float]
+        ] = []
+
+        for point in points:
+
+            xy = _extract_xy(
+                point
             )
 
-            if np.isfinite(result):
-                return result
+            if xy is not None:
+                xy_points.append(
+                    xy
+                )
+
+        if xy_points:
+
+            xy_points.sort(
+                key=lambda item: item[1]
+            )
+
+            xs = np.asarray(
+                [
+                    item[0]
+                    for item in xy_points
+                ],
+                dtype=float,
+            )
+
+            ys = np.asarray(
+                [
+                    item[1]
+                    for item in xy_points
+                ],
+                dtype=float,
+            )
+
+            if len(xs) == 1:
+                return float(xs[0])
+
+            try:
+
+                value = np.interp(
+                    target_y,
+                    ys,
+                    xs,
+                )
+
+                value = _finite_float(
+                    value
+                )
+
+                if value is not None:
+                    return value
+
+            except Exception:
+                pass
+
+        # ------------------------------------------------------------------
+        # Explicit bottom/reference coordinates.
+        # ------------------------------------------------------------------
+
+        for name in (
+            "bottom_x",
+            "reference_x",
+            "near_x",
+            "x_at_bottom",
+            "center_x",
+            "x",
+        ):
+
+            value = _finite_float(
+                getattr(
+                    model,
+                    name,
+                    None,
+                )
+            )
+
+            if value is not None:
+                return value
 
         return None
 
     # =========================================================================
-    # CONFIANÇA DA LINHA
+    # MODEL CONFIDENCE
     # =========================================================================
 
-    def _line_confidence(
+    def _model_confidence(
         self,
-        lane: Any,
+        model: Any,
     ) -> float:
-        """Obtém confiança da linha."""
 
-        value = _get_attr(
-            lane,
+        value = _first_attr(
+            model,
             (
                 "confidence",
                 "score",
                 "lane_confidence",
+                "model_confidence",
             ),
             1.0,
         )
 
         return _clip01(
-            _safe_float(
-                value,
-                1.0,
-            )
+            value
         )
 
     # =========================================================================
-    # ORDENAÇÃO
+    # MODEL SORTING
     # =========================================================================
 
-    def _prepare_lanes(
+    def _prepare_models(
         self,
-        lanes: Iterable[Any],
-        reference_y: Optional[float],
-    ) -> list[tuple[Any, float, float]]:
-        """
-        Converte as linhas para:
+        models: Iterable[Any],
+        reference_y: float,
+    ) -> list[dict[str, Any]]:
 
-            (lane, x, confidence)
+        prepared: list[
+            dict[str, Any]
+        ] = []
 
-        e ordena esquerda → direita.
-        """
-
-        prepared = []
-
-        if lanes is None:
+        if models is None:
             return prepared
 
         try:
-            iterator = iter(lanes)
+            iterator = iter(models)
         except TypeError:
             return prepared
 
-        for lane in iterator:
+        for model in iterator:
 
-            if lane is None:
+            if model is None:
                 continue
 
-            x = self._line_x(
-                lane,
+            x = self._model_x_at_y(
+                model,
                 reference_y,
             )
 
             if x is None:
                 continue
 
-            confidence = self._line_confidence(
-                lane
-            )
-
-            prepared.append(
-                (
-                    lane,
-                    float(x),
-                    confidence,
+            confidence = (
+                self._model_confidence(
+                    model
                 )
             )
 
+            prepared.append(
+                {
+                    "model": model,
+                    "x": float(x),
+                    "confidence": confidence,
+                }
+            )
+
+        # Spatial order: left → right.
         prepared.sort(
-            key=lambda item: item[1]
+            key=lambda item: item["x"]
         )
 
-        return prepared
+        # Prevent pathological duplicate lines.
+        filtered: list[
+            dict[str, Any]
+        ] = []
+
+        for item in prepared:
+
+            if not filtered:
+                filtered.append(item)
+                continue
+
+            previous_x = filtered[-1]["x"]
+
+            if abs(
+                item["x"]
+                - previous_x
+            ) < 1.0:
+                # Keep the more confident duplicate.
+                if (
+                    item["confidence"]
+                    > filtered[-1]["confidence"]
+                ):
+                    filtered[-1] = item
+
+                continue
+
+            filtered.append(item)
+
+        return filtered[
+            : self.max_lanes
+        ]
 
     # =========================================================================
-    # VEÍCULO
-    # =========================================================================
-
-    @staticmethod
-    def _vehicle_x(
-        vehicle_x: Optional[float],
-        image_center_x: Optional[float],
-    ) -> Optional[float]:
-
-        if vehicle_x is not None:
-            value = _safe_float(
-                vehicle_x,
-                float("nan"),
-            )
-
-            if np.isfinite(value):
-                return value
-
-        if image_center_x is not None:
-            value = _safe_float(
-                image_center_x,
-                float("nan"),
-            )
-
-            if np.isfinite(value):
-                return value
-
-        return None
-
-    # =========================================================================
-    # CORREDORES
+    # CORRIDORS
     # =========================================================================
 
     def _build_corridors(
         self,
-        prepared: list[tuple[Any, float, float]],
+        prepared: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """
-        Constrói corredores entre linhas adjacentes.
 
-        Exemplo:
-
-            L0 L1 L2 L3
-
-        produz:
-
-            C0 = L0-L1
-            C1 = L1-L2
-            C2 = L2-L3
-        """
-
-        corridors: list[dict[str, Any]] = []
+        corridors: list[
+            dict[str, Any]
+        ] = []
 
         if len(prepared) < 2:
             return corridors
@@ -683,95 +672,109 @@ class LaneAssignmentEngine:
             len(prepared) - 1
         ):
 
-            left_lane, left_x, left_conf = (
-                prepared[index]
+            left = prepared[index]
+            right = prepared[
+                index + 1
+            ]
+
+            left_x = float(
+                left["x"]
             )
 
-            right_lane, right_x, right_conf = (
-                prepared[index + 1]
+            right_x = float(
+                right["x"]
             )
 
-            width = right_x - left_x
+            width = (
+                right_x
+                - left_x
+            )
 
+            # The two lines must be spatially ordered.
             if width <= 0:
                 continue
+
+            # Reject obviously impossible corridors.
+            if width < self.min_lane_width_px:
+                continue
+
+            if width > self.max_lane_width_px:
+                continue
+
+            left_conf = float(
+                left["confidence"]
+            )
+
+            right_conf = float(
+                right["confidence"]
+            )
 
             confidence = min(
                 left_conf,
                 right_conf,
             )
 
-            width_error = abs(
-                width - self.expected_lane_width
-            ) / self.expected_lane_width
-
-            width_score = max(
-                0.0,
-                1.0
-                - (
-                    width_error
-                    / max(
-                        self.lane_width_tolerance,
-                        1e-6,
-                    )
-                ),
-            )
+            center_x = (
+                left_x
+                + right_x
+            ) * 0.5
 
             corridors.append(
                 {
-                    "index": index,
-                    "left_index": index,
-                    "right_index": index + 1,
-                    "left_lane": left_lane,
-                    "right_lane": right_lane,
+                    "lane_id": index,
+                    "left_id": index,
+                    "right_id": index + 1,
                     "left_x": left_x,
                     "right_x": right_x,
-                    "center_x": (
-                        left_x
-                        + (
-                            width
-                            * self.center_reference_ratio
-                        )
-                    ),
+                    "center_x": center_x,
                     "width": width,
                     "confidence": confidence,
-                    "width_score": _clip01(
-                        width_score
-                    ),
                 }
             )
 
         return corridors
 
     # =========================================================================
-    # SELEÇÃO DO CORREDOR
+    # CURRENT LANE
     # =========================================================================
 
-    def _select_corridor(
+    def _select_current_lane(
         self,
         corridors: list[dict[str, Any]],
         vehicle_x: float,
     ) -> Optional[dict[str, Any]]:
         """
-        Seleciona o corredor que contém o veículo.
+        Select the corridor containing the vehicle.
 
-        Regra principal:
+        This is the critical semantic operation.
 
-            left_x <= vehicle_x <= right_x
+        With:
 
-        Isso é fundamental.
+            L0 L1 L2 L3
 
-        Não escolhemos a linha mais próxima.
+        and vehicle_x between L1 and L2:
 
-        Escolhemos o INTERVALO entre duas linhas.
+            current_lane_id = 1
+
+        NOT the closest boundary.
         """
 
-        containing = []
+        if not corridors:
+            return None
+
+        containing: list[
+            dict[str, Any]
+        ] = []
 
         for corridor in corridors:
 
-            left_x = corridor["left_x"]
-            right_x = corridor["right_x"]
+            left_x = corridor[
+                "left_x"
+            ]
+
+            right_x = corridor[
+                "right_x"
+            ]
 
             if (
                 left_x
@@ -784,51 +787,50 @@ class LaneAssignmentEngine:
 
         if containing:
 
-            # Em condições normais haverá somente um.
-            # Se houver sobreposição, prefere o corredor
-            # cujo centro esteja mais próximo do veículo.
-
+            # Normally exactly one corridor contains
+            # the vehicle. If numerical overlap occurs,
+            # use the closest center.
             return min(
                 containing,
-                key=lambda corridor: abs(
-                    corridor["center_x"]
+                key=lambda item: abs(
+                    item["center_x"]
                     - vehicle_x
                 ),
             )
 
         # ------------------------------------------------------------------
-        # Fallback:
-        # veículo ligeiramente fora de uma faixa.
+        # Vehicle just outside a boundary.
+        #
+        # We allow a limited extrapolation so that a temporary
+        # detection error does not immediately invalidate assignment.
         # ------------------------------------------------------------------
-
-        if not corridors:
-            return None
 
         nearest = min(
             corridors,
-            key=lambda corridor: min(
+            key=lambda item: min(
                 abs(
                     vehicle_x
-                    - corridor["left_x"]
+                    - item["left_x"]
                 ),
                 abs(
                     vehicle_x
-                    - corridor["right_x"]
+                    - item["right_x"]
                 ),
             ),
         )
 
-        width = nearest["width"]
+        half_width = (
+            nearest["width"]
+            * 0.5
+        )
 
-        if width <= 0:
+        if half_width <= 0:
             return None
 
         offset_ratio = abs(
             vehicle_x
             - nearest["center_x"]
-        ) / (
-            width * 0.5
-        )
+        ) / half_width
 
         if (
             offset_ratio
@@ -839,7 +841,7 @@ class LaneAssignmentEngine:
         return None
 
     # =========================================================================
-    # CONTINUIDADE TEMPORAL
+    # TEMPORAL CONTINUITY
     # =========================================================================
 
     def _apply_temporal_continuity(
@@ -849,234 +851,281 @@ class LaneAssignmentEngine:
         vehicle_x: float,
     ) -> Optional[dict[str, Any]]:
         """
-        Mantém a faixa atual estável entre frames.
+        Avoid unnecessary lane-ID jumps.
 
-        O histórico só é utilizado quando ainda existe
-        um corredor plausível.
+        A jump of one corridor is allowed because it can represent
+        an actual lane change.
 
-        Não força uma faixa antiga quando ela claramente
-        não contém mais o veículo.
+        Large jumps require the previous corridor to remain plausible.
         """
 
         if selected is None:
-            self._previous_lane_index = None
             return None
 
-        current_index = int(
-            selected["index"]
+        current_id = int(
+            selected["lane_id"]
         )
 
-        previous = self._previous_lane_index
+        previous_id = (
+            self._previous_lane_id
+        )
 
-        if previous is None:
-            self._previous_lane_index = current_index
+        if previous_id is None:
+
+            self._previous_lane_id = (
+                current_id
+            )
+
+            self._previous_center_x = (
+                float(
+                    selected["center_x"]
+                )
+            )
+
             return selected
 
-        # --------------------------------------------------------------
-        # Mesma faixa
-        # --------------------------------------------------------------
+        if current_id == previous_id:
 
-        if current_index == previous:
-            self._previous_lane_index = current_index
+            self._previous_center_x = (
+                float(
+                    selected["center_x"]
+                )
+            )
+
             return selected
 
-        # --------------------------------------------------------------
-        # Mudança para corredor adjacente:
-        # permitido.
-        # --------------------------------------------------------------
-
+        # Adjacent lane transition is legitimate.
         if abs(
-            current_index - previous
+            current_id
+            - previous_id
         ) <= 1:
-            self._previous_lane_index = current_index
+
+            self._previous_lane_id = (
+                current_id
+            )
+
+            self._previous_center_x = (
+                float(
+                    selected["center_x"]
+                )
+            )
+
             return selected
 
-        # --------------------------------------------------------------
-        # Mudança grande:
-        # procurar o corredor anterior.
-        # --------------------------------------------------------------
-
+        # For a larger jump, verify that the old lane is
+        # still physically plausible.
         previous_corridor = None
 
         for corridor in corridors:
+
             if (
-                int(corridor["index"])
-                == previous
+                int(corridor["lane_id"])
+                == previous_id
             ):
-                previous_corridor = corridor
+                previous_corridor = (
+                    corridor
+                )
                 break
 
         if previous_corridor is not None:
 
-            left = previous_corridor["left_x"]
-            right = previous_corridor["right_x"]
-
             if (
-                left
+                previous_corridor[
+                    "left_x"
+                ]
                 <= vehicle_x
-                <= right
+                <= previous_corridor[
+                    "right_x"
+                ]
             ):
                 return previous_corridor
 
-        self._previous_lane_index = current_index
+        self._previous_lane_id = (
+            current_id
+        )
+
+        self._previous_center_x = (
+            float(
+                selected["center_x"]
+            )
+        )
 
         return selected
 
     # =========================================================================
-    # UPDATE
+    # PUBLIC API
     # =========================================================================
 
     def assign(
         self,
-        lanes: Iterable[Any],
-        vehicle_x: Optional[float] = None,
-        image_center_x: Optional[float] = None,
-        reference_y: Optional[float] = None,
+        models: Iterable[Any],
+        frame_width: float,
+        frame_height: float,
     ) -> LaneAssignmentResult:
         """
-        Executa a associação.
+        Assign semantic lane information.
 
-        Parâmetros
+        Parameters
         ----------
-        lanes:
-            Linhas/projeções.
+        models:
+            LaneModel objects generated by the current pipeline.
 
-        vehicle_x:
-            Centro lateral do veículo.
+        frame_width:
+            Current frame width in pixels.
 
-        image_center_x:
-            Centro da imagem caso vehicle_x não seja fornecido.
+        frame_height:
+            Current frame height in pixels.
 
-        reference_y:
-            Y utilizado para determinar a posição das linhas.
+        Returns
+        -------
+        LaneAssignmentResult
         """
 
-        prepared = self._prepare_lanes(
-            lanes,
+        width = _finite_float(
+            frame_width
+        )
+
+        height = _finite_float(
+            frame_height
+        )
+
+        if width is None or width <= 0:
+            return LaneAssignmentResult(
+                valid=False,
+                reason="Invalid frame width.",
+            )
+
+        if height is None or height <= 0:
+            return LaneAssignmentResult(
+                valid=False,
+                reason="Invalid frame height.",
+            )
+
+        # ------------------------------------------------------------------
+        # Reference point.
+        #
+        # We evaluate lanes close to the bottom of the image because
+        # this is where lateral lane separation is most useful.
+        # ------------------------------------------------------------------
+
+        reference_y = (
+            height * 0.90
+        )
+
+        vehicle_x = (
+            width
+            * self.vehicle_x_ratio
+        )
+
+        prepared = self._prepare_models(
+            models,
             reference_y,
         )
 
-        ordered_lanes = tuple(
-            item[0]
-            for item in prepared
-        )
-
-        # ------------------------------------------------------------------
-        # Linhas insuficientes
-        # ------------------------------------------------------------------
-
-        if len(prepared) < 2:
-
-            self._previous_lane_index = None
-
-            return LaneAssignmentResult(
-                lanes=ordered_lanes,
-                valid=False,
-                reason=(
-                    "São necessárias pelo menos "
-                    "duas linhas para formar uma faixa."
-                ),
-            )
-
-        # ------------------------------------------------------------------
-        # Veículo
-        # ------------------------------------------------------------------
-
-        resolved_vehicle_x = self._vehicle_x(
-            vehicle_x,
-            image_center_x,
-        )
-
-        if resolved_vehicle_x is None:
-
-            return LaneAssignmentResult(
-                lanes=ordered_lanes,
-                valid=False,
-                reason=(
-                    "Não foi possível determinar "
-                    "a posição lateral do veículo."
-                ),
-            )
-
-        # ------------------------------------------------------------------
-        # Corredores
-        # ------------------------------------------------------------------
-
-        corridors = self._build_corridors(
+        lane_count = len(
             prepared
+        )
+
+        if lane_count < 2:
+
+            self._previous_lane_id = None
+            self._previous_center_x = None
+
+            return LaneAssignmentResult(
+                valid=False,
+                vehicle_x=vehicle_x,
+                lane_count=lane_count,
+                reason=(
+                    "At least two lane "
+                    "boundaries are required."
+                ),
+            )
+
+        corridors = (
+            self._build_corridors(
+                prepared
+            )
         )
 
         if not corridors:
 
-            self._previous_lane_index = None
-
             return LaneAssignmentResult(
-                lanes=ordered_lanes,
-                vehicle_x=resolved_vehicle_x,
                 valid=False,
+                vehicle_x=vehicle_x,
+                lane_count=lane_count,
                 reason=(
-                    "Nenhum corredor válido "
-                    "foi formado entre as linhas."
+                    "No valid corridor could "
+                    "be constructed."
                 ),
             )
 
-        # ------------------------------------------------------------------
-        # Seleção
-        # ------------------------------------------------------------------
-
-        selected = self._select_corridor(
-            corridors,
-            resolved_vehicle_x,
+        selected = (
+            self._select_current_lane(
+                corridors,
+                vehicle_x,
+            )
         )
 
-        selected = self._apply_temporal_continuity(
-            selected,
-            corridors,
-            resolved_vehicle_x,
+        if selected is None:
+
+            self._previous_lane_id = None
+
+            return LaneAssignmentResult(
+                valid=False,
+                vehicle_x=vehicle_x,
+                lane_count=lane_count,
+                reason=(
+                    "Vehicle could not be "
+                    "associated with a lane."
+                ),
+            )
+
+        selected = (
+            self._apply_temporal_continuity(
+                selected,
+                corridors,
+                vehicle_x,
+            )
         )
 
         if selected is None:
 
             return LaneAssignmentResult(
-                lanes=ordered_lanes,
-                vehicle_x=resolved_vehicle_x,
                 valid=False,
+                vehicle_x=vehicle_x,
+                lane_count=lane_count,
                 reason=(
-                    "O veículo não está dentro "
-                    "de nenhum corredor plausível."
+                    "Temporal lane association "
+                    "failed."
                 ),
             )
 
         # ------------------------------------------------------------------
-        # Índice
+        # Geometry of selected corridor.
         # ------------------------------------------------------------------
 
-        lane_index = int(
-            selected["index"]
+        lane_id = int(
+            selected["lane_id"]
         )
 
-        left_boundary_index = int(
-            selected["left_index"]
+        left_id = int(
+            selected["left_id"]
         )
 
-        right_boundary_index = int(
-            selected["right_index"]
-        )
-
-        # ------------------------------------------------------------------
-        # Offset
-        # ------------------------------------------------------------------
-
-        lane_width = float(
-            selected["width"]
+        right_id = int(
+            selected["right_id"]
         )
 
         lane_center_x = float(
             selected["center_x"]
         )
 
+        lane_width = float(
+            selected["width"]
+        )
+
         lateral_offset = (
-            resolved_vehicle_x
+            vehicle_x
             - lane_center_x
         )
 
@@ -1086,27 +1135,57 @@ class LaneAssignmentEngine:
         )
 
         normalized_offset = float(
+            lateral_offset
+            / half_width
+        )
+
+        normalized_offset = float(
             np.clip(
-                lateral_offset
-                / half_width,
+                normalized_offset,
                 -1.0,
                 1.0,
             )
         )
 
         # ------------------------------------------------------------------
-        # Confiança
+        # Confidence.
+        #
+        # Confidence depends on:
+        #   - both boundary confidences;
+        #   - whether the vehicle is inside the corridor;
+        #   - how far the vehicle is from the center.
         # ------------------------------------------------------------------
 
-        confidence = (
-            float(selected["confidence"])
-            * (
-                0.65
-                + 0.35
-                * float(
-                    selected["width_score"]
-                )
+        boundary_confidence = float(
+            selected["confidence"]
+        )
+
+        inside = (
+            selected["left_x"]
+            <= vehicle_x
+            <= selected["right_x"]
+        )
+
+        if inside:
+
+            position_confidence = 1.0
+
+        else:
+
+            position_confidence = max(
+                0.0,
+                1.0
+                - (
+                    abs(
+                        normalized_offset
+                    )
+                    - 1.0
+                ),
             )
+
+        confidence = (
+            boundary_confidence
+            * position_confidence
         )
 
         confidence = _clip01(
@@ -1119,112 +1198,115 @@ class LaneAssignmentEngine:
         )
 
         # ------------------------------------------------------------------
-        # Linhas à esquerda/direita
+        # Adjacent lanes.
+        #
+        # lane_id represents a corridor:
+        #
+        #   0 = L0-L1
+        #   1 = L1-L2
+        #   2 = L2-L3
+        #
+        # Therefore:
+        #
+        #   lanes left  = corridors [0 ... lane_id-1]
+        #   lanes right = corridors [lane_id+1 ...]
         # ------------------------------------------------------------------
 
-        left_lanes = ordered_lanes[
-            :left_boundary_index
-        ]
+        left_lane_count = max(
+            0,
+            lane_id,
+        )
 
-        right_lanes = ordered_lanes[
-            right_boundary_index + 1:
-        ]
-
-        # ------------------------------------------------------------------
-        # Limitação
-        # ------------------------------------------------------------------
-
-        left_lanes = left_lanes[
-            -self.max_left_lanes:
-        ]
-
-        right_lanes = right_lanes[
-            :self.max_right_lanes
-        ]
+        right_lane_count = max(
+            0,
+            len(corridors)
+            - lane_id
+            - 1,
+        )
 
         return LaneAssignmentResult(
-            lanes=ordered_lanes,
+            valid=valid,
 
-            current_lane_index=lane_index,
+            current_lane_id=lane_id,
 
-            left_boundary_index=(
-                left_boundary_index
-            ),
-
-            right_boundary_index=(
-                right_boundary_index
-            ),
-
-            left_lanes=tuple(
-                left_lanes
-            ),
-
-            right_lanes=tuple(
-                right_lanes
-            ),
+            left_boundary_id=left_id,
+            right_boundary_id=right_id,
 
             lane_center_x=lane_center_x,
-
-            vehicle_x=resolved_vehicle_x,
-
-            lateral_offset=lateral_offset,
-
-            normalized_offset=normalized_offset,
+            vehicle_x=vehicle_x,
 
             lane_width=lane_width,
 
+            lateral_offset=lateral_offset,
+            normalized_offset=normalized_offset,
+
             confidence=confidence,
 
-            valid=valid,
+            lane_count=lane_count,
+
+            left_lane_count=left_lane_count,
+            right_lane_count=right_lane_count,
 
             reason=(
                 None
                 if valid
                 else (
-                    "Confiança da associação "
-                    "abaixo do mínimo."
+                    "Assignment confidence "
+                    "below threshold."
                 )
             ),
         )
 
     # =========================================================================
-    # COMPATIBILIDADE
+    # OPTIONAL COMPATIBILITY ALIAS
     # =========================================================================
 
     def update(
         self,
-        lanes: Iterable[Any],
-        vehicle_x: Optional[float] = None,
-        image_center_x: Optional[float] = None,
-        reference_y: Optional[float] = None,
+        models: Iterable[Any],
+        frame_width: float,
+        frame_height: float,
     ) -> LaneAssignmentResult:
-        """
-        Alias de assign().
-
-        Mantido para compatibilidade com chamadas existentes.
-        """
+        """Compatibility alias for assign()."""
 
         return self.assign(
-            lanes=lanes,
-            vehicle_x=vehicle_x,
-            image_center_x=image_center_x,
-            reference_y=reference_y,
+            models=models,
+            frame_width=frame_width,
+            frame_height=frame_height,
         )
 
+    def reset(self) -> None:
+        """Reset temporal assignment state."""
 
-# =============================================================================
+        self._previous_lane_id = None
+        self._previous_center_x = None
+
+
+# ============================================================================
+# ENGINE COMPATIBILITY
+# ============================================================================
+
+
+class LaneAssignmentEngine(LaneAssignment):
+    """
+    Backward-compatible alias.
+
+    Older code may import LaneAssignmentEngine.
+    """
+
+    pass
+
+
+# ============================================================================
 # FACTORY
-# =============================================================================
+# ============================================================================
 
 
 def create_default_lane_assignment(
     config: Optional[Any] = None,
-) -> LaneAssignmentEngine:
+) -> LaneAssignment:
     """
-    Cria o assignment utilizando a configuração global.
-
-    Aceita config opcional para manter compatibilidade
-    com diferentes versões do projeto.
+    Create LaneAssignment using project configuration when available.
     """
 
     if config is None:
@@ -1234,150 +1316,121 @@ def create_default_lane_assignment(
 
             config = LANE_ASSIGNMENT
 
-        except ImportError:
+        except (
+            ImportError,
+            AttributeError,
+        ):
             config = None
 
     if config is None:
 
-        return LaneAssignmentEngine()
+        return LaneAssignment()
 
-    return LaneAssignmentEngine(
-        expected_lane_width=_safe_float(
-            getattr(
-                config,
-                "expected_lane_width",
-                312.0,
-            ),
-            312.0,
+    # Current main.py API.
+    max_lanes = getattr(
+        config,
+        "max_lanes",
+        8,
+    )
+
+    min_width = getattr(
+        config,
+        "min_lane_width_px",
+        getattr(
+            config,
+            "minimum_lane_separation",
+            80.0,
+        ),
+    )
+
+    max_width = getattr(
+        config,
+        "max_lane_width_px",
+        getattr(
+            config,
+            "maximum_lane_separation",
+            900.0,
+        ),
+    )
+
+    vehicle_ratio = getattr(
+        config,
+        "vehicle_x_ratio",
+        0.5,
+    )
+
+    return LaneAssignment(
+        max_lanes=int(
+            max_lanes
         ),
 
-        lane_width_tolerance=_safe_float(
-            getattr(
-                config,
-                "lane_width_tolerance",
-                0.45,
-            ),
+        min_lane_width_px=float(
+            min_width
+        ),
+
+        max_lane_width_px=float(
+            max_width
+        ),
+
+        vehicle_x_ratio=float(
+            vehicle_ratio
+        ),
+
+        expected_lane_width=getattr(
+            config,
+            "expected_lane_width",
+            None,
+        ),
+
+        lane_width_tolerance=getattr(
+            config,
+            "lane_width_tolerance",
             0.45,
         ),
 
-        minimum_confidence=_safe_float(
-            getattr(
-                config,
-                "minimum_confidence",
-                0.40,
-            ),
-            0.40,
+        minimum_confidence=getattr(
+            config,
+            "minimum_confidence",
+            0.35,
         ),
 
-        minimum_lane_separation=_safe_float(
-            getattr(
-                config,
-                "minimum_lane_separation",
-                80.0,
-            ),
-            80.0,
-        ),
-
-        maximum_lane_separation=_safe_float(
-            getattr(
-                config,
-                "maximum_lane_separation",
-                900.0,
-            ),
-            900.0,
-        ),
-
-        maximum_lateral_offset_ratio=_safe_float(
-            getattr(
-                config,
-                "maximum_lateral_offset_ratio",
-                1.25,
-            ),
+        maximum_lateral_offset_ratio=getattr(
+            config,
+            "maximum_lateral_offset_ratio",
             1.25,
-        ),
-
-        center_reference_ratio=_safe_float(
-            getattr(
-                config,
-                "center_reference_ratio",
-                0.50,
-            ),
-            0.50,
-        ),
-
-        max_left_lanes=int(
-            getattr(
-                config,
-                "max_left_lanes",
-                8,
-            )
-        ),
-
-        max_right_lanes=int(
-            getattr(
-                config,
-                "max_right_lanes",
-                8,
-            )
-        ),
-
-        enable_multi_lane_assignment=bool(
-            getattr(
-                config,
-                "enable_multi_lane_assignment",
-                True,
-            )
         ),
     )
 
 
-# =============================================================================
-# FUNÇÃO DE CONVENIÊNCIA
-# =============================================================================
+# ============================================================================
+# FUNCTIONAL API
+# ============================================================================
 
 
 def assign_lanes(
-    lanes: Iterable[Any],
-    vehicle_x: Optional[float] = None,
-    image_center_x: Optional[float] = None,
-    reference_y: Optional[float] = None,
-    engine: Optional[LaneAssignmentEngine] = None,
+    models: Iterable[Any],
+    frame_width: float,
+    frame_height: float,
+    assignment: Optional[LaneAssignment] = None,
 ) -> LaneAssignmentResult:
     """
-    Função simples para executar o assignment.
-
-    Exemplo:
-
-        result = assign_lanes(
-            projections,
-            image_center_x=960,
-        )
-
+    Convenience wrapper.
     """
 
-    if engine is None:
-        engine = create_default_lane_assignment()
+    if assignment is None:
+        assignment = create_default_lane_assignment()
 
-    return engine.assign(
-        lanes=lanes,
-        vehicle_x=vehicle_x,
-        image_center_x=image_center_x,
-        reference_y=reference_y,
+    return assignment.assign(
+        models=models,
+        frame_width=frame_width,
+        frame_height=frame_height,
     )
 
 
 __all__ = [
     "LaneAssignment",
-    "LaneAssignmentResult",
     "LaneAssignmentEngine",
+    "LaneAssignmentResult",
     "create_default_lane_assignment",
     "assign_lanes",
 ]
-
-
-class LaneAssignment(LaneAssignmentEngine):
-    """
-    Interface compatível com o main.py existente.
-    """
-
-    pass
