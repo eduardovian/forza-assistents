@@ -286,7 +286,7 @@ class LaneGeometryConfig:
 
     image_height: int = 698
 
-    roi_height: int = 700
+    roi_height: int = 400
 
     min_lane_confidence: float = 0.35
 
@@ -717,7 +717,7 @@ class HotkeyConfig:
     Teclas de operação durante os testes.
     """
 
-    toggle_monitor: str = "F8"
+    toggle_monitor: str = "m"
 
     emergency_stop: str = "F9"
 
