@@ -1367,8 +1367,17 @@ def assign_lanes(
 
 
 __all__ = [
+    "LaneAssignment",
     "LaneAssignmentResult",
     "LaneAssignmentEngine",
     "create_default_lane_assignment",
     "assign_lanes",
 ]
+
+
+class LaneAssignment(LaneAssignmentEngine):
+    """
+    Interface compatível com o main.py existente.
+    """
+
+    pass
