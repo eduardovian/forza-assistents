@@ -286,7 +286,7 @@ class LaneGeometryConfig:
 
     image_height: int = 698
 
-    roi_height: int = 419
+    roi_height: int = 700
 
     min_lane_confidence: float = 0.35
 
