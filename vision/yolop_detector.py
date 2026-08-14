@@ -70,6 +70,13 @@ from .lane_types import LanePoint
 
 logger = logging.getLogger(__name__)
 
+try:
+    ort.preload_dlls()
+except Exception as exc:
+    logger.debug(
+        "[YOLOP] Não foi possível pré-carregar DLLs CUDA: %s",
+        exc,
+    )
 
 # =============================================================================
 # CONFIGURAÇÃO
