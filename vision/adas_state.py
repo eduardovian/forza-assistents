@@ -1,18 +1,23 @@
 """
-Forza Horizon 6 ADAS/LKA
-Estimador de estado ADAS.
+Forza Assistents
+ADAS / LKA state estimation.
 
 Responsabilidades:
-- Determinar a posição do veículo dentro da faixa.
+- Determinar a posição do veículo dentro da faixa atual.
+- Usar LaneAssignment como fonte primária da posição lateral.
 - Detectar aproximação da linha esquerda/direita.
 - Detectar saída iminente da faixa.
 - Considerar erro lateral + heading.
-- Aplicar histerese e persistência temporal para evitar oscilações.
-- Produzir um estado estável para a futura interface ADAS.
+- Aplicar histerese temporal.
+- Produzir um estado ADAS estável.
 
-IMPORTANTE:
+Convenção obrigatória:
+
+    normalized_offset < 0  -> esquerda
+    normalized_offset = 0  -> centro
+    normalized_offset > 0  -> direita
+
 Este módulo NÃO controla o veículo.
-Ele apenas estima o estado visual.
 """
 
 from __future__ import annotations
@@ -25,15 +30,15 @@ from typing import Optional
 import numpy as np
 
 from .lane_geometry import LaneGeometryResult
+from .lane_assignment import LaneAssignmentResult
 
 
 # =============================================================================
-# ESTADOS ADAS
+# ESTADOS
 # =============================================================================
+
 
 class ADASState(Enum):
-    """Estado visual atual do veículo em relação à faixa."""
-
     UNKNOWN = "unknown"
     LANE_LOST = "lane_lost"
 
@@ -50,8 +55,6 @@ class ADASState(Enum):
 
 
 class LaneSide(Enum):
-    """Lado da faixa em relação ao veículo."""
-
     NONE = "none"
     LEFT = "left"
     RIGHT = "right"
@@ -61,10 +64,9 @@ class LaneSide(Enum):
 # RESULTADO
 # =============================================================================
 
+
 @dataclass(frozen=True)
 class ADASStateResult:
-    """Resultado completo da estimativa ADAS."""
-
     state: ADASState
     warning_side: LaneSide
 
@@ -87,24 +89,20 @@ class ADASStateResult:
 # ESTIMADOR
 # =============================================================================
 
+
 class ADASStateEstimator:
     """
-    Estima o estado ADAS a partir da geometria da faixa.
+    Estima o estado ADAS.
 
-    lateral_error:
-        [-1, +1]
+    Fonte da posição lateral:
 
-        negativo = veículo deslocado para a esquerda
-        positivo = veículo deslocado para a direita
+    1. LaneAssignmentResult.normalized_offset
+    2. fallback para LaneGeometryResult.lateral_error
 
-    heading_error:
-        [-1, +1]
+    Convenção:
 
-        negativo = orientação para esquerda
-        positivo = orientação para direita
-
-    A saída utiliza histerese temporal para impedir que o estado fique
-    alternando rapidamente entre CENTERED / WARNING.
+        negativo = esquerda
+        positivo = direita
     """
 
     def __init__(
@@ -120,10 +118,6 @@ class ADASStateEstimator:
         approach_warning_rate: float = 0.70,
         approach_departure_rate: float = 1.20,
     ):
-        # ---------------------------------------------------------------------
-        # Limites espaciais
-        # ---------------------------------------------------------------------
-
         self.warning_threshold = float(
             np.clip(warning_threshold, 0.0, 1.0)
         )
@@ -132,59 +126,67 @@ class ADASStateEstimator:
             np.clip(
                 departure_threshold,
                 self.warning_threshold,
-                1.0
+                1.0,
             )
         )
 
         self.centered_threshold = float(
-            np.clip(centered_threshold, 0.0, self.warning_threshold)
+            np.clip(
+                centered_threshold,
+                0.0,
+                self.warning_threshold,
+            )
         )
 
         self.slight_threshold = float(
             np.clip(
                 slight_threshold,
                 self.centered_threshold,
-                self.warning_threshold
+                self.warning_threshold,
             )
         )
 
         self.heading_warning_threshold = float(
-            np.clip(heading_warning_threshold, 0.0, 1.0)
+            np.clip(
+                heading_warning_threshold,
+                0.0,
+                1.0,
+            )
         )
 
         self.min_confidence = float(
             np.clip(min_confidence, 0.0, 1.0)
         )
 
-        # ---------------------------------------------------------------------
-        # Filtros temporais
-        # ---------------------------------------------------------------------
+        self.state_hold_time = max(
+            0.0,
+            float(state_hold_time),
+        )
 
-        self.state_hold_time = max(0.0, float(state_hold_time))
-        self.lost_timeout = max(0.0, float(lost_timeout))
+        self.lost_timeout = max(
+            0.0,
+            float(lost_timeout),
+        )
 
-        # Taxa de aproximação:
-        # valor positivo significa aproximação da respectiva linha.
         self.approach_warning_rate = max(
             0.0,
-            float(approach_warning_rate)
+            float(approach_warning_rate),
         )
 
         self.approach_departure_rate = max(
             self.approach_warning_rate,
-            float(approach_departure_rate)
+            float(approach_departure_rate),
         )
 
-        # ---------------------------------------------------------------------
-        # Estado interno
-        # ---------------------------------------------------------------------
-
+        # Estado atual.
         self._state = ADASState.UNKNOWN
         self._warning_side = LaneSide.NONE
 
+        # Histerese.
         self._candidate_state = ADASState.UNKNOWN
         self._candidate_since = 0.0
 
+        # Tracking temporal.
         self._last_valid_time: Optional[float] = None
 
         self._previous_lateral_error: Optional[float] = None
@@ -193,12 +195,27 @@ class ADASStateEstimator:
         self._last_result: Optional[ADASStateResult] = None
 
     # =========================================================================
+    # PROPRIEDADES
+    # =========================================================================
+
+    @property
+    def state(self) -> ADASState:
+        return self._state
+
+    @property
+    def warning_side(self) -> LaneSide:
+        return self._warning_side
+
+    @property
+    def last_result(self) -> Optional[ADASStateResult]:
+        return self._last_result
+
+    # =========================================================================
     # UTILITÁRIOS
     # =========================================================================
 
     @staticmethod
     def _clip_error(value: float) -> float:
-        """Limita um erro normalizado ao intervalo [-1, +1]."""
         try:
             value = float(value)
         except (TypeError, ValueError):
@@ -210,8 +227,10 @@ class ADASStateEstimator:
         return float(np.clip(value, -1.0, 1.0))
 
     @staticmethod
-    def _safe_float(value: float, default: float = 0.0) -> float:
-        """Converte valores numéricos evitando NaN/inf."""
+    def _safe_float(
+        value: float,
+        default: float = 0.0,
+    ) -> float:
         try:
             value = float(value)
         except (TypeError, ValueError):
@@ -223,36 +242,83 @@ class ADASStateEstimator:
         return value
 
     # =========================================================================
+    # POSIÇÃO LATERAL
+    # =========================================================================
+
+    def _get_lateral_error(
+        self,
+        geometry: LaneGeometryResult,
+        assignment: Optional[LaneAssignmentResult],
+    ) -> float:
+        """
+        Obtém a posição lateral do veículo.
+
+        LaneAssignment é a fonte principal.
+
+        Convenção:
+
+            < 0 = esquerda
+            = 0 = centro
+            > 0 = direita
+        """
+
+        if assignment is not None:
+            assignment_valid = bool(
+                getattr(assignment, "valid", False)
+            )
+
+            if assignment_valid:
+                value = getattr(
+                    assignment,
+                    "normalized_offset",
+                    None,
+                )
+
+                if value is not None:
+                    value = self._safe_float(
+                        value,
+                        default=0.0,
+                    )
+
+                    return self._clip_error(value)
+
+        # Fallback para a geometria.
+        return self._clip_error(
+            getattr(
+                geometry,
+                "lateral_error",
+                0.0,
+            )
+        )
+
+    # =========================================================================
     # DISTÂNCIAS
     # =========================================================================
 
     def _compute_lane_distances(
         self,
-        lateral_error: float
+        lateral_error: float,
     ) -> tuple[float, float]:
         """
-        Converte lateral_error em distância normalizada às bordas.
+        Converte posição lateral para distância normalizada.
 
-        lateral_error = -1:
-            veículo extremamente próximo da esquerda.
+        -1 = linha esquerda
+         0 = centro
+        +1 = linha direita
 
-        lateral_error = +1:
-            veículo extremamente próximo da direita.
+        left_distance:
+            distância até a linha esquerda.
 
-        Retorno:
-            left_distance
-            right_distance
-
-        Valores:
-            0.0 = borda
-            1.0 = centro aproximado / maior distância
+        right_distance:
+            distância até a linha direita.
         """
 
-        # Espaço normalizado entre -1 e +1.
-        vehicle_position = (lateral_error + 1.0) / 2.0
+        position = (
+            self._clip_error(lateral_error) + 1.0
+        ) / 2.0
 
-        left_distance = vehicle_position
-        right_distance = 1.0 - vehicle_position
+        left_distance = position
+        right_distance = 1.0 - position
 
         return (
             float(np.clip(left_distance, 0.0, 1.0)),
@@ -260,7 +326,7 @@ class ADASStateEstimator:
         )
 
     # =========================================================================
-    # TAXA DE APROXIMAÇÃO
+    # APROXIMAÇÃO
     # =========================================================================
 
     def _compute_approach_rates(
@@ -269,52 +335,44 @@ class ADASStateEstimator:
         timestamp: float,
     ) -> tuple[float, float]:
         """
-        Calcula velocidade de aproximação das linhas.
+        Calcula a velocidade de aproximação das linhas.
 
-        Retorno:
-            left_approach_rate
-            right_approach_rate
+        Movimento para esquerda:
+            lateral_error diminui
+            left_rate > 0
 
-        Valores positivos indicam aproximação.
-
-        Exemplo:
-
-            lateral_error = -0.20 -> -0.50
-
-            veículo está indo para a esquerda.
-
-            left_approach_rate > 0
+        Movimento para direita:
+            lateral_error aumenta
+            right_rate > 0
         """
 
-        if (
-            self._previous_lateral_error is None
-            or self._previous_timestamp is None
-        ):
-            self._previous_lateral_error = lateral_error
-            self._previous_timestamp = timestamp
-            return 0.0, 0.0
-
-        dt = timestamp - self._previous_timestamp
-
-        if dt <= 0.001 or dt > 1.0:
-            self._previous_lateral_error = lateral_error
-            self._previous_timestamp = timestamp
-            return 0.0, 0.0
-
-        delta = lateral_error - self._previous_lateral_error
-
-        # delta positivo = movimento para direita
-        # delta negativo = movimento para esquerda
-        rate = delta / dt
+        previous_error = self._previous_lateral_error
+        previous_time = self._previous_timestamp
 
         self._previous_lateral_error = lateral_error
         self._previous_timestamp = timestamp
 
-        # Aproximação esquerda ocorre quando rate < 0.
-        left_rate = max(0.0, -rate)
+        if previous_error is None or previous_time is None:
+            return 0.0, 0.0
 
-        # Aproximação direita ocorre quando rate > 0.
-        right_rate = max(0.0, rate)
+        dt = timestamp - previous_time
+
+        if dt <= 0.001 or dt > 1.0:
+            return 0.0, 0.0
+
+        rate = (
+            lateral_error - previous_error
+        ) / dt
+
+        left_rate = max(
+            0.0,
+            -rate,
+        )
+
+        right_rate = max(
+            0.0,
+            rate,
+        )
 
         return (
             float(left_rate),
@@ -328,45 +386,74 @@ class ADASStateEstimator:
     def _compute_confidence(
         self,
         geometry: LaneGeometryResult,
+        assignment: Optional[LaneAssignmentResult],
     ) -> float:
         """
-        Estima confiança do estado geométrico.
+        Calcula a confiança da estimativa.
 
-        A confiança considera:
-        - validade da geometria;
-        - largura da faixa;
-        - erro lateral;
-        - presença da linha central.
+        Quando o Assignment é válido, sua confiança tem prioridade.
         """
 
-        if not geometry.valid:
+        geometry_valid = bool(
+            getattr(
+                geometry,
+                "valid",
+                False,
+            )
+        )
+
+        if not geometry_valid:
             return 0.0
 
-        score = 1.0
-
-        # Erros extremamente grandes reduzem confiança.
-        lateral = abs(
-            self._clip_error(geometry.lateral_error)
+        geometry_confidence = self._safe_float(
+            getattr(
+                geometry,
+                "confidence",
+                1.0,
+            ),
+            default=1.0,
         )
 
-        score *= max(
-            0.0,
-            1.0 - 0.25 * lateral
+        geometry_confidence = float(
+            np.clip(
+                geometry_confidence,
+                0.0,
+                1.0,
+            )
         )
 
-        # Centro da faixa precisa existir.
-        if not geometry.center_line:
-            score *= 0.5
+        if assignment is not None and bool(
+            getattr(
+                assignment,
+                "valid",
+                False,
+            )
+        ):
+            assignment_confidence = self._safe_float(
+                getattr(
+                    assignment,
+                    "confidence",
+                    1.0,
+                ),
+                default=1.0,
+            )
 
-        # Largura inválida reduz confiança.
-        lane_width = self._safe_float(
-            geometry.lane_width
-        )
+            assignment_confidence = float(
+                np.clip(
+                    assignment_confidence,
+                    0.0,
+                    1.0,
+                )
+            )
 
-        if lane_width <= 1.0:
-            score *= 0.4
+            return float(
+                np.sqrt(
+                    geometry_confidence
+                    * assignment_confidence
+                )
+            )
 
-        return float(np.clip(score, 0.0, 1.0))
+        return geometry_confidence
 
     # =========================================================================
     # CLASSIFICAÇÃO
@@ -379,13 +466,9 @@ class ADASStateEstimator:
         left_approach_rate: float,
         right_approach_rate: float,
     ) -> tuple[ADASState, LaneSide]:
-        """Classifica o estado instantâneo."""
-
-        abs_lateral = abs(lateral_error)
-        abs_heading = abs(heading_error)
 
         # ---------------------------------------------------------------------
-        # SAÍDA IMINENTE
+        # DEPARTURE
         # ---------------------------------------------------------------------
 
         if lateral_error <= -self.departure_threshold:
@@ -404,19 +487,25 @@ class ADASStateEstimator:
         # APROXIMAÇÃO MUITO RÁPIDA
         # ---------------------------------------------------------------------
 
-        if left_approach_rate >= self.approach_departure_rate:
-            if lateral_error <= -self.centered_threshold:
-                return (
-                    ADASState.LEFT_DEPARTURE,
-                    LaneSide.LEFT,
-                )
+        if (
+            left_approach_rate
+            >= self.approach_departure_rate
+            and lateral_error < 0.0
+        ):
+            return (
+                ADASState.LEFT_DEPARTURE,
+                LaneSide.LEFT,
+            )
 
-        if right_approach_rate >= self.approach_departure_rate:
-            if lateral_error >= self.centered_threshold:
-                return (
-                    ADASState.RIGHT_DEPARTURE,
-                    LaneSide.RIGHT,
-                )
+        if (
+            right_approach_rate
+            >= self.approach_departure_rate
+            and lateral_error > 0.0
+        ):
+            return (
+                ADASState.RIGHT_DEPARTURE,
+                LaneSide.RIGHT,
+            )
 
         # ---------------------------------------------------------------------
         # WARNING
@@ -434,11 +523,12 @@ class ADASStateEstimator:
                 LaneSide.RIGHT,
             )
 
-        # Aproximação rápida também pode gerar warning antes do limite
-        # espacial, desde que o veículo esteja realmente deslocado.
+        # Aproximação rápida.
         if (
-            left_approach_rate >= self.approach_warning_rate
-            and lateral_error < -self.centered_threshold
+            left_approach_rate
+            >= self.approach_warning_rate
+            and lateral_error
+            <= -self.centered_threshold
         ):
             return (
                 ADASState.LEFT_WARNING,
@@ -446,8 +536,10 @@ class ADASStateEstimator:
             )
 
         if (
-            right_approach_rate >= self.approach_warning_rate
-            and lateral_error > self.centered_threshold
+            right_approach_rate
+            >= self.approach_warning_rate
+            and lateral_error
+            >= self.centered_threshold
         ):
             return (
                 ADASState.RIGHT_WARNING,
@@ -455,7 +547,7 @@ class ADASStateEstimator:
             )
 
         # ---------------------------------------------------------------------
-        # DESLOCAMENTO LEVE
+        # SLIGHT
         # ---------------------------------------------------------------------
 
         if lateral_error <= -self.slight_threshold:
@@ -474,46 +566,34 @@ class ADASStateEstimator:
         # HEADING
         # ---------------------------------------------------------------------
 
-        # Heading sozinho não deve provocar WARNING.
-        # Ele só reforça um deslocamento lateral existente.
-        if abs_lateral >= self.centered_threshold:
-            if (
-                lateral_error < 0.0
-                and heading_error < -self.heading_warning_threshold
-            ):
-                return (
-                    ADASState.SLIGHT_LEFT,
-                    LaneSide.NONE,
-                )
-
-            if (
-                lateral_error > 0.0
-                and heading_error > self.heading_warning_threshold
-            ):
-                return (
-                    ADASState.SLIGHT_RIGHT,
-                    LaneSide.NONE,
-                )
-
-        # ---------------------------------------------------------------------
-        # CENTRADO
-        # ---------------------------------------------------------------------
-
-        if abs_lateral <= self.centered_threshold:
-            return (
-                ADASState.CENTERED,
-                LaneSide.NONE,
-            )
-
-        # Segurança: classificação residual.
-        if lateral_error < 0:
+        if (
+            lateral_error
+            <= -self.centered_threshold
+            and heading_error
+            <= -self.heading_warning_threshold
+        ):
             return (
                 ADASState.SLIGHT_LEFT,
                 LaneSide.NONE,
             )
 
+        if (
+            lateral_error
+            >= self.centered_threshold
+            and heading_error
+            >= self.heading_warning_threshold
+        ):
+            return (
+                ADASState.SLIGHT_RIGHT,
+                LaneSide.NONE,
+            )
+
+        # ---------------------------------------------------------------------
+        # CENTER
+        # ---------------------------------------------------------------------
+
         return (
-            ADASState.SLIGHT_RIGHT,
+            ADASState.CENTERED,
             LaneSide.NONE,
         )
 
@@ -527,13 +607,6 @@ class ADASStateEstimator:
         proposed_side: LaneSide,
         timestamp: float,
     ) -> tuple[ADASState, LaneSide]:
-        """
-        Evita troca de estado em cada frame.
-
-        Estados de emergência/departure entram imediatamente.
-        Estados normais precisam permanecer estáveis durante
-        state_hold_time.
-        """
 
         immediate_states = {
             ADASState.LEFT_DEPARTURE,
@@ -543,41 +616,61 @@ class ADASStateEstimator:
             ADASState.LANE_LOST,
         }
 
-        # Primeiro estado.
         if self._state == ADASState.UNKNOWN:
             self._state = proposed_state
             self._warning_side = proposed_side
+
             self._candidate_state = proposed_state
             self._candidate_since = timestamp
-            return self._state, self._warning_side
 
-        # Mesmo estado.
+            return (
+                self._state,
+                self._warning_side,
+            )
+
         if proposed_state == self._state:
             self._candidate_state = proposed_state
             self._candidate_since = timestamp
-            self._warning_side = proposed_side
-            return self._state, self._warning_side
 
-        # Estados críticos entram imediatamente.
+            self._warning_side = proposed_side
+
+            return (
+                self._state,
+                self._warning_side,
+            )
+
         if proposed_state in immediate_states:
             self._state = proposed_state
             self._warning_side = proposed_side
+
             self._candidate_state = proposed_state
             self._candidate_since = timestamp
-            return self._state, self._warning_side
 
-        # Novo candidato.
+            return (
+                self._state,
+                self._warning_side,
+            )
+
         if proposed_state != self._candidate_state:
             self._candidate_state = proposed_state
             self._candidate_since = timestamp
-            return self._state, self._warning_side
 
-        # Aguarda estabilidade.
-        if timestamp - self._candidate_since >= self.state_hold_time:
+            return (
+                self._state,
+                self._warning_side,
+            )
+
+        if (
+            timestamp - self._candidate_since
+            >= self.state_hold_time
+        ):
             self._state = proposed_state
             self._warning_side = proposed_side
 
-        return self._state, self._warning_side
+        return (
+            self._state,
+            self._warning_side,
+        )
 
     # =========================================================================
     # UPDATE
@@ -586,16 +679,12 @@ class ADASStateEstimator:
     def update(
         self,
         geometry: Optional[LaneGeometryResult],
+        assignment: Optional[LaneAssignmentResult] = None,
         timestamp: Optional[float] = None,
     ) -> ADASStateResult:
-        """
-        Atualiza o estado ADAS.
-
-        Este é o método principal utilizado pelo pipeline.
-        """
 
         now = (
-            time.perf_counter()
+            time.monotonic()
             if timestamp is None
             else float(timestamp)
         )
@@ -604,138 +693,223 @@ class ADASStateEstimator:
         # GEOMETRIA AUSENTE
         # ---------------------------------------------------------------------
 
-        if geometry is None or not geometry.valid:
-            if self._last_valid_time is None:
-                lost_duration = float("inf")
-            else:
-                lost_duration = now - self._last_valid_time
-
-            # Mantém o último estado por um curto período.
-            if (
-                self._state not in {
-                    ADASState.UNKNOWN,
-                    ADASState.LANE_LOST,
-                }
-                and lost_duration < self.lost_timeout
-            ):
-                if self._last_result is not None:
-                    return ADASStateResult(
-                        state=self._state,
-                        warning_side=self._warning_side,
-                        lateral_error=self._last_result.lateral_error,
-                        heading_error=self._last_result.heading_error,
-                        left_distance=self._last_result.left_distance,
-                        right_distance=self._last_result.right_distance,
-                        left_approach_rate=self._last_result.left_approach_rate,
-                        right_approach_rate=self._last_result.right_approach_rate,
-                        confidence=0.0,
-                        valid=False,
-                        timestamp=now,
-                    )
-
-            self._state = ADASState.LANE_LOST
-            self._warning_side = LaneSide.NONE
-            self._candidate_state = ADASState.LANE_LOST
-            self._candidate_since = now
-
-            result = ADASStateResult(
-                state=ADASState.LANE_LOST,
-                warning_side=LaneSide.NONE,
-                lateral_error=0.0,
-                heading_error=0.0,
-                left_distance=0.0,
-                right_distance=0.0,
-                left_approach_rate=0.0,
-                right_approach_rate=0.0,
+        if geometry is None:
+            return self._handle_invalid(
+                now,
                 confidence=0.0,
-                valid=False,
-                timestamp=now,
             )
 
-            self._last_result = result
-            return result
-
-        # ---------------------------------------------------------------------
-        # GEOMETRIA VÁLIDA
-        # ---------------------------------------------------------------------
-
-        self._last_valid_time = now
-
-        lateral_error = self._clip_error(
-            geometry.lateral_error
+        geometry_valid = bool(
+            getattr(
+                geometry,
+                "valid",
+                False,
+            )
         )
+
+        if not geometry_valid:
+            return self._handle_invalid(
+                now,
+                confidence=0.0,
+            )
+
+        # ---------------------------------------------------------------------
+        # POSIÇÃO LATERAL
+        # ---------------------------------------------------------------------
+
+        lateral_error = self._get_lateral_error(
+            geometry,
+            assignment,
+        )
+
+        # ---------------------------------------------------------------------
+        # HEADING
+        # ---------------------------------------------------------------------
 
         heading_error = self._clip_error(
-            geometry.heading_error
+            getattr(
+                geometry,
+                "heading_error",
+                0.0,
+            )
         )
 
-        left_distance, right_distance = (
-            self._compute_lane_distances(lateral_error)
-        )
-
-        left_rate, right_rate = self._compute_approach_rates(
-            lateral_error,
-            now,
-        )
+        # ---------------------------------------------------------------------
+        # CONFIANÇA
+        # ---------------------------------------------------------------------
 
         confidence = self._compute_confidence(
-            geometry
+            geometry,
+            assignment,
         )
 
-        # Confiança insuficiente.
-        if confidence < self.min_confidence:
-            self._state = ADASState.LANE_LOST
-            self._warning_side = LaneSide.NONE
+        # ---------------------------------------------------------------------
+        # APROXIMAÇÃO
+        # ---------------------------------------------------------------------
 
-            result = ADASStateResult(
-                state=ADASState.LANE_LOST,
-                warning_side=LaneSide.NONE,
+        left_approach_rate, right_approach_rate = (
+            self._compute_approach_rates(
+                lateral_error,
+                now,
+            )
+        )
+
+        # ---------------------------------------------------------------------
+        # DISTÂNCIAS
+        # ---------------------------------------------------------------------
+
+        left_distance, right_distance = (
+            self._compute_lane_distances(
+                lateral_error,
+            )
+        )
+
+        # ---------------------------------------------------------------------
+        # VALIDADE
+        # ---------------------------------------------------------------------
+
+        valid = (
+            confidence >= self.min_confidence
+        )
+
+        if not valid:
+            return self._handle_invalid(
+                now,
+                confidence=confidence,
                 lateral_error=lateral_error,
                 heading_error=heading_error,
                 left_distance=left_distance,
                 right_distance=right_distance,
-                left_approach_rate=left_rate,
-                right_approach_rate=right_rate,
-                confidence=confidence,
-                valid=False,
-                timestamp=now,
+                left_approach_rate=left_approach_rate,
+                right_approach_rate=right_approach_rate,
             )
 
-            self._last_result = result
-            return result
+        self._last_valid_time = now
 
         # ---------------------------------------------------------------------
         # CLASSIFICAÇÃO
         # ---------------------------------------------------------------------
 
-        proposed_state, proposed_side = self._classify_state(
-            lateral_error=lateral_error,
-            heading_error=heading_error,
-            left_approach_rate=left_rate,
-            right_approach_rate=right_rate,
+        proposed_state, proposed_side = (
+            self._classify_state(
+                lateral_error=lateral_error,
+                heading_error=heading_error,
+                left_approach_rate=left_approach_rate,
+                right_approach_rate=right_approach_rate,
+            )
         )
 
-        state, warning_side = self._apply_state_hysteresis(
-            proposed_state=proposed_state,
-            proposed_side=proposed_side,
-            timestamp=now,
+        state, warning_side = (
+            self._apply_state_hysteresis(
+                proposed_state,
+                proposed_side,
+                now,
+            )
         )
 
         result = ADASStateResult(
             state=state,
             warning_side=warning_side,
+
             lateral_error=lateral_error,
             heading_error=heading_error,
+
             left_distance=left_distance,
             right_distance=right_distance,
-            left_approach_rate=left_rate,
-            right_approach_rate=right_rate,
+
+            left_approach_rate=left_approach_rate,
+            right_approach_rate=right_approach_rate,
+
             confidence=confidence,
             valid=True,
+
             timestamp=now,
         )
 
         self._last_result = result
+
+        return result
+
+    # =========================================================================
+    # INVALID / LANE LOST
+    # =========================================================================
+
+    def _handle_invalid(
+        self,
+        timestamp: float,
+        confidence: float,
+        lateral_error: float = 0.0,
+        heading_error: float = 0.0,
+        left_distance: float = 0.5,
+        right_distance: float = 0.5,
+        left_approach_rate: float = 0.0,
+        right_approach_rate: float = 0.0,
+    ) -> ADASStateResult:
+
+        lost = (
+            self._last_valid_time is None
+            or (
+                timestamp - self._last_valid_time
+                >= self.lost_timeout
+            )
+        )
+
+        if lost:
+            self._state = ADASState.LANE_LOST
+            self._warning_side = LaneSide.NONE
+
+            self._candidate_state = ADASState.LANE_LOST
+            self._candidate_since = timestamp
+
+        result = ADASStateResult(
+            state=self._state,
+            warning_side=self._warning_side,
+
+            lateral_error=self._clip_error(
+                lateral_error
+            ),
+            heading_error=self._clip_error(
+                heading_error
+            ),
+
+            left_distance=float(
+                np.clip(
+                    left_distance,
+                    0.0,
+                    1.0,
+                )
+            ),
+            right_distance=float(
+                np.clip(
+                    right_distance,
+                    0.0,
+                    1.0,
+                )
+            ),
+
+            left_approach_rate=max(
+                0.0,
+                float(left_approach_rate),
+            ),
+            right_approach_rate=max(
+                0.0,
+                float(right_approach_rate),
+            ),
+
+            confidence=float(
+                np.clip(
+                    confidence,
+                    0.0,
+                    1.0,
+                )
+            ),
+            valid=False,
+
+            timestamp=timestamp,
+        )
+
+        self._last_result = result
+
         return result
 
     # =========================================================================
@@ -743,7 +917,7 @@ class ADASStateEstimator:
     # =========================================================================
 
     def reset(self) -> None:
-        """Reseta completamente o estimador."""
+        """Reinicia completamente o estimador."""
 
         self._state = ADASState.UNKNOWN
         self._warning_side = LaneSide.NONE
@@ -758,21 +932,10 @@ class ADASStateEstimator:
 
         self._last_result = None
 
-    # =========================================================================
-    # PROPRIEDADES
-    # =========================================================================
 
-    @property
-    def state(self) -> ADASState:
-        """Estado atualmente confirmado."""
-        return self._state
-
-    @property
-    def warning_side(self) -> LaneSide:
-        """Lado atualmente em alerta."""
-        return self._warning_side
-
-    @property
-    def last_result(self) -> Optional[ADASStateResult]:
-        """Último resultado calculado."""
-        return self._last_result
+__all__ = [
+    "ADASState",
+    "LaneSide",
+    "ADASStateResult",
+    "ADASStateEstimator",
+]
