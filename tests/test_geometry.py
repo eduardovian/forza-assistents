@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vision.ufld_detector import LanePoint, LaneDetectionResult
+from vision.yolop_detector import LanePoint, LaneDetectionResult
 from vision.lane_geometry import LaneGeometry, LaneGeometryResult
 
 
