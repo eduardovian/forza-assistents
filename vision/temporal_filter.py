@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .ufld_detector import LaneDetectionResult, LanePoint
+from .detection_types import LaneDetectionResult, LanePoint
 from .lane_geometry import LaneGeometryResult
 
 logger = logging.getLogger(__name__)
