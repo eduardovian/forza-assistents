@@ -1,13 +1,12 @@
-
 """
 vision/yolop_detector.py
 
 Forza Assistents
 ================
 
-Detector de percepção baseado no YOLOPv2 oficial em TorchScript.
+Detector de percepção baseado em YOLOPv2 / TorchScript.
 
-Arquitetura:
+Pipeline:
 
     frame BGR
         │
@@ -15,18 +14,18 @@ Arquitetura:
     validação
         │
         ▼
-    canonicalização YOLOPv2
+    canonicalização
         │
         ▼
     letterbox 640x640
         │
         ▼
-    TorchScript / CUDA
+    TorchScript / CUDA / FP16
         │
         ├───────────────┐
         │               │
         ▼               ▼
-    detection        segmentation
+    detection       segmentation
         │               │
         │        ┌──────┴──────┐
         │        ▼             ▼
@@ -36,52 +35,42 @@ Arquitetura:
         │        │             │
         │        │          máscara
         │        │             │
-        │        │      componentes/segmentos
-        │        │             │
-        │        │      associação espacial
-        │        │             │
-        │        │       LanePoint[]
+        │        │       segmentos
         │        │             │
         └────────┴─────────────┤
                                ▼
                     LaneDetectionResult
 
+Responsabilidades deste módulo:
+
+    - inferência YOLOPv2;
+    - detecção de lanes;
+    - detecção de objetos;
+    - máscara de área dirigível;
+    - associação espacial das lanes dentro do frame;
+    - conversão rigorosa de coordenadas;
+    - diagnóstico.
+
 Este módulo NÃO executa:
 
     - tracking temporal entre frames;
     - fitting polinomial;
-    - geometria da faixa;
+    - geometria;
     - projeção;
-    - identificação da faixa atual;
     - LaneAssignment;
     - decisão ADAS;
-    - controle do veículo.
+    - controle.
 
 Essas responsabilidades pertencem às camadas posteriores.
 
-Princípios:
+IMPORTANTE:
 
-    - TorchScript nativo;
-    - CUDA preferencial;
-    - FP16 opcional em CUDA;
-    - CPU fallback;
-    - fail-soft;
-    - nenhuma dependência de ONNX Runtime;
-    - compatibilidade com o contrato atual do projeto;
-    - preservação das lanes adicionais;
-    - uso da área dirigível como evidência auxiliar;
-    - detecção de objetos preservada para evolução futura;
-    - confiança explícita;
-    - diagnóstico por frame;
-    - nenhuma identidade temporal dentro do detector.
+Todos os LanePoint produzidos por este módulo estão em
+coordenadas do FRAME ORIGINAL recebido por detect().
 
-Compatibilidade pública:
+Não existe segundo mapeamento depois da extração dos
+segmentos.
 
-    YOLOPDetector
-    YOLOPLaneDetector
-    create_default_detector
-    LaneDetectionResult
-    LanePoint
 """
 
 from __future__ import annotations
@@ -89,6 +78,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -96,7 +86,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
-import torchvision
 
 from .lane_types import LanePoint
 
@@ -105,7 +94,7 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# PATHS / MODEL CONTRACT
+# PATHS
 # =============================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -122,26 +111,26 @@ LEGACY_MODEL_PATH = (
     / "yolop-640-640.onnx"
 )
 
-# Contrato do modelo oficial.
+
+# =============================================================================
+# MODEL CONTRACT
+# =============================================================================
+
 YOLOPV2_INPUT_WIDTH = 640
 YOLOPV2_INPUT_HEIGHT = 640
 
-# O demo oficial trabalha sobre uma representação 1280x720 antes
-# do letterbox para 640x640.
 CANONICAL_WIDTH = 1280
 CANONICAL_HEIGHT = 720
 
 YOLOPV2_STRIDE = 32
 
-# Pós-processamento oficial da saída de lane-line segmentation.
-LANE_OUTPUT_TOP_CROP = 12
-LANE_OUTPUT_BOTTOM = 372
 
 # =============================================================================
-# DEFAULTS
+# DEFAULT PARAMETERS
 # =============================================================================
 
 DEFAULT_LANE_THRESHOLD = 0.50
+
 DEFAULT_OBJECT_CONFIDENCE = 0.30
 DEFAULT_OBJECT_IOU = 0.45
 
@@ -158,34 +147,15 @@ DEFAULT_MIN_LANE_HORIZONTAL_SPAN = 1.0
 DEFAULT_MORPH_KERNEL = 3
 DEFAULT_MIN_COMPONENT_AREA = 3
 
-DEFAULT_SAMPLE_BOTTOM_ROWS = 10
-
 DEFAULT_USE_FP16 = True
 
-# Para não transformar o detector em um filtro excessivamente agressivo.
 DEFAULT_DRIVABLE_GATE_MIN = 0.15
 DEFAULT_DRIVABLE_CONFIDENCE_BONUS = 0.10
 
-# Curvatura vertical máxima permitida entre observações consecutivas
-# durante a reconstrução dentro de um único frame.
-DEFAULT_MAX_SLOPE_CHANGE = 1.8
-
 
 # =============================================================================
-# COCO NAMES
+# COCO
 # =============================================================================
-#
-# O modelo TorchScript oficial utiliza a cabeça de detecção com 85 valores
-# por âncora, isto é:
-#
-#     4 bbox + 1 objectness + 80 classes
-#
-# O YOLOPv2 oficial, portanto, segue o contrato de 80 classes da cabeça
-# YOLO utilizada no projeto original.
-#
-# Mantemos os nomes aqui apenas para diagnóstico e futura camada de veículos.
-# O pipeline de lanes não depende desses nomes.
-#
 
 COCO_CLASS_NAMES: Tuple[str, ...] = (
     "person",
@@ -270,25 +240,12 @@ COCO_CLASS_NAMES: Tuple[str, ...] = (
     "toothbrush",
 )
 
-
-# Classes relevantes para a futura camada de percepção de tráfego.
 VEHICLE_CLASS_IDS = frozenset(
     {
-        2,   # car
-        3,   # motorcycle
-        5,   # bus
-        7,   # truck
-    }
-)
-
-ROAD_USER_CLASS_IDS = frozenset(
-    {
-        0,   # person
-        1,   # bicycle
-        2,   # car
-        3,   # motorcycle
-        5,   # bus
-        7,   # truck
+        2,  # car
+        3,  # motorcycle
+        5,  # bus
+        7,  # truck
     }
 )
 
@@ -297,57 +254,111 @@ ROAD_USER_CLASS_IDS = frozenset(
 # NUMERIC UTILITIES
 # =============================================================================
 
-
 def _finite(value: Any) -> Optional[float]:
     try:
-        result = float(value)
+        value = float(value)
     except (TypeError, ValueError):
         return None
 
-    if not math.isfinite(result):
+    if not math.isfinite(value):
         return None
 
-    return result
+    return value
 
 
 def _clip01(value: Any) -> float:
-    result = _finite(value)
+    value = _finite(value)
 
-    if result is None:
+    if value is None:
         return 0.0
 
-    return max(0.0, min(1.0, result))
-
-
-def _finite_array(
-    values: np.ndarray,
-) -> np.ndarray:
-    return np.nan_to_num(
-        values,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
+    return max(
+        0.0,
+        min(1.0, value),
     )
 
 
-# =============================================================================
-# RESULT TYPES
-# =============================================================================
+def _shape_of(value: Any) -> Tuple[int, ...]:
+    if isinstance(value, torch.Tensor):
+        return tuple(
+            int(v)
+            for v in value.shape
+        )
 
+    if isinstance(value, np.ndarray):
+        return tuple(
+            int(v)
+            for v in value.shape
+        )
+
+    return tuple()
+
+
+def _collect_shapes(
+    value: Any,
+) -> List[Tuple[int, ...]]:
+    """
+    Coleta recursivamente os shapes reais de uma saída
+    TorchScript.
+
+    YOLOPv2 pode retornar estruturas aninhadas.
+    """
+
+    shapes: List[Tuple[int, ...]] = []
+
+    if isinstance(value, torch.Tensor):
+        shapes.append(_shape_of(value))
+        return shapes
+
+    if isinstance(value, np.ndarray):
+        shapes.append(_shape_of(value))
+        return shapes
+
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            shapes.extend(
+                _collect_shapes(item)
+            )
+
+    elif isinstance(value, dict):
+        for item in value.values():
+            shapes.extend(
+                _collect_shapes(item)
+            )
+
+    return shapes
+
+
+def _flatten_tensors(
+    value: Any,
+) -> List[torch.Tensor]:
+    tensors: List[torch.Tensor] = []
+
+    if isinstance(value, torch.Tensor):
+        tensors.append(value)
+
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            tensors.extend(
+                _flatten_tensors(item)
+            )
+
+    elif isinstance(value, dict):
+        for item in value.values():
+            tensors.extend(
+                _flatten_tensors(item)
+            )
+
+    return tensors
+
+
+# =============================================================================
+# OBJECT DETECTION
+# =============================================================================
 
 @dataclass(frozen=True)
 class ObjectDetection:
-    """
-    Detecção de objeto produzida pela cabeça YOLOPv2.
-
-    Não participa diretamente do pipeline de LaneModel.
-
-    Serve como contrato de percepção para a futura camada
-    de risco/distância/veículos.
-    """
-
     class_id: int
-
     confidence: float
 
     x1: float
@@ -361,88 +372,63 @@ class ObjectDetection:
     @property
     def class_name(self) -> str:
         if 0 <= self.class_id < len(COCO_CLASS_NAMES):
-            return COCO_CLASS_NAMES[self.class_id]
+            return COCO_CLASS_NAMES[
+                self.class_id
+            ]
 
         return f"class_{self.class_id}"
 
     @property
     def is_vehicle(self) -> bool:
-        return self.class_id in VEHICLE_CLASS_IDS
+        return (
+            self.class_id
+            in VEHICLE_CLASS_IDS
+        )
 
     @property
     def center_x(self) -> float:
-        return (self.x1 + self.x2) * 0.5
+        return (
+            self.x1 + self.x2
+        ) * 0.5
 
     @property
     def center_y(self) -> float:
-        return (self.y1 + self.y2) * 0.5
+        return (
+            self.y1 + self.y2
+        ) * 0.5
 
     @property
     def width(self) -> float:
-        return max(0.0, self.x2 - self.x1)
+        return max(
+            0.0,
+            self.x2 - self.x1,
+        )
 
     @property
     def height(self) -> float:
-        return max(0.0, self.y2 - self.y1)
+        return max(
+            0.0,
+            self.y2 - self.y1,
+        )
 
     @property
     def area(self) -> float:
-        return self.width * self.height
+        return (
+            self.width
+            * self.height
+        )
 
     @property
     def bottom_y(self) -> float:
         return self.y2
 
-    @property
-    def normalized_center_x(self) -> float:
-        if self.frame_width <= 0:
-            return 0.5
 
-        return _clip01(
-            self.center_x
-            / float(self.frame_width)
-        )
-
-    @property
-    def normalized_bottom_y(self) -> float:
-        if self.frame_height <= 0:
-            return 1.0
-
-        return _clip01(
-            self.bottom_y
-            / float(self.frame_height)
-        )
-
+# =============================================================================
+# PUBLIC RESULT
+# =============================================================================
 
 @dataclass
 class LaneDetectionResult:
-    """
-    Resultado público do detector.
-
-    lanes:
-        Todas as linhas de faixa detectadas.
-
-    left_lane / right_lane:
-        Apenas classificação espacial.
-        Não significa lane atual.
-
-    additional_lanes:
-        Demais linhas preservadas.
-
-    objects:
-        Detecções de tráfego da cabeça de objetos.
-
-    drivable_area_mask:
-        Máscara binária da área dirigível, já convertida
-        para o frame original.
-
-    metadata:
-        Diagnóstico adicional.
-
-    O resultado mantém os campos utilizados pelo pipeline atual,
-    evitando alterações desnecessárias nos módulos downstream.
-    """
-
     lanes: List[List[LanePoint]] = field(
         default_factory=list
     )
@@ -466,16 +452,19 @@ class LaneDetectionResult:
     )
 
     left_confidence: float = 0.0
-
     right_confidence: float = 0.0
 
     valid: bool = False
 
     num_lanes_detected: int = 0
 
-    input_width: int = YOLOPV2_INPUT_WIDTH
+    input_width: int = (
+        YOLOPV2_INPUT_WIDTH
+    )
 
-    input_height: int = YOLOPV2_INPUT_HEIGHT
+    input_height: int = (
+        YOLOPV2_INPUT_HEIGHT
+    )
 
     model_output_shape: Tuple[int, ...] = field(
         default_factory=tuple
@@ -495,12 +484,15 @@ class LaneDetectionResult:
 
     @property
     def detected(self) -> bool:
-        return self.num_lanes_detected > 0
+        return (
+            self.num_lanes_detected > 0
+        )
 
     @property
     def has_current_lane(self) -> bool:
         return (
-            self.current_lane_index is not None
+            self.current_lane_index
+            is not None
             and bool(self.left_lane)
             and bool(self.right_lane)
         )
@@ -510,24 +502,25 @@ class LaneDetectionResult:
         self,
     ) -> List[ObjectDetection]:
         return [
-            detection
-            for detection in self.objects
-            if detection.is_vehicle
+            obj
+            for obj in self.objects
+            if obj.is_vehicle
         ]
+
+    @property
+    def vehicle_count(self) -> int:
+        return len(
+            self.vehicle_detections
+        )
 
     @property
     def object_count(self) -> int:
         return len(self.objects)
 
-    @property
-    def vehicle_count(self) -> int:
-        return len(self.vehicle_detections)
-
 
 # =============================================================================
-# INTERNAL ROW SEGMENT
+# INTERNAL TYPES
 # =============================================================================
-
 
 @dataclass
 class _RowSegment:
@@ -539,79 +532,63 @@ class _RowSegment:
     road_confidence: float
     pixel_count: int
 
-    @property
-    def width(self) -> float:
-        return self.x_max - self.x_min
-
-
-# =============================================================================
-# INTERNAL FRAME TRACK
-# =============================================================================
-
 
 @dataclass
 class _LaneTrack:
-    points: List[Tuple[int, float, float]] = field(
+    points: List[
+        Tuple[int, float, float]
+    ] = field(
         default_factory=list
     )
 
     last_x: float = 0.0
     last_y: int = 0
 
-    previous_x: Optional[float] = None
-    previous_y: Optional[int] = None
-
     confidence_sum: float = 0.0
-    pixel_sum: int = 0
     road_confidence_sum: float = 0.0
 
-    def predicted_x(self) -> float:
-        if (
-            self.previous_x is None
-            or self.previous_y is None
-        ):
-            return self.last_x
-
-        dy = self.last_y - self.previous_y
-
-        if dy == 0:
-            return self.last_x
-
-        dx = self.last_x - self.previous_x
-
-        return (
-            self.last_x
-            + dx / float(dy)
+    def add(
+        self,
+        y: int,
+        x: float,
+        confidence: float,
+        road_confidence: float,
+    ) -> None:
+        self.points.append(
+            (
+                int(y),
+                float(x),
+                float(confidence),
+            )
         )
 
+        self.last_x = float(x)
+        self.last_y = int(y)
 
-# =============================================================================
-# PREPROCESS METADATA
-# =============================================================================
+        self.confidence_sum += (
+            float(confidence)
+        )
+
+        self.road_confidence_sum += (
+            float(road_confidence)
+        )
 
 
 @dataclass(frozen=True)
 class _PreprocessMeta:
-    """
-    Transformação usada para passar do frame do projeto
-    ao tensor aceito pelo YOLOPv2.
-
-    A representação canônica é mantida explícita para
-    que a máscara possa retornar ao frame original sem
-    depender de escala mágica.
-    """
-
     original_width: int
     original_height: int
 
     canonical_width: int
     canonical_height: int
 
-    ratio: float
+    scale: float
+
+    resized_width: int
+    resized_height: int
 
     pad_left: int
     pad_top: int
-
     pad_right: int
     pad_bottom: int
 
@@ -620,27 +597,20 @@ class _PreprocessMeta:
 # DETECTOR
 # =============================================================================
 
-
 class YOLOPLaneDetector:
     """
-    Detector YOLOPv2 em TorchScript.
+    YOLOPv2 TorchScript detector.
 
-    A classe preserva o nome utilizado pelo pipeline atual.
+    Design goals:
 
-    Public API:
+        deterministic
+        bounded
+        fail-soft
+        coordinate-safe
+        GPU optimized
+        downstream compatible
 
-        load_model()
-        get_device_name()
-        preprocess()
-        infer()
-        detect()
-
-    O detector é stateless entre frames no sentido temporal:
-    nenhum histórico de lane é mantido aqui.
-
-    Isso é deliberado.
-
-    A identidade temporal pertence ao LaneTracker.
+    O detector não mantém histórico temporal.
     """
 
     def __init__(
@@ -655,42 +625,32 @@ class YOLOPLaneDetector:
             DEFAULT_MIN_PIXELS_PER_SEGMENT
         ),
         max_lanes: int = DEFAULT_MAX_LANES,
-        max_tracking_jump: Optional[float] = None,
-        min_lane_span: float = 25.0,
-        min_lane_vertical_span: float = (
-            DEFAULT_MIN_LANE_VERTICAL_SPAN
-        ),
-        morph_kernel: int = DEFAULT_MORPH_KERNEL,
-        min_component_area: int = (
-            DEFAULT_MIN_COMPONENT_AREA
-        ),
-        providers: Optional[List[str]] = None,
         use_fp16: bool = DEFAULT_USE_FP16,
-        object_confidence: float = (
-            DEFAULT_OBJECT_CONFIDENCE
-        ),
-        object_iou: float = DEFAULT_OBJECT_IOU,
-        canonical_width: int = CANONICAL_WIDTH,
-        canonical_height: int = CANONICAL_HEIGHT,
+        device: Optional[str] = None,
+        **_: Any,
     ) -> None:
 
-        self.requested_model_path = Path(
+        self.model_path = Path(
             model_path
         )
 
-        self.model_path = (
-            self._resolve_model_path(
-                self.requested_model_path
+        if (
+            not self.model_path.exists()
+            and self.model_path
+            == LEGACY_MODEL_PATH
+            and DEFAULT_MODEL_PATH.exists()
+        ):
+            self.model_path = (
+                DEFAULT_MODEL_PATH
             )
-        )
 
         self.input_width = max(
-            1,
+            32,
             int(input_width),
         )
 
         self.input_height = max(
-            1,
+            32,
             int(input_height),
         )
 
@@ -714,82 +674,41 @@ class YOLOPLaneDetector:
         )
 
         self.max_lanes = max(
-            1,
+            2,
             int(max_lanes),
-        )
-
-        self.max_tracking_jump = (
-            float(max_tracking_jump)
-            if max_tracking_jump is not None
-            else max(
-                DEFAULT_MAX_TRACKING_JUMP,
-                self.input_width
-                * 0.14,
-            )
-        )
-
-        self.min_lane_span = max(
-            0.0,
-            float(min_lane_span),
-        )
-
-        self.min_lane_vertical_span = max(
-            0.0,
-            float(min_lane_vertical_span),
-        )
-
-        self.morph_kernel = max(
-            1,
-            int(morph_kernel),
-        )
-
-        if self.morph_kernel % 2 == 0:
-            self.morph_kernel += 1
-
-        self.min_component_area = max(
-            1,
-            int(min_component_area),
-        )
-
-        self.providers = (
-            list(providers)
-            if providers is not None
-            else None
         )
 
         self.use_fp16 = bool(
             use_fp16
         )
 
-        self.object_confidence = _clip01(
-            object_confidence
-        )
+        if device is None:
+            self.device = torch.device(
+                "cuda"
+                if torch.cuda.is_available()
+                else "cpu"
+            )
+        else:
+            self.device = torch.device(
+                device
+            )
 
-        self.object_iou = _clip01(
-            object_iou
-        )
+        if (
+            self.device.type == "cuda"
+            and not torch.cuda.is_available()
+        ):
+            logger.warning(
+                "CUDA solicitado, mas não "
+                "está disponível. Usando CPU."
+            )
 
-        self.canonical_width = max(
-            64,
-            int(canonical_width),
-        )
-
-        self.canonical_height = max(
-            64,
-            int(canonical_height),
-        )
-
-        # ---------------------------------------------------------------------
-        # Runtime state
-        # ---------------------------------------------------------------------
+            self.device = torch.device(
+                "cpu"
+            )
 
         self.model: Optional[
             torch.jit.ScriptModule
         ] = None
-
-        self.device = torch.device(
-            "cpu"
-        )
 
         self.loaded = False
 
@@ -801,116 +720,25 @@ class YOLOPLaneDetector:
             LaneDetectionResult
         ] = None
 
-        self.last_output_shape: Tuple[
-            int, ...
-        ] = tuple()
-
         self.last_output_shapes: List[
             Tuple[int, ...]
         ] = []
-
-        self.last_lane_probability: Optional[
-            np.ndarray
-        ] = None
-
-        self.last_lane_mask: Optional[
-            np.ndarray
-        ] = None
-
-        self.last_drivable_mask: Optional[
-            np.ndarray
-        ] = None
 
         self.last_diagnostics: Dict[
             str,
             Any,
         ] = {}
 
-        self.last_preprocess_meta: Optional[
-            _PreprocessMeta
-        ] = None
-
-        self._warmup_done = False
+        self._warmed_up = False
 
     # =========================================================================
-    # MODEL PATH
+    # MODEL
     # =========================================================================
-
-    @staticmethod
-    def _resolve_model_path(
-        requested: Path,
-    ) -> Path:
-
-        if requested.is_file():
-            return requested
-
-        if (
-            requested == LEGACY_MODEL_PATH
-            or requested.suffix.lower() == ".onnx"
-        ):
-            if DEFAULT_MODEL_PATH.is_file():
-                logger.warning(
-                    "[YOLOPv2] Caminho legado solicitado (%s), "
-                    "usando YOLOPv2: %s",
-                    requested,
-                    DEFAULT_MODEL_PATH,
-                )
-
-                return DEFAULT_MODEL_PATH
-
-        return requested
 
     def model_exists(self) -> bool:
         return self.model_path.is_file()
 
-    # =========================================================================
-    # DEVICE
-    # =========================================================================
-
-    def _select_device(self) -> torch.device:
-        if torch.cuda.is_available():
-            return torch.device(
-                "cuda:0"
-            )
-
-        return torch.device(
-            "cpu"
-        )
-
-    def get_device_name(self) -> str:
-
-        if not self.loaded:
-            return "NOT_LOADED"
-
-        if self.device.type == "cuda":
-
-            try:
-                return str(
-                    torch.cuda.get_device_name(
-                        self.device
-                    )
-                )
-
-            except Exception:
-                return "CUDA"
-
-        return "CPU"
-
-    # =========================================================================
-    # LOAD
-    # =========================================================================
-
     def load_model(self) -> bool:
-        """
-        Carrega o TorchScript YOLOPv2.
-
-        CUDA é preferencial.
-
-        CPU permanece como fallback.
-
-        A assinatura aceita `providers` apenas por
-        compatibilidade com o main/config legado.
-        """
 
         if (
             self.loaded
@@ -921,7 +749,6 @@ class YOLOPLaneDetector:
         self.last_error = None
 
         if not self.model_exists():
-
             self.last_error = (
                 "Modelo YOLOPv2 não encontrado: "
                 f"{self.model_path}"
@@ -934,58 +761,39 @@ class YOLOPLaneDetector:
 
             return False
 
-        if self.model_path.suffix.lower() != ".pt":
-
-            self.last_error = (
-                "O detector atual requer um checkpoint "
-                "TorchScript .pt do YOLOPv2. "
-                f"Arquivo recebido: {self.model_path}"
-            )
-
-            logger.error(
-                "[YOLOPv2] %s",
-                self.last_error,
-            )
-
-            return False
-
-        target_device = self._select_device()
-
         try:
             logger.info(
-                "[YOLOPv2] Carregando TorchScript: %s",
+                "[YOLOPv2] Carregando: %s",
                 self.model_path,
             )
 
             model = torch.jit.load(
                 str(self.model_path),
-                map_location=target_device,
-            )
-
-            model = model.to(
-                target_device
+                map_location=self.device,
             )
 
             model.eval()
 
-            fp16_active = (
-                self.use_fp16
-                and target_device.type
-                == "cuda"
-            )
+            if self.device.type == "cuda":
+                model = model.cuda()
 
-            if fp16_active:
-                model = model.half()
+                if self.use_fp16:
+                    model = model.half()
+                    self.fp16_active = True
+
+            else:
+                self.fp16_active = False
 
             self.model = model
-            self.device = target_device
-            self.fp16_active = fp16_active
             self.loaded = True
-            self._warmup_done = False
 
             logger.info(
-                "[YOLOPv2] READY | device=%s | fp16=%s",
+                "[YOLOPv2] Device: %s",
                 self.get_device_name(),
+            )
+
+            logger.info(
+                "[YOLOPv2] FP16: %s",
                 self.fp16_active,
             )
 
@@ -995,78 +803,25 @@ class YOLOPLaneDetector:
 
         except Exception as exc:
 
-            self.model = None
-            self.loaded = False
-            self.fp16_active = False
-
             self.last_error = (
-                f"{type(exc).__name__}: "
-                f"{exc}"
+                f"{type(exc).__name__}: {exc}"
             )
 
             logger.exception(
                 "[YOLOPv2] Falha ao carregar modelo."
             )
 
-            # Última chance: CPU.
-            if target_device.type == "cuda":
-
-                try:
-                    logger.warning(
-                        "[YOLOPv2] Tentando fallback CPU."
-                    )
-
-                    model = torch.jit.load(
-                        str(self.model_path),
-                        map_location="cpu",
-                    )
-
-                    model = model.to(
-                        torch.device("cpu")
-                    )
-
-                    model.eval()
-
-                    self.model = model
-                    self.device = torch.device(
-                        "cpu"
-                    )
-                    self.fp16_active = False
-                    self.loaded = True
-                    self._warmup_done = False
-
-                    logger.warning(
-                        "[YOLOPv2] CPU fallback ativo."
-                    )
-
-                    self._warmup()
-
-                    return True
-
-                except Exception as cpu_exc:
-
-                    self.last_error = (
-                        f"CUDA: {self.last_error}; "
-                        f"CPU: "
-                        f"{type(cpu_exc).__name__}: "
-                        f"{cpu_exc}"
-                    )
-
-                    self.model = None
-                    self.loaded = False
+            self.model = None
+            self.loaded = False
+            self.fp16_active = False
 
             return False
-
-    # =========================================================================
-    # WARMUP
-    # =========================================================================
 
     def _warmup(self) -> None:
 
         if (
-            not self.loaded
+            self._warmed_up
             or self.model is None
-            or self._warmup_done
         ):
             return
 
@@ -1085,42 +840,54 @@ class YOLOPLaneDetector:
                     self.input_height,
                     self.input_width,
                 ),
-                device=self.device,
                 dtype=dtype,
+                device=self.device,
             )
 
             with torch.inference_mode():
-                _ = self.model(
-                    tensor
-                )
+                _ = self.model(tensor)
 
             if self.device.type == "cuda":
-                torch.cuda.synchronize(
+                torch.cuda.synchronize()
+
+            self._warmed_up = True
+
+        except Exception:
+
+            logger.exception(
+                "[YOLOPv2] Warmup falhou."
+            )
+
+            self._warmed_up = False
+
+    # =========================================================================
+    # DEVICE
+    # =========================================================================
+
+    def get_device_name(self) -> str:
+
+        if self.device.type == "cuda":
+
+            try:
+                return torch.cuda.get_device_name(
                     self.device
                 )
+            except Exception:
+                return "CUDA"
 
-            self._warmup_done = True
-
-        except Exception as exc:
-
-            logger.warning(
-                "[YOLOPv2] Warmup falhou: %s",
-                exc,
-            )
+        return "CPU"
 
     # =========================================================================
-    # FRAME VALIDATION
+    # PREPROCESS
     # =========================================================================
 
-    @staticmethod
-    def _validate_frame(
+    def _prepare_frame(
+        self,
         frame: np.ndarray,
-    ) -> Tuple[int, int]:
-
-        if frame is None:
-            raise ValueError(
-                "Frame é None."
-            )
+    ) -> Tuple[
+        np.ndarray,
+        _PreprocessMeta,
+    ]:
 
         if not isinstance(
             frame,
@@ -1130,14 +897,9 @@ class YOLOPLaneDetector:
                 "Frame deve ser numpy.ndarray."
             )
 
-        if frame.size == 0:
-            raise ValueError(
-                "Frame vazio."
-            )
-
         if frame.ndim != 3:
             raise ValueError(
-                "Frame deve ser HxWxC."
+                "Frame deve possuir formato HxWxC."
             )
 
         if frame.shape[2] != 3:
@@ -1147,145 +909,165 @@ class YOLOPLaneDetector:
 
         height, width = frame.shape[:2]
 
-        if (
-            width <= 0
-            or height <= 0
-        ):
+        if width <= 0 or height <= 0:
             raise ValueError(
-                "Dimensões inválidas."
+                "Frame possui dimensões inválidas."
             )
 
-        return int(width), int(height)
+        if not np.isfinite(
+            frame.astype(
+                np.float32,
+                copy=False,
+            )
+        ).all():
+            raise ValueError(
+                "Frame contém valores não finitos."
+            )
 
-    # =========================================================================
-    # LETTERBOX
-    # =========================================================================
-
-    def _letterbox(
-        self,
-        image: np.ndarray,
-    ) -> Tuple[
-        np.ndarray,
-        float,
-        Tuple[int, int],
-    ]:
-        """
-        Letterbox determinístico para 640x640.
-
-        Retorna:
-
-            image
-            scale
-            (pad_left, pad_top)
-        """
-
-        target_w = self.input_width
-        target_h = self.input_height
-
-        src_h, src_w = image.shape[:2]
+        # -------------------------------------------------------------
+        # Canonicalização.
+        #
+        # Mantemos aspect ratio e adicionamos padding.
+        # -------------------------------------------------------------
 
         scale = min(
-            target_w / float(src_w),
-            target_h / float(src_h),
+            CANONICAL_WIDTH / width,
+            CANONICAL_HEIGHT / height,
         )
 
-        resized_w = max(
+        resized_width = max(
             1,
-            int(round(src_w * scale)),
+            int(round(width * scale)),
         )
 
-        resized_h = max(
+        resized_height = max(
             1,
-            int(round(src_h * scale)),
+            int(round(height * scale)),
         )
 
         resized = cv2.resize(
-            image,
+            frame,
             (
-                resized_w,
-                resized_h,
+                resized_width,
+                resized_height,
             ),
             interpolation=cv2.INTER_LINEAR,
         )
 
-        pad_x = target_w - resized_w
-        pad_y = target_h - resized_h
+        pad_left = (
+            CANONICAL_WIDTH
+            - resized_width
+        ) // 2
 
-        left = pad_x // 2
-        right = pad_x - left
+        pad_top = (
+            CANONICAL_HEIGHT
+            - resized_height
+        ) // 2
 
-        top = pad_y // 2
-        bottom = pad_y - top
+        pad_right = (
+            CANONICAL_WIDTH
+            - resized_width
+            - pad_left
+        )
 
-        output = cv2.copyMakeBorder(
+        pad_bottom = (
+            CANONICAL_HEIGHT
+            - resized_height
+            - pad_top
+        )
+
+        canonical = cv2.copyMakeBorder(
             resized,
-            top,
-            bottom,
-            left,
-            right,
-            cv2.BORDER_CONSTANT,
+            pad_top,
+            pad_bottom,
+            pad_left,
+            pad_right,
+            borderType=cv2.BORDER_CONSTANT,
             value=(114, 114, 114),
         )
 
-        return (
-            output,
-            float(scale),
-            (
-                int(left),
-                int(top),
+        # -------------------------------------------------------------
+        # Letterbox para input do modelo.
+        # -------------------------------------------------------------
+
+        model_scale = min(
+            self.input_width
+            / CANONICAL_WIDTH,
+            self.input_height
+            / CANONICAL_HEIGHT,
+        )
+
+        model_width = max(
+            1,
+            int(
+                round(
+                    CANONICAL_WIDTH
+                    * model_scale
+                )
             ),
         )
 
-    # =========================================================================
-    # PREPROCESS
-    # =========================================================================
-
-    def preprocess(
-        self,
-        frame: np.ndarray,
-    ) -> np.ndarray:
-
-        width, height = (
-            self._validate_frame(
-                frame
-            )
+        model_height = max(
+            1,
+            int(
+                round(
+                    CANONICAL_HEIGHT
+                    * model_scale
+                )
+            ),
         )
 
-        # ---------------------------------------------------------------------
-        # O modelo original foi treinado com a cadeia:
-        #
-        # imagem -> 1280x720 -> letterbox -> 640x640
-        #
-        # Mantemos essa convenção para maximizar compatibilidade com o
-        # checkpoint oficial.
-        # ---------------------------------------------------------------------
-
-        canonical = cv2.resize(
-            frame,
+        model_image = cv2.resize(
+            canonical,
             (
-                self.canonical_width,
-                self.canonical_height,
+                model_width,
+                model_height,
             ),
             interpolation=cv2.INTER_LINEAR,
         )
 
-        letterboxed, scale, pad = (
-            self._letterbox(
-                canonical
-            )
+        model_pad_left = (
+            self.input_width
+            - model_width
+        ) // 2
+
+        model_pad_top = (
+            self.input_height
+            - model_height
+        ) // 2
+
+        model_pad_right = (
+            self.input_width
+            - model_width
+            - model_pad_left
+        )
+
+        model_pad_bottom = (
+            self.input_height
+            - model_height
+            - model_pad_top
+        )
+
+        model_image = cv2.copyMakeBorder(
+            model_image,
+            model_pad_top,
+            model_pad_bottom,
+            model_pad_left,
+            model_pad_right,
+            borderType=cv2.BORDER_CONSTANT,
+            value=(114, 114, 114),
         )
 
         rgb = cv2.cvtColor(
-            letterboxed,
+            model_image,
             cv2.COLOR_BGR2RGB,
         )
 
-        tensor = rgb.astype(
-            np.float32
-        )
-
-        tensor *= (
-            1.0 / 255.0
+        tensor = (
+            rgb.astype(
+                np.float32
+            )
+            / 255.0
         )
 
         tensor = np.transpose(
@@ -1303,93 +1085,44 @@ class YOLOPLaneDetector:
             dtype=np.float32,
         )
 
-        self.last_preprocess_meta = (
-            _PreprocessMeta(
-                original_width=width,
-                original_height=height,
-                canonical_width=self.canonical_width,
-                canonical_height=self.canonical_height,
-                ratio=scale,
-                pad_left=pad[0],
-                pad_top=pad[1],
-                pad_right=(
-                    self.input_width
-                    - int(
-                        round(
-                            self.canonical_width
-                            * scale
-                        )
-                    )
-                    - pad[0]
-                ),
-                pad_bottom=(
-                    self.input_height
-                    - int(
-                        round(
-                            self.canonical_height
-                            * scale
-                        )
-                    )
-                    - pad[1]
-                ),
-            )
+        meta = _PreprocessMeta(
+            original_width=width,
+            original_height=height,
+            canonical_width=CANONICAL_WIDTH,
+            canonical_height=CANONICAL_HEIGHT,
+            scale=scale,
+            resized_width=resized_width,
+            resized_height=resized_height,
+            pad_left=pad_left,
+            pad_top=pad_top,
+            pad_right=pad_right,
+            pad_bottom=pad_bottom,
+        )
+
+        return tensor, meta
+
+    def preprocess(
+        self,
+        frame: np.ndarray,
+    ) -> np.ndarray:
+
+        tensor, _ = self._prepare_frame(
+            frame
         )
 
         return tensor
 
     # =========================================================================
-    # TENSOR INFERENCE
+    # INFERENCE
     # =========================================================================
 
-    def _prepare_tensor(
-        self,
-        tensor: np.ndarray,
-    ) -> torch.Tensor:
-
-        if tensor.ndim != 4:
-            raise ValueError(
-                "Tensor de entrada deve possuir "
-                "formato NCHW."
-            )
-
-        torch_tensor = torch.from_numpy(
-            tensor
-        ).to(
-            self.device,
-            non_blocking=True,
-        )
-
-        if self.fp16_active:
-            torch_tensor = (
-                torch_tensor.half()
-            )
-        else:
-            torch_tensor = (
-                torch_tensor.float()
-            )
-
-        return torch_tensor
-
-    @staticmethod
-    def _shape_tuple(
-        value: Any,
-    ) -> Tuple[int, ...]:
-
-        try:
-            return tuple(
-                int(v)
-                for v in value.shape
-            )
-        except Exception:
-            return tuple()
-
+    @torch.inference_mode()
     def infer(
         self,
         frame: np.ndarray,
-    ) -> Tuple[Any, Any, Any]:
+    ) -> Any:
 
         if not self.loaded:
-
             if not self.load_model():
                 raise RuntimeError(
                     self.last_error
@@ -1401,962 +1134,304 @@ class YOLOPLaneDetector:
                 "Modelo YOLOPv2 inexistente."
             )
 
-        input_array = self.preprocess(
-            frame
+        tensor_np, _ = (
+            self._prepare_frame(frame)
         )
 
-        tensor = self._prepare_tensor(
-            input_array
+        tensor = torch.from_numpy(
+            tensor_np
+        ).to(
+            self.device,
+            non_blocking=True,
         )
 
-        with torch.inference_mode():
-
-            outputs = self.model(
-                tensor
-            )
+        if self.fp16_active:
+            tensor = tensor.half()
 
         if self.device.type == "cuda":
-            torch.cuda.synchronize(
-                self.device
-            )
+            torch.cuda.synchronize()
 
-        if not isinstance(
-            outputs,
-            (tuple, list),
-        ):
-            raise RuntimeError(
-                "YOLOPv2 deveria retornar uma tupla/lista "
-                "com 3 elementos."
-            )
+        start = time.perf_counter()
 
-        if len(outputs) != 3:
-            raise RuntimeError(
-                "Saída YOLOPv2 incompatível: "
-                f"esperado 3 elementos, recebido {len(outputs)}."
-            )
+        outputs = self.model(tensor)
 
-        prediction_output = outputs[0]
-        drivable_output = outputs[1]
-        lane_output = outputs[2]
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
 
-        self.last_output_shapes = [
-            self._shape_tuple(
-                value
-            )
-            for value in (
-                prediction_output
-                if isinstance(
-                    prediction_output,
-                    (tuple, list),
-                )
-                else outputs
-            )
-        ]
+        inference_ms = (
+            time.perf_counter()
+            - start
+        ) * 1000.0
+
+        self.last_output_shapes = (
+            _collect_shapes(outputs)
+        )
+
+        self.last_diagnostics[
+            "inference_ms"
+        ] = inference_ms
+
+        return outputs
+
+    # =========================================================================
+    # OUTPUT EXTRACTION
+    # =========================================================================
+
+    @staticmethod
+    def _tensor_to_numpy(
+        tensor: torch.Tensor,
+    ) -> np.ndarray:
 
         return (
-            prediction_output,
-            drivable_output,
-            lane_output,
+            tensor.detach()
+            .float()
+            .cpu()
+            .numpy()
         )
-
-    # =========================================================================
-    # TRACE MODEL DETECTION DECODE
-    # =========================================================================
 
     @staticmethod
-    def _make_grid(
-        nx: int,
-        ny: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
+    def _find_segmentation_tensor(
+        tensors: Sequence[torch.Tensor],
+        preferred_channels: Sequence[int],
+    ) -> Optional[torch.Tensor]:
 
-        y = torch.arange(
-            ny,
-            device=device,
-            dtype=dtype,
-        )
+        candidates = []
 
-        x = torch.arange(
-            nx,
-            device=device,
-            dtype=dtype,
-        )
+        for tensor in tensors:
 
-        try:
-            yy, xx = torch.meshgrid(
-                y,
-                x,
-                indexing="ij",
-            )
-        except TypeError:
-            yy, xx = torch.meshgrid(
-                y,
-                x,
+            if tensor.ndim != 4:
+                continue
+
+            channels = int(
+                tensor.shape[1]
             )
 
-        return torch.stack(
-            (
-                xx,
-                yy,
-            ),
-            dim=2,
-        ).view(
-            1,
-            1,
-            ny,
-            nx,
-            2,
-        )
-
-    def _split_for_trace_model(
-        self,
-        prediction: Any,
-        anchor_grid: Any,
-    ) -> torch.Tensor:
-
-        if not isinstance(
-            prediction,
-            (tuple, list),
-        ):
-            raise RuntimeError(
-                "Cabeça de detecção YOLOPv2 inválida."
+            height = int(
+                tensor.shape[2]
             )
 
-        if not isinstance(
-            anchor_grid,
-            (tuple, list),
-        ):
-            raise RuntimeError(
-                "anchor_grid YOLOPv2 inválido."
-            )
-
-        if len(prediction) != 3:
-            raise RuntimeError(
-                "A cabeça YOLOPv2 deve possuir "
-                "3 escalas de detecção."
-            )
-
-        if len(anchor_grid) != 3:
-            raise RuntimeError(
-                "anchor_grid YOLOPv2 deveria possuir "
-                "3 escalas."
-            )
-
-        chunks: List[torch.Tensor] = []
-
-        strides = (
-            8,
-            16,
-            32,
-        )
-
-        for i in range(3):
-
-            feature = prediction[i]
-
-            if feature.ndim != 4:
-                raise RuntimeError(
-                    "Mapa de detecção inválido: "
-                    f"{tuple(feature.shape)}"
-                )
-
-            batch, channels, ny, nx = (
-                feature.shape
-            )
-
-            if channels % 3 != 0:
-                raise RuntimeError(
-                    "Número de canais incompatível "
-                    "com 3 anchors."
-                )
-
-            attributes = (
-                channels // 3
-            )
-
-            reshaped = feature.view(
-                batch,
-                3,
-                attributes,
-                ny,
-                nx,
-            ).permute(
-                0,
-                1,
-                3,
-                4,
-                2,
-            ).contiguous()
-
-            activated = (
-                reshaped.sigmoid()
-            )
-
-            grid = self._make_grid(
-                nx=nx,
-                ny=ny,
-                device=feature.device,
-                dtype=feature.dtype,
-            )
-
-            stride = float(
-                strides[i]
-            )
-
-            activated[..., 0:2] = (
-                activated[..., 0:2]
-                * 2.0
-                - 0.5
-                + grid
-            ) * stride
-
-            activated[..., 2:4] = (
-                activated[..., 2:4]
-                * 2.0
-            ) ** 2 * anchor_grid[i]
-
-            chunks.append(
-                activated.view(
-                    batch,
-                    -1,
-                    attributes,
-                )
-            )
-
-        return torch.cat(
-            chunks,
-            dim=1,
-        )
-
-    # =========================================================================
-    # NMS
-    # =========================================================================
-
-    @staticmethod
-    def _xywh_to_xyxy(
-        boxes: torch.Tensor,
-    ) -> torch.Tensor:
-
-        output = boxes.clone()
-
-        output[:, 0] = (
-            boxes[:, 0]
-            - boxes[:, 2] * 0.5
-        )
-
-        output[:, 1] = (
-            boxes[:, 1]
-            - boxes[:, 3] * 0.5
-        )
-
-        output[:, 2] = (
-            boxes[:, 0]
-            + boxes[:, 2] * 0.5
-        )
-
-        output[:, 3] = (
-            boxes[:, 1]
-            + boxes[:, 3] * 0.5
-        )
-
-        return output
-
-    def _decode_objects(
-        self,
-        prediction_output: Any,
-        frame_width: int,
-        frame_height: int,
-    ) -> List[ObjectDetection]:
-        """
-        Decodifica a cabeça de objetos.
-
-        Falha nesta etapa não invalida a percepção das lanes.
-        """
-
-        if not isinstance(
-            prediction_output,
-            (tuple, list),
-        ):
-            return []
-
-        if len(prediction_output) != 2:
-            return []
-
-        raw_prediction = prediction_output[0]
-        anchor_grid = prediction_output[1]
-
-        try:
-
-            prediction = (
-                self._split_for_trace_model(
-                    raw_prediction,
-                    anchor_grid,
-                )
-            )
-
-            if prediction.ndim != 3:
-                return []
-
-            if prediction.shape[0] < 1:
-                return []
-
-            data = prediction[0]
-
-            if data.shape[1] < 6:
-                return []
-
-            objectness = (
-                data[:, 4]
-            )
-
-            class_scores = data[:, 5:]
-
-            class_confidence, class_id = (
-                torch.max(
-                    class_scores,
-                    dim=1,
-                )
-            )
-
-            confidence = (
-                objectness
-                * class_confidence
-            )
-
-            keep = (
-                confidence
-                >= self.object_confidence
-            )
-
-            if not bool(
-                keep.any()
-            ):
-                return []
-
-            boxes = (
-                self._xywh_to_xyxy(
-                    data[keep, :4]
-                )
-            )
-
-            scores = (
-                confidence[keep]
-            )
-
-            classes = (
-                class_id[keep]
+            width = int(
+                tensor.shape[3]
             )
 
             if (
-                self.device.type == "cuda"
+                height < 32
+                or width < 32
             ):
-                boxes_cpu = (
-                    boxes.float().cpu()
-                )
-                scores_cpu = (
-                    scores.float().cpu()
-                )
-                classes_cpu = (
-                    classes.long().cpu()
-                )
-            else:
-                boxes_cpu = (
-                    boxes.float()
-                )
-                scores_cpu = (
-                    scores.float()
-                )
-                classes_cpu = (
-                    classes.long()
+                continue
+
+            if channels in preferred_channels:
+                candidates.append(
+                    tensor
                 )
 
-            keep_indices = (
-                torchvision.ops.nms(
-                    boxes_cpu,
-                    scores_cpu,
-                    self.object_iou,
-                )
-            )
+        if not candidates:
+            return None
 
-            objects: List[
-                ObjectDetection
-            ] = []
-
-            # -----------------------------------------------------------------
-            # O decoder oficial opera nas coordenadas da imagem de inferência
-            # 640x640. Para o objeto, removemos o letterbox e devolvemos
-            # coordenadas no frame original.
-            # -----------------------------------------------------------------
-
-            meta = (
-                self.last_preprocess_meta
-            )
-
-            if meta is None:
-                return []
-
-            boxes_numpy = (
-                boxes_cpu.numpy()
-            )
-
-            scores_numpy = (
-                scores_cpu.numpy()
-            )
-
-            classes_numpy = (
-                classes_cpu.numpy()
-            )
-
-            for index in keep_indices.numpy():
-
-                box = boxes_numpy[index]
-
-                x1, y1, x2, y2 = (
-                    self._map_inference_box_to_frame(
-                        box,
-                        frame_width,
-                        frame_height,
-                    )
-                )
-
-                confidence_value = (
-                    _clip01(
-                        scores_numpy[index]
-                    )
-                )
-
-                class_value = int(
-                    classes_numpy[index]
-                )
-
-                if (
-                    x2 <= x1
-                    or y2 <= y1
-                ):
-                    continue
-
-                objects.append(
-                    ObjectDetection(
-                        class_id=class_value,
-                        confidence=confidence_value,
-                        x1=x1,
-                        y1=y1,
-                        x2=x2,
-                        y2=y2,
-                        frame_width=frame_width,
-                        frame_height=frame_height,
-                    )
-                )
-
-            objects.sort(
-                key=lambda detection:
-                detection.confidence,
-                reverse=True,
-            )
-
-            return objects
-
-        except Exception as exc:
-
-            self.last_diagnostics[
-                "object_decode_error"
-            ] = (
-                f"{type(exc).__name__}: "
-                f"{exc}"
-            )
-
-            logger.debug(
-                "[YOLOPv2] Falha no decode de objetos: %s",
-                exc,
-            )
-
-            return []
-
-    # =========================================================================
-    # INFERENCE COORDINATE MAPPING
-    # =========================================================================
-
-    def _map_inference_point_to_frame(
-        self,
-        x: float,
-        y: float,
-        frame_width: int,
-        frame_height: int,
-    ) -> Tuple[float, float]:
-
-        meta = (
-            self.last_preprocess_meta
-        )
-
-        if meta is None:
-            return (
-                float(x),
-                float(y),
-            )
-
-        # 640 -> canonical.
-        canonical_x = (
-            float(x)
-            - float(meta.pad_left)
-        ) / max(
-            meta.ratio,
-            1e-9,
-        )
-
-        canonical_y = (
-            float(y)
-            - float(meta.pad_top)
-        ) / max(
-            meta.ratio,
-            1e-9,
-        )
-
-        canonical_x = float(
-            np.clip(
-                canonical_x,
-                0.0,
-                float(
-                    meta.canonical_width
+        # Preferência:
+        # maior resolução espacial.
+        candidates.sort(
+            key=lambda tensor: (
+                int(tensor.shape[2])
+                * int(tensor.shape[3]),
+                -abs(
+                    int(tensor.shape[1])
+                    - preferred_channels[0]
                 ),
-            )
-        )
-
-        canonical_y = float(
-            np.clip(
-                canonical_y,
-                0.0,
-                float(
-                    meta.canonical_height
-                ),
-            )
-        )
-
-        frame_x = (
-            canonical_x
-            * float(frame_width)
-            / float(
-                meta.canonical_width
-            )
-        )
-
-        frame_y = (
-            canonical_y
-            * float(frame_height)
-            / float(
-                meta.canonical_height
-            )
-        )
-
-        return (
-            float(
-                np.clip(
-                    frame_x,
-                    0.0,
-                    float(frame_width - 1),
-                )
             ),
-            float(
-                np.clip(
-                    frame_y,
-                    0.0,
-                    float(frame_height - 1),
-                )
-            ),
+            reverse=True,
         )
 
-    def _map_inference_box_to_frame(
-        self,
-        box: Sequence[float],
-        frame_width: int,
-        frame_height: int,
-    ) -> Tuple[float, float, float, float]:
-
-        x1, y1 = (
-            self._map_inference_point_to_frame(
-                box[0],
-                box[1],
-                frame_width,
-                frame_height,
-            )
-        )
-
-        x2, y2 = (
-            self._map_inference_point_to_frame(
-                box[2],
-                box[3],
-                frame_width,
-                frame_height,
-            )
-        )
-
-        return (
-            min(x1, x2),
-            min(y1, y2),
-            max(x1, x2),
-            max(y1, y2),
-        )
-
-    # =========================================================================
-    # SEGMENTATION NORMALIZATION
-    # =========================================================================
+        return candidates[0]
 
     @staticmethod
-    def _as_tensor(
-        value: Any,
-        device: torch.device,
-    ) -> torch.Tensor:
+    def _find_lane_segmentation(
+        outputs: Any,
+    ) -> Optional[torch.Tensor]:
 
-        if isinstance(
-            value,
-            torch.Tensor,
-        ):
-            return value
-
-        if isinstance(
-            value,
-            np.ndarray,
-        ):
-            return torch.from_numpy(
-                value
-            ).to(device)
-
-        raise TypeError(
-            "Saída de segmentação incompatível."
+        tensors = _flatten_tensors(
+            outputs
         )
 
-    def _decode_lane_output(
+        # YOLOPv2 normalmente usa [1, 2, H, W].
+        return (
+            YOLOPLaneDetector
+            ._find_segmentation_tensor(
+                tensors,
+                (2,),
+            )
+        )
+
+    @staticmethod
+    def _find_drivable_segmentation(
+        outputs: Any,
+    ) -> Optional[torch.Tensor]:
+
+        tensors = _flatten_tensors(
+            outputs
+        )
+
+        return (
+            YOLOPLaneDetector
+            ._find_segmentation_tensor(
+                tensors,
+                (2,),
+            )
+        )
+
+    # =========================================================================
+    # SEGMENTATION
+    # =========================================================================
+
+    def _segmentation_probability(
         self,
-        lane_output: Any,
+        segmentation: np.ndarray,
     ) -> np.ndarray:
-        """
-        Replica o contrato oficial lane_line_mask()
-        do YOLOPv2, mas devolve HxW uint8/probability sem
-        depender do código do repositório externo.
-        """
 
-        tensor = self._as_tensor(
-            lane_output,
-            self.device,
+        if segmentation.ndim != 4:
+            raise ValueError(
+                "Segmentation deve ser [N,C,H,W]."
+            )
+
+        if segmentation.shape[0] < 1:
+            raise ValueError(
+                "Batch vazio."
+            )
+
+        channels = int(
+            segmentation.shape[1]
         )
 
-        if tensor.ndim != 4:
-            raise RuntimeError(
-                "Saída lane do YOLOPv2 inválida: "
-                f"{tuple(tensor.shape)}"
+        if channels < 2:
+            raise ValueError(
+                "Segmentation deve possuir "
+                "pelo menos dois canais."
             )
 
-        # Contrato oficial:
-        #
-        #   ll[:, :, 12:372, :]
-        #
-        # seguido por interpolação x2 e round.
-        if (
-            tensor.shape[2]
-            >= LANE_OUTPUT_BOTTOM
-            and tensor.shape[3]
-            == self.input_width
-        ):
+        logits = segmentation[0]
 
-            tensor = tensor[
-                :,
-                :,
-                LANE_OUTPUT_TOP_CROP:
-                LANE_OUTPUT_BOTTOM,
-                :,
-            ]
-
-            tensor = torch.nn.functional.interpolate(
-                tensor,
-                scale_factor=2.0,
-                mode="bilinear",
-                align_corners=False,
-            )
-
-            tensor = torch.round(
-                tensor
-            )
-
-        else:
-
-            # Fallback defensivo para variantes exportadas.
-            tensor = torch.sigmoid(
-                tensor
-            )
-
-        while tensor.ndim > 2:
-            if tensor.shape[1] == 1:
-                tensor = tensor[:, 0]
-
-            elif tensor.shape[0] == 1:
-                tensor = tensor[0]
-
-            else:
-                tensor = tensor[0]
-
-        result = tensor.float().detach().cpu().numpy()
-
-        result = _finite_array(
-            result
+        logits = np.asarray(
+            logits,
+            dtype=np.float32,
         )
 
-        if result.ndim != 2:
-            raise RuntimeError(
-                "Máscara de lane deveria ser HxW: "
-                f"{result.shape}"
-            )
+        logits = np.nan_to_num(
+            logits,
+            nan=0.0,
+            posinf=50.0,
+            neginf=-50.0,
+        )
 
-        result = np.clip(
-            result,
+        logits -= np.max(
+            logits,
+            axis=0,
+            keepdims=True,
+        )
+
+        exp_logits = np.exp(
+            np.clip(
+                logits,
+                -50.0,
+                50.0,
+            )
+        )
+
+        denominator = np.sum(
+            exp_logits,
+            axis=0,
+            keepdims=True,
+        )
+
+        denominator = np.maximum(
+            denominator,
+            1e-8,
+        )
+
+        probabilities = (
+            exp_logits
+            / denominator
+        )
+
+        return np.clip(
+            probabilities[1],
             0.0,
             1.0,
+        )
+
+    def _resize_probability_to_frame(
+        self,
+        probability: np.ndarray,
+        frame_width: int,
+        frame_height: int,
+    ) -> np.ndarray:
+
+        if probability.size == 0:
+            return np.zeros(
+                (
+                    frame_height,
+                    frame_width,
+                ),
+                dtype=np.float32,
+            )
+
+        return cv2.resize(
+            probability,
+            (
+                frame_width,
+                frame_height,
+            ),
+            interpolation=cv2.INTER_LINEAR,
         ).astype(
             np.float32,
             copy=False,
         )
 
-        return result
-
-    def _decode_drivable_output(
+    def _build_lane_mask(
         self,
-        drivable_output: Any,
+        probability: np.ndarray,
     ) -> np.ndarray:
-        """
-        Replica driving_area_mask() do YOLOPv2.
-        """
 
-        tensor = self._as_tensor(
-            drivable_output,
-            self.device,
-        )
-
-        if tensor.ndim != 4:
-            raise RuntimeError(
-                "Saída drivable do YOLOPv2 inválida: "
-                f"{tuple(tensor.shape)}"
-            )
-
-        if (
-            tensor.shape[2]
-            >= LANE_OUTPUT_BOTTOM
-            and tensor.shape[3]
-            == self.input_width
-        ):
-
-            tensor = tensor[
-                :,
-                :,
-                LANE_OUTPUT_TOP_CROP:
-                LANE_OUTPUT_BOTTOM,
-                :,
-            ]
-
-            tensor = torch.nn.functional.interpolate(
-                tensor,
-                scale_factor=2.0,
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        channels = tensor.shape[1]
-
-        if channels < 1:
-            raise RuntimeError(
-                "Saída drivable sem canais."
-            )
-
-        if channels == 1:
-
-            mask = torch.sigmoid(
-                tensor
-            )[:, 0]
-
-        else:
-
-            mask = torch.argmax(
-                tensor,
-                dim=1,
-            ).float()
-
-        mask = mask[0]
-
-        result = (
-            mask.float()
-            .detach()
-            .cpu()
-            .numpy()
-        )
-
-        result = _finite_array(
-            result
-        )
-
-        return (
-            result > 0.5
+        mask = (
+            probability
+            >= self.lane_threshold
         ).astype(
             np.uint8
         )
 
-    # =========================================================================
-    # MASK MAPPING
-    # =========================================================================
+        if DEFAULT_MORPH_KERNEL >= 3:
 
-    def _map_canonical_mask_to_frame(
-        self,
-        canonical_mask: np.ndarray,
-        frame_width: int,
-        frame_height: int,
-    ) -> np.ndarray:
-
-        canonical = np.asarray(
-            canonical_mask
-        ).astype(
-            np.uint8,
-            copy=False,
-        )
-
-        canonical = cv2.resize(
-            canonical,
-            (
-                self.canonical_width,
-                self.canonical_height,
-            ),
-            interpolation=cv2.INTER_NEAREST,
-        )
-
-        frame_mask = cv2.resize(
-            canonical,
-            (
-                frame_width,
-                frame_height,
-            ),
-            interpolation=cv2.INTER_NEAREST,
-        )
-
-        return frame_mask.astype(
-            np.uint8,
-            copy=False,
-        )
-
-    # =========================================================================
-    # MASK CLEANING
-    # =========================================================================
-
-    def _clean_mask(
-        self,
-        mask: np.ndarray,
-    ) -> np.ndarray:
-
-        result = np.asarray(
-            mask
-        ).astype(
-            np.uint8,
-            copy=True,
-        )
-
-        if result.ndim != 2:
-            raise ValueError(
-                "Máscara deve ser 2D."
-            )
-
-        if self.morph_kernel > 1:
-
-            kernel = np.ones(
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
                 (
-                    self.morph_kernel,
-                    self.morph_kernel,
+                    DEFAULT_MORPH_KERNEL,
+                    DEFAULT_MORPH_KERNEL,
                 ),
-                dtype=np.uint8,
             )
 
-            # Fechamento conservador.
-            result = cv2.morphologyEx(
-                result,
+            mask = cv2.morphologyEx(
+                mask,
+                cv2.MORPH_OPEN,
+                kernel,
+            )
+
+            mask = cv2.morphologyEx(
+                mask,
                 cv2.MORPH_CLOSE,
                 kernel,
-                iterations=1,
             )
 
-        if self.min_component_area > 1:
+        return mask
 
-            labels_count, labels, stats, _ = (
-                cv2.connectedComponentsWithStats(
-                    result,
-                    connectivity=8,
-                )
-            )
-
-            cleaned = np.zeros_like(
-                result
-            )
-
-            for label in range(
-                1,
-                labels_count,
-            ):
-
-                area = int(
-                    stats[
-                        label,
-                        cv2.CC_STAT_AREA,
-                    ]
-                )
-
-                if area >= self.min_component_area:
-
-                    cleaned[
-                        labels == label
-                    ] = 1
-
-            result = cleaned
-
-        return result
-
-    # =========================================================================
-    # DRIVABLE GATE
-    # =========================================================================
-
-    def _drivable_probability_at(
+    def _build_drivable_mask(
         self,
-        drivable_mask: Optional[np.ndarray],
-        x: float,
-        y: int,
-    ) -> float:
+        probability: np.ndarray,
+    ) -> np.ndarray:
 
-        if drivable_mask is None:
-            return 1.0
-
-        height, width = (
-            drivable_mask.shape
-        )
-
-        if (
-            width <= 0
-            or height <= 0
-        ):
-            return 1.0
-
-        xi = int(
-            np.clip(
-                round(x),
-                0,
-                width - 1,
-            )
-        )
-
-        yi = int(
-            np.clip(
-                y,
-                0,
-                height - 1,
-            )
-        )
-
-        return float(
-            drivable_mask[
-                yi,
-                xi,
-            ]
+        return (
+            probability
+            >= DEFAULT_DRIVABLE_GATE_MIN
+        ).astype(
+            np.uint8
         )
 
     # =========================================================================
@@ -2364,20 +1439,19 @@ class YOLOPLaneDetector:
     # =========================================================================
 
     @staticmethod
-    def _split_row_segments(
+    def _split_contiguous(
         xs: np.ndarray,
+        max_gap: int = 3,
     ) -> List[np.ndarray]:
 
         if xs.size == 0:
             return []
 
-        gaps = np.diff(
-            xs
-        )
+        gaps = np.diff(xs)
 
-        indices = (
+        split_indices = (
             np.where(
-                gaps > 2
+                gaps > max_gap
             )[0]
             + 1
         )
@@ -2385,24 +1459,34 @@ class YOLOPLaneDetector:
         return list(
             np.split(
                 xs,
-                indices,
+                split_indices,
             )
         )
 
     def _extract_row_segments(
         self,
-        probability: np.ndarray,
         lane_mask: np.ndarray,
-        drivable_mask: Optional[np.ndarray],
-    ) -> List[List[_RowSegment]]:
+        lane_probability: np.ndarray,
+        drivable_probability: Optional[np.ndarray],
+    ) -> List[
+        _RowSegment
+    ]:
 
         height, width = (
             lane_mask.shape
         )
 
-        rows: List[
-            List[_RowSegment]
+        segments: List[
+            _RowSegment
         ] = []
+
+        # Importante:
+        #
+        # lane_mask já está no FRAME ORIGINAL.
+        #
+        # Portanto x/y produzidos aqui também estão
+        # no FRAME ORIGINAL.
+        #
 
         for y in range(
             height - 1,
@@ -2420,508 +1504,207 @@ class YOLOPLaneDetector:
             ):
                 continue
 
-            segments = (
-                self._split_row_segments(
-                    xs
-                )
-            )
-
-            row_segments: List[
-                _RowSegment
-            ] = []
-
-            for segment in segments:
+            for group in self._split_contiguous(
+                xs
+            ):
 
                 if (
-                    segment.size
+                    group.size
                     < self.min_lane_pixels_per_row
                 ):
                     continue
 
                 x_min = float(
-                    segment[0]
+                    group[0]
                 )
 
                 x_max = float(
-                    segment[-1]
+                    group[-1]
                 )
 
-                x_center = float(
-                    np.mean(
-                        segment
-                    )
-                )
+                x_center = (
+                    x_min
+                    + x_max
+                ) * 0.5
 
-                lane_confidence = float(
+                confidence = float(
                     np.mean(
-                        probability[
+                        lane_probability[
                             y,
-                            segment,
+                            group,
                         ]
                     )
                 )
 
-                if drivable_mask is None:
-
-                    road_confidence = 1.0
-
-                else:
-
+                if drivable_probability is not None:
                     road_confidence = float(
                         np.mean(
-                            drivable_mask[
+                            drivable_probability[
                                 y,
-                                segment,
+                                group,
                             ]
                         )
                     )
+                else:
+                    road_confidence = 0.0
 
-                row_segments.append(
+                segments.append(
                     _RowSegment(
                         y=int(y),
                         x_min=x_min,
                         x_max=x_max,
                         x_center=x_center,
                         confidence=_clip01(
-                            lane_confidence
+                            confidence
                         ),
                         road_confidence=_clip01(
                             road_confidence
                         ),
                         pixel_count=int(
-                            segment.size
+                            group.size
                         ),
                     )
                 )
 
-            if row_segments:
-
-                row_segments.sort(
-                    key=lambda item:
-                    item.x_center
-                )
-
-                rows.append(
-                    row_segments
-                )
-
-        return rows
+        return segments
 
     # =========================================================================
-    # FRAME-LOCAL LANE ASSOCIATION
+    # LANE ASSOCIATION
     # =========================================================================
-
-    def _segment_distance(
-        self,
-        track: _LaneTrack,
-        segment: _RowSegment,
-    ) -> float:
-
-        predicted = (
-            track.predicted_x()
-        )
-
-        return abs(
-            segment.x_center
-            - predicted
-        )
 
     def _associate_segments(
         self,
-        rows: List[List[_RowSegment]],
-    ) -> List[_LaneTrack]:
+        segments: Sequence[
+            _RowSegment
+        ],
+        frame_width: int,
+    ) -> List[
+        _LaneTrack
+    ]:
+
+        if not segments:
+            return []
+
+        rows: Dict[
+            int,
+            List[_RowSegment]
+        ] = {}
+
+        for segment in segments:
+            rows.setdefault(
+                segment.y,
+                []
+            ).append(segment)
 
         tracks: List[
             _LaneTrack
         ] = []
 
-        for segments in rows:
+        max_jump = max(
+            DEFAULT_MAX_TRACKING_JUMP,
+            frame_width * 0.035,
+        )
 
-            used_tracks: set[int] = set()
-            used_segments: set[int] = set()
+        for y in sorted(
+            rows.keys(),
+            reverse=True,
+        ):
 
-            matches: List[
-                Tuple[float, int, int]
-            ] = []
+            candidates = sorted(
+                rows[y],
+                key=lambda segment:
+                    segment.x_center,
+            )
 
-            for segment_index, segment in enumerate(
-                segments
-            ):
+            if not tracks:
 
-                for track_index, track in enumerate(
+                for candidate in candidates:
+                    track = _LaneTrack()
+
+                    track.add(
+                        candidate.y,
+                        candidate.x_center,
+                        candidate.confidence,
+                        candidate.road_confidence,
+                    )
+
+                    tracks.append(
+                        track
+                    )
+
+                continue
+
+            used_tracks = set()
+
+            for candidate in candidates:
+
+                best_index = None
+                best_distance = float(
+                    "inf"
+                )
+
+                for index, track in enumerate(
                     tracks
                 ):
 
-                    if (
-                        track_index
-                        in used_tracks
-                    ):
+                    if index in used_tracks:
                         continue
 
-                    distance = (
-                        self._segment_distance(
-                            track,
-                            segment,
-                        )
+                    distance = abs(
+                        candidate.x_center
+                        - track.last_x
                     )
 
-                    jump = (
-                        self.max_tracking_jump
-                        + min(
-                            20.0,
-                            segment.width,
-                        )
+                    if distance > max_jump:
+                        continue
+
+                    # Penalização leve para candidatos
+                    # incompatíveis verticalmente.
+                    score = distance
+
+                    if score < best_distance:
+                        best_distance = score
+                        best_index = index
+
+                if best_index is None:
+
+                    if len(tracks) >= self.max_lanes:
+                        continue
+
+                    track = _LaneTrack()
+
+                    track.add(
+                        candidate.y,
+                        candidate.x_center,
+                        candidate.confidence,
+                        candidate.road_confidence,
                     )
 
-                    if distance <= jump:
-
-                        matches.append(
-                            (
-                                distance,
-                                segment_index,
-                                track_index,
-                            )
-                        )
-
-            matches.sort(
-                key=lambda item:
-                item[0]
-            )
-
-            for (
-                _distance,
-                segment_index,
-                track_index,
-            ) in matches:
-
-                if (
-                    segment_index
-                    in used_segments
-                ):
-                    continue
-
-                if (
-                    track_index
-                    in used_tracks
-                ):
-                    continue
-
-                segment = segments[
-                    segment_index
-                ]
-
-                track = tracks[
-                    track_index
-                ]
-
-                # Rejeição de saltos de inclinação absurdos.
-                if (
-                    track.previous_x is not None
-                    and track.previous_y is not None
-                ):
-
-                    dy = (
-                        track.last_y
-                        - segment.y
+                    tracks.append(
+                        track
                     )
 
-                    if abs(dy) > 0:
+                else:
 
-                        previous_dx = (
-                            track.last_x
-                            - track.previous_x
-                        )
+                    track = tracks[
+                        best_index
+                    ]
 
-                        new_dx = (
-                            segment.x_center
-                            - track.last_x
-                        )
-
-                        previous_slope = (
-                            previous_dx
-                            / max(
-                                1.0,
-                                abs(
-                                    track.last_y
-                                    - track.previous_y
-                                ),
-                            )
-                        )
-
-                        new_slope = (
-                            new_dx
-                            / max(
-                                1.0,
-                                abs(dy)
-                            )
-                        )
-
-                        if (
-                            abs(
-                                new_slope
-                                - previous_slope
-                            )
-                            > DEFAULT_MAX_SLOPE_CHANGE
-                        ):
-                            continue
-
-                track.previous_x = (
-                    track.last_x
-                )
-
-                track.previous_y = (
-                    track.last_y
-                )
-
-                track.last_x = (
-                    segment.x_center
-                )
-
-                track.last_y = (
-                    segment.y
-                )
-
-                track.points.append(
-                    (
-                        segment.y,
-                        segment.x_center,
-                        segment.confidence,
+                    track.add(
+                        candidate.y,
+                        candidate.x_center,
+                        candidate.confidence,
+                        candidate.road_confidence,
                     )
-                )
 
-                track.confidence_sum += (
-                    segment.confidence
-                )
-
-                track.road_confidence_sum += (
-                    segment.road_confidence
-                )
-
-                track.pixel_sum += (
-                    segment.pixel_count
-                )
-
-                used_segments.add(
-                    segment_index
-                )
-
-                used_tracks.add(
-                    track_index
-                )
-
-            # -----------------------------------------------------------------
-            # Novas lanes.
-            # -----------------------------------------------------------------
-
-            for segment_index, segment in enumerate(
-                segments
-            ):
-
-                if (
-                    segment_index
-                    in used_segments
-                ):
-                    continue
-
-                if (
-                    len(tracks)
-                    >= self.max_lanes
-                ):
-                    break
-
-                tracks.append(
-                    _LaneTrack(
-                        points=[
-                            (
-                                segment.y,
-                                segment.x_center,
-                                segment.confidence,
-                            )
-                        ],
-                        last_x=segment.x_center,
-                        last_y=segment.y,
-                        previous_x=None,
-                        previous_y=None,
-                        confidence_sum=(
-                            segment.confidence
-                        ),
-                        pixel_sum=(
-                            segment.pixel_count
-                        ),
-                        road_confidence_sum=(
-                            segment.road_confidence
-                        ),
+                    used_tracks.add(
+                        best_index
                     )
-                )
 
         return tracks
 
     # =========================================================================
-    # TRACK VALIDATION
-    # =========================================================================
-
-    def _validate_track(
-        self,
-        track: _LaneTrack,
-    ) -> bool:
-
-        if (
-            len(track.points)
-            < self.min_points_per_lane
-        ):
-            return False
-
-        ys = np.asarray(
-            [
-                value[0]
-                for value in track.points
-            ],
-            dtype=np.float32,
-        )
-
-        xs = np.asarray(
-            [
-                value[1]
-                for value in track.points
-            ],
-            dtype=np.float32,
-        )
-
-        if not (
-            np.all(
-                np.isfinite(ys)
-            )
-            and np.all(
-                np.isfinite(xs)
-            )
-        ):
-            return False
-
-        vertical_span = float(
-            np.max(ys)
-            - np.min(ys)
-        )
-
-        horizontal_span = float(
-            np.max(xs)
-            - np.min(xs)
-        )
-
-        if (
-            vertical_span
-            < self.min_lane_vertical_span
-        ):
-            return False
-
-        if (
-            horizontal_span
-            < self.min_lane_span
-            and vertical_span
-            < self.min_lane_vertical_span
-        ):
-            return False
-
-        mean_confidence = (
-            track.confidence_sum
-            / max(
-                1,
-                len(track.points),
-            )
-        )
-
-        mean_road_confidence = (
-            track.road_confidence_sum
-            / max(
-                1,
-                len(track.points),
-            )
-        )
-
-        structural_confidence = (
-            0.75 * _clip01(
-                mean_confidence
-            )
-            + 0.25 * _clip01(
-                mean_road_confidence
-            )
-        )
-
-        # Não eliminar linhas legítimas apenas porque a rede
-        # classificou parcialmente sua região como estrada.
-        return (
-            structural_confidence
-            >= max(
-                0.15,
-                self.lane_threshold * 0.50,
-            )
-        )
-
-    # =========================================================================
-    # LANE CONFIDENCE
-    # =========================================================================
-
-    @staticmethod
-    def _lane_confidence(
-        lane: Sequence[LanePoint],
-    ) -> float:
-
-        if not lane:
-            return 0.0
-
-        values = [
-            _clip01(
-                point.confidence
-            )
-            for point in lane
-            if point.valid
-        ]
-
-        if not values:
-            return 0.0
-
-        confidence = float(
-            np.mean(
-                values
-            )
-        )
-
-        count_score = _clip01(
-            len(values)
-            / 24.0
-        )
-
-        ys = np.asarray(
-            [
-                point.y
-                for point in lane
-                if point.valid
-            ],
-            dtype=np.float64,
-        )
-
-        if ys.size >= 2:
-
-            span_score = _clip01(
-                (
-                    float(
-                        np.max(ys)
-                        - np.min(ys)
-                    )
-                )
-                / 400.0
-            )
-
-        else:
-            span_score = 0.0
-
-        return _clip01(
-            0.60 * confidence
-            + 0.20 * count_score
-            + 0.20 * span_score
-        )
-
-    # =========================================================================
-    # TRACK -> LANE
+    # TRACK → LANE POINTS
     # =========================================================================
 
     def _track_to_lane(
@@ -2935,50 +1718,73 @@ class YOLOPLaneDetector:
             LanePoint
         ] = []
 
-        meta = (
-            self.last_preprocess_meta
-        )
-
-        if meta is None:
-            return points
-
         for (
-            canonical_y,
-            canonical_x,
+            frame_y,
+            frame_x,
             confidence,
         ) in track.points:
 
-            frame_x, frame_y = (
-                self._map_inference_point_to_frame(
-                    canonical_x,
-                    canonical_y,
-                    frame_width,
-                    frame_height,
+            # =========================================================
+            # CRÍTICO:
+            #
+            # frame_x/frame_y JÁ estão nas coordenadas do frame
+            # original.
+            #
+            # NÃO chamar:
+            #
+            #     _map_inference_point_to_frame()
+            #
+            # novamente.
+            #
+            # Este era o bug que produzia x=1989.
+            # =========================================================
+
+            x = float(
+                np.clip(
+                    frame_x,
+                    0.0,
+                    float(
+                        frame_width - 1
+                    ),
                 )
+            )
+
+            y = float(
+                np.clip(
+                    frame_y,
+                    0.0,
+                    float(
+                        frame_height - 1
+                    ),
+                )
+            )
+
+            confidence = _clip01(
+                confidence
             )
 
             points.append(
                 LanePoint(
-                    x=frame_x,
-                    y=frame_y,
-                    confidence=_clip01(
-                        confidence
-                    ),
+                    x=x,
+                    y=y,
+                    confidence=confidence,
                     valid=True,
                 )
             )
 
         points.sort(
             key=lambda point:
-            point.y
+                point.y
         )
 
-        # Remove exact/near duplicates.
-        deduplicated: List[
+        # Remove duplicatas de Y.
+        result: List[
             LanePoint
         ] = []
 
-        last_y: Optional[float] = None
+        last_y: Optional[
+            float
+        ] = None
 
         for point in points:
 
@@ -2986,369 +1792,827 @@ class YOLOPLaneDetector:
                 last_y is not None
                 and abs(
                     point.y - last_y
-                )
-                < 0.5
+                ) < 0.5
             ):
                 continue
 
-            deduplicated.append(
+            result.append(
                 point
             )
 
             last_y = point.y
 
-        return deduplicated
+        return result
 
     # =========================================================================
-    # LANE REFERENCE
+    # LANE VALIDATION
+    # =========================================================================
+
+    @staticmethod
+    def _lane_quality(
+        lane: Sequence[LanePoint],
+        frame_width: int,
+        frame_height: int,
+    ) -> float:
+
+        if not lane:
+            return 0.0
+
+        if len(lane) < 2:
+            return 0.0
+
+        xs = np.asarray(
+            [
+                point.x
+                for point in lane
+            ],
+            dtype=np.float32,
+        )
+
+        ys = np.asarray(
+            [
+                point.y
+                for point in lane
+            ],
+            dtype=np.float32,
+        )
+
+        if not np.isfinite(xs).all():
+            return 0.0
+
+        if not np.isfinite(ys).all():
+            return 0.0
+
+        vertical_span = (
+            float(
+                ys.max()
+                - ys.min()
+            )
+        )
+
+        horizontal_span = (
+            float(
+                xs.max()
+                - xs.min()
+            )
+        )
+
+        confidence = float(
+            np.mean(
+                [
+                    point.confidence
+                    for point in lane
+                ]
+            )
+        )
+
+        vertical_score = _clip01(
+            vertical_span
+            / max(
+                1.0,
+                frame_height * 0.35,
+            )
+        )
+
+        horizontal_score = _clip01(
+            horizontal_span
+            / max(
+                1.0,
+                frame_width * 0.02,
+            )
+        )
+
+        return _clip01(
+            0.55 * confidence
+            + 0.30 * vertical_score
+            + 0.15 * horizontal_score
+        )
+
+    def _validate_lane(
+        self,
+        lane: Sequence[LanePoint],
+        frame_width: int,
+        frame_height: int,
+    ) -> bool:
+
+        if len(lane) < self.min_points_per_lane:
+            return False
+
+        xs = [
+            point.x
+            for point in lane
+        ]
+
+        ys = [
+            point.y
+            for point in lane
+        ]
+
+        if not xs or not ys:
+            return False
+
+        if not all(
+            math.isfinite(x)
+            for x in xs
+        ):
+            return False
+
+        if not all(
+            math.isfinite(y)
+            for y in ys
+        ):
+            return False
+
+        if any(
+            x < 0.0
+            or x >= frame_width
+            for x in xs
+        ):
+            return False
+
+        if any(
+            y < 0.0
+            or y >= frame_height
+            for y in ys
+        ):
+            return False
+
+        vertical_span = (
+            max(ys)
+            - min(ys)
+        )
+
+        if (
+            vertical_span
+            < DEFAULT_MIN_LANE_VERTICAL_SPAN
+        ):
+            return False
+
+        return True
+
+    # =========================================================================
+    # SORTING / CLASSIFICATION
     # =========================================================================
 
     @staticmethod
     def _lane_reference_x(
         lane: Sequence[LanePoint],
+        frame_height: int,
     ) -> float:
 
-        valid = [
-            point
-            for point in lane
-            if point.valid
-            and math.isfinite(
-                point.x
-            )
-            and math.isfinite(
-                point.y
-            )
-        ]
-
-        if not valid:
+        if not lane:
             return float(
-                "inf"
+                "nan"
             )
 
-        valid.sort(
+        target_y = (
+            frame_height
+            * 0.82
+        )
+
+        return min(
+            lane,
             key=lambda point:
-            point.y,
-            reverse=True,
-        )
+                abs(
+                    point.y
+                    - target_y
+                ),
+        ).x
 
-        sample = valid[
-            : min(
-                DEFAULT_SAMPLE_BOTTOM_ROWS,
-                len(valid),
-            )
-        ]
-
-        return float(
-            np.mean(
-                [
-                    point.x
-                    for point in sample
-                ]
-            )
-        )
-
-    # =========================================================================
-    # PRIMARY LEFT / RIGHT
-    # =========================================================================
-
-    def _classify_primary_lanes(
+    def _sort_lanes(
         self,
-        lanes: List[List[LanePoint]],
-        frame_width: int,
-    ) -> Tuple[
-        List[LanePoint],
-        List[LanePoint],
-        List[List[LanePoint]],
-    ]:
-
-        if not lanes:
-            return (
-                [],
-                [],
-                [],
-            )
-
-        center_x = (
-            float(frame_width)
-            * 0.5
-        )
-
-        ordered = sorted(
-            lanes,
-            key=self._lane_reference_x,
-        )
-
-        left_candidates = [
-            lane
-            for lane in ordered
-            if self._lane_reference_x(lane)
-            < center_x
-        ]
-
-        right_candidates = [
-            lane
-            for lane in ordered
-            if self._lane_reference_x(lane)
-            >= center_x
-        ]
-
-        left_lane: List[
-            LanePoint
-        ] = []
-
-        right_lane: List[
-            LanePoint
-        ] = []
-
-        if left_candidates:
-
-            left_lane = max(
-                left_candidates,
-                key=self._lane_reference_x,
-            )
-
-        if right_candidates:
-
-            right_lane = min(
-                right_candidates,
-                key=self._lane_reference_x,
-            )
-
-        primary_ids = {
-            id(left_lane)
-            if left_lane
-            else None,
-            id(right_lane)
-            if right_lane
-            else None,
-        }
-
-        additional = [
-            lane
-            for lane in ordered
-            if id(lane)
-            not in primary_ids
-        ]
-
-        return (
-            left_lane,
-            right_lane,
-            additional,
-        )
-
-    # =========================================================================
-    # DRIVABLE AREA CONFIDENCE
-    # =========================================================================
-
-    def _calculate_lane_confidence_adjustment(
-        self,
-        lane: Sequence[LanePoint],
-        drivable_mask: Optional[np.ndarray],
-    ) -> float:
-
-        if (
-            not lane
-            or drivable_mask is None
-        ):
-            return 1.0
-
-        height, width = (
-            drivable_mask.shape
-        )
-
-        values: List[
-            float
-        ] = []
-
-        for point in lane:
-
-            xi = int(
-                np.clip(
-                    round(point.x),
-                    0,
-                    width - 1,
-                )
-            )
-
-            yi = int(
-                np.clip(
-                    round(point.y),
-                    0,
-                    height - 1,
-                )
-            )
-
-            values.append(
-                float(
-                    drivable_mask[
-                        yi,
-                        xi,
-                    ]
-                )
-            )
-
-        if not values:
-            return 1.0
-
-        road_ratio = float(
-            np.mean(
-                values
-            )
-        )
-
-        # Apenas como ajuste suave, nunca como veto absoluto.
-        return _clip01(
-            1.0
-            + (
-                road_ratio
-                - 0.5
-            )
-            * 2.0
-            * DEFAULT_DRIVABLE_CONFIDENCE_BONUS
-        )
-
-    # =========================================================================
-    # RESULT
-    # =========================================================================
-
-    def _build_result(
-        self,
-        lanes: List[List[LanePoint]],
-        objects: List[ObjectDetection],
-        drivable_mask: Optional[np.ndarray],
+        lanes: List[
+            List[LanePoint]
+        ],
         frame_width: int,
         frame_height: int,
-    ) -> LaneDetectionResult:
+    ) -> List[
+        List[LanePoint]
+    ]:
 
-        valid_lanes: List[
-            List[LanePoint]
-        ] = []
+        return sorted(
+            lanes,
+            key=lambda lane:
+                self._lane_reference_x(
+                    lane,
+                    frame_height,
+                )
+        )
 
-        for lane in lanes:
+    # =========================================================================
+    # OBJECT DETECTION
+    # =========================================================================
 
-            points = [
-                point
-                for point in lane
-                if point.valid
-                and point.is_finite()
+    @staticmethod
+    def _box_iou(
+        box: np.ndarray,
+        boxes: np.ndarray,
+    ) -> np.ndarray:
+
+        x1 = np.maximum(
+            box[0],
+            boxes[:, 0],
+        )
+
+        y1 = np.maximum(
+            box[1],
+            boxes[:, 1],
+        )
+
+        x2 = np.minimum(
+            box[2],
+            boxes[:, 2],
+        )
+
+        y2 = np.minimum(
+            box[3],
+            boxes[:, 3],
+        )
+
+        intersection = (
+            np.maximum(
+                0.0,
+                x2 - x1,
+            )
+            * np.maximum(
+                0.0,
+                y2 - y1,
+            )
+        )
+
+        area_a = (
+            max(
+                0.0,
+                box[2] - box[0],
+            )
+            * max(
+                0.0,
+                box[3] - box[1],
+            )
+        )
+
+        area_b = (
+            np.maximum(
+                0.0,
+                boxes[:, 2]
+                - boxes[:, 0],
+            )
+            * np.maximum(
+                0.0,
+                boxes[:, 3]
+                - boxes[:, 1],
+            )
+        )
+
+        union = (
+            area_a
+            + area_b
+            - intersection
+        )
+
+        return intersection / np.maximum(
+            union,
+            1e-8,
+        )
+
+    @classmethod
+    def _nms(
+        cls,
+        boxes: np.ndarray,
+        scores: np.ndarray,
+        iou_threshold: float,
+    ) -> List[int]:
+
+        if boxes.size == 0:
+            return []
+
+        order = np.argsort(
+            scores
+        )[::-1]
+
+        keep: List[int] = []
+
+        while order.size > 0:
+
+            index = int(
+                order[0]
+            )
+
+            keep.append(
+                index
+            )
+
+            if order.size == 1:
+                break
+
+            ious = cls._box_iou(
+                boxes[index],
+                boxes[
+                    order[1:]
+                ],
+            )
+
+            order = order[
+                1:
+            ][
+                ious
+                <= iou_threshold
             ]
 
+        return keep
+
+    def _extract_objects(
+        self,
+        outputs: Any,
+        frame_width: int,
+        frame_height: int,
+    ) -> List[
+        ObjectDetection
+    ]:
+
+        """
+        Extrator tolerante da cabeça de detecção.
+
+        O YOLOPv2 pode retornar a cabeça de detecção
+        em estruturas TorchScript diferentes conforme
+        a versão do checkpoint.
+
+        Se o formato não for reconhecido, retornamos
+        [] sem comprometer a percepção de lanes.
+        """
+
+        tensors = _flatten_tensors(
+            outputs
+        )
+
+        candidates = []
+
+        for tensor in tensors:
+
+            if tensor.ndim == 3:
+
+                shape = tensor.shape
+
+                # Formatos comuns:
+                #
+                # [B,N,85]
+                # [B,85,N]
+
+                if (
+                    shape[-1] >= 6
+                    and shape[-1] <= 100
+                ):
+                    candidates.append(
+                        tensor
+                    )
+
+                elif (
+                    shape[1] >= 6
+                    and shape[1] <= 100
+                ):
+                    candidates.append(
+                        tensor
+                    )
+
+        if not candidates:
+            return []
+
+        # Escolhemos o tensor com maior número
+        # de candidatos e formato mais plausível.
+        tensor = max(
+            candidates,
+            key=lambda item:
+                int(item.numel())
+        )
+
+        array = (
+            tensor.detach()
+            .float()
+            .cpu()
+            .numpy()
+        )
+
+        if array.ndim != 3:
+            return []
+
+        array = array[0]
+
+        # -------------------------------------------------------------
+        # Normalização para [N, attributes].
+        # -------------------------------------------------------------
+
+        if (
+            array.shape[0] >= 6
+            and array.shape[0] <= 100
+            and array.shape[1] > array.shape[0]
+        ):
+            array = array.T
+
+        if array.shape[1] < 6:
+            return []
+
+        # -------------------------------------------------------------
+        # Contrato:
+        #
+        # cx cy w h obj cls...
+        # -------------------------------------------------------------
+
+        boxes = array[:, :4]
+        objectness = array[:, 4]
+
+        if array.shape[1] >= 7:
+            class_scores = array[:, 5:]
+
+            class_ids = np.argmax(
+                class_scores,
+                axis=1,
+            )
+
+            class_confidence = np.max(
+                class_scores,
+                axis=1,
+            )
+
+            confidence = (
+                objectness
+                * class_confidence
+            )
+
+        else:
+            class_ids = np.zeros(
+                len(array),
+                dtype=np.int32,
+            )
+
+            confidence = objectness
+
+        valid = (
+            np.isfinite(
+                boxes
+            ).all(axis=1)
+            & np.isfinite(
+                confidence
+            )
+            & (
+                confidence
+                >= DEFAULT_OBJECT_CONFIDENCE
+            )
+        )
+
+        if not np.any(valid):
+            return []
+
+        boxes = boxes[
+            valid
+        ]
+
+        confidence = confidence[
+            valid
+        ]
+
+        class_ids = class_ids[
+            valid
+        ]
+
+        # -------------------------------------------------------------
+        # Detectar se as caixas estão normalizadas.
+        # -------------------------------------------------------------
+
+        if np.max(
+            np.abs(boxes)
+        ) <= 2.0:
+
+            boxes[:, 0] *= (
+                self.input_width
+            )
+
+            boxes[:, 2] *= (
+                self.input_width
+            )
+
+            boxes[:, 1] *= (
+                self.input_height
+            )
+
+            boxes[:, 3] *= (
+                self.input_height
+            )
+
+        cx = boxes[:, 0]
+        cy = boxes[:, 1]
+        width = boxes[:, 2]
+        height = boxes[:, 3]
+
+        x1 = cx - width * 0.5
+        y1 = cy - height * 0.5
+        x2 = cx + width * 0.5
+        y2 = cy + height * 0.5
+
+        # Map model input -> frame.
+        x_scale = (
+            frame_width
+            / float(self.input_width)
+        )
+
+        y_scale = (
+            frame_height
+            / float(self.input_height)
+        )
+
+        x1 *= x_scale
+        x2 *= x_scale
+        y1 *= y_scale
+        y2 *= y_scale
+
+        x1 = np.clip(
+            x1,
+            0.0,
+            frame_width - 1,
+        )
+
+        x2 = np.clip(
+            x2,
+            0.0,
+            frame_width - 1,
+        )
+
+        y1 = np.clip(
+            y1,
+            0.0,
+            frame_height - 1,
+        )
+
+        y2 = np.clip(
+            y2,
+            0.0,
+            frame_height - 1,
+        )
+
+        final_boxes = np.column_stack(
+            (
+                x1,
+                y1,
+                x2,
+                y2,
+            )
+        )
+
+        keep = self._nms(
+            final_boxes,
+            confidence,
+            DEFAULT_OBJECT_IOU,
+        )
+
+        objects: List[
+            ObjectDetection
+        ] = []
+
+        for index in keep:
+
             if (
-                len(points)
-                < self.min_points_per_lane
+                final_boxes[index, 2]
+                <= final_boxes[index, 0]
+                or final_boxes[index, 3]
+                <= final_boxes[index, 1]
             ):
                 continue
 
-            points.sort(
-                key=lambda point:
-                point.y
-            )
-
-            adjustment = (
-                self._calculate_lane_confidence_adjustment(
-                    points,
-                    drivable_mask,
+            objects.append(
+                ObjectDetection(
+                    class_id=int(
+                        class_ids[index]
+                    ),
+                    confidence=_clip01(
+                        confidence[index]
+                    ),
+                    x1=float(
+                        final_boxes[
+                            index,
+                            0,
+                        ]
+                    ),
+                    y1=float(
+                        final_boxes[
+                            index,
+                            1,
+                        ]
+                    ),
+                    x2=float(
+                        final_boxes[
+                            index,
+                            2,
+                        ]
+                    ),
+                    y2=float(
+                        final_boxes[
+                            index,
+                            3,
+                        ]
+                    ),
+                    frame_width=frame_width,
+                    frame_height=frame_height,
                 )
             )
 
-            if adjustment != 1.0:
+        return objects
 
-                adjusted_points: List[
-                    LanePoint
-                ] = []
+    # =========================================================================
+    # LANE RESULT
+    # =========================================================================
 
-                for point in points:
+    def _build_lane_result(
+        self,
+        lanes: List[
+            List[LanePoint]
+        ],
+        frame_width: int,
+        frame_height: int,
+        objects: List[
+            ObjectDetection
+        ],
+        drivable_mask: Optional[
+            np.ndarray
+        ],
+        output_shapes: List[
+            Tuple[int, ...]
+        ],
+        inference_ms: float,
+    ) -> LaneDetectionResult:
 
-                    adjusted_confidence = (
-                        _clip01(
-                            point.confidence
-                            * adjustment
-                        )
-                    )
-
-                    adjusted_points.append(
-                        LanePoint(
-                            x=point.x,
-                            y=point.y,
-                            confidence=(
-                                adjusted_confidence
-                            ),
-                            valid=True,
-                        )
-                    )
-
-                points = adjusted_points
-
-            valid_lanes.append(
-                points
-            )
-
-        valid_lanes.sort(
-            key=self._lane_reference_x
-        )
-
-        (
-            left_lane,
-            right_lane,
-            additional_lanes,
-        ) = self._classify_primary_lanes(
-            valid_lanes,
+        lanes = self._sort_lanes(
+            lanes,
             frame_width,
+            frame_height,
         )
 
         confidences = [
-            self._lane_confidence(
-                lane
+            _clip01(
+                self._lane_quality(
+                    lane,
+                    frame_width,
+                    frame_height,
+                )
             )
-            for lane in valid_lanes
+            for lane in lanes
         ]
 
-        left_confidence = (
-            self._lane_confidence(
-                left_lane
+        valid_pairs = [
+            (
+                lane,
+                confidence,
             )
-            if left_lane
+            for lane, confidence
+            in zip(
+                lanes,
+                confidences,
+            )
+            if self._validate_lane(
+                lane,
+                frame_width,
+                frame_height,
+            )
+        ]
+
+        lanes = [
+            lane
+            for lane, _
+            in valid_pairs
+        ]
+
+        confidences = [
+            confidence
+            for _, confidence
+            in valid_pairs
+        ]
+
+        center = (
+            frame_width
+            * 0.5
+        )
+
+        left_candidates = []
+        right_candidates = []
+
+        for index, lane in enumerate(
+            lanes
+        ):
+
+            reference_x = (
+                self._lane_reference_x(
+                    lane,
+                    frame_height,
+                )
+            )
+
+            if not math.isfinite(
+                reference_x
+            ):
+                continue
+
+            if reference_x < center:
+                left_candidates.append(
+                    index
+                )
+            else:
+                right_candidates.append(
+                    index
+                )
+
+        left_index = None
+        right_index = None
+
+        if left_candidates:
+            left_index = max(
+                left_candidates,
+                key=lambda index:
+                    self._lane_reference_x(
+                        lanes[index],
+                        frame_height,
+                    )
+            )
+
+        if right_candidates:
+            right_index = min(
+                right_candidates,
+                key=lambda index:
+                    self._lane_reference_x(
+                        lanes[index],
+                        frame_height,
+                    )
+            )
+
+        left_lane = (
+            lanes[left_index]
+            if left_index is not None
+            else []
+        )
+
+        right_lane = (
+            lanes[right_index]
+            if right_index is not None
+            else []
+        )
+
+        left_confidence = (
+            confidences[left_index]
+            if left_index is not None
             else 0.0
         )
 
         right_confidence = (
-            self._lane_confidence(
-                right_lane
-            )
-            if right_lane
+            confidences[right_index]
+            if right_index is not None
             else 0.0
         )
 
-        # ---------------------------------------------------------------------
-        # Confiança global da percepção.
-        # ---------------------------------------------------------------------
+        used = {
+            index
+            for index in (
+                left_index,
+                right_index,
+            )
+            if index is not None
+        }
 
-        if confidences:
+        additional_lanes = [
+            lane
+            for index, lane
+            in enumerate(lanes)
+            if index not in used
+        ]
 
-            mean_lane_confidence = float(
-                np.mean(
-                    confidences
+        valid = bool(
+            lanes
+        )
+
+        lane_pixels = 0
+
+        if drivable_mask is not None:
+            lane_pixels = int(
+                np.count_nonzero(
+                    drivable_mask
                 )
             )
 
-            lane_count_score = _clip01(
-                len(confidences)
-                / 4.0
-            )
-
-            perception_confidence = (
-                0.75
-                * mean_lane_confidence
-                + 0.25
-                * lane_count_score
-            )
-
-        else:
-
-            perception_confidence = 0.0
+        metadata = {
+            "device": self.get_device_name(),
+            "fp16": self.fp16_active,
+            "inference_ms": inference_ms,
+            "model_output_shapes": output_shapes,
+            "lane_count": len(lanes),
+            "vehicle_count": sum(
+                obj.is_vehicle
+                for obj in objects
+            ),
+            "object_count": len(objects),
+            "drivable_pixels": lane_pixels,
+            "coordinate_system": (
+                "original_frame"
+            ),
+        }
 
         return LaneDetectionResult(
-            lanes=valid_lanes,
+            lanes=lanes,
             lane_confidences=confidences,
             current_lane_index=None,
             left_lane=left_lane,
@@ -3356,133 +2620,20 @@ class YOLOPLaneDetector:
             additional_lanes=additional_lanes,
             left_confidence=left_confidence,
             right_confidence=right_confidence,
-            valid=bool(valid_lanes),
-            num_lanes_detected=len(
-                valid_lanes
-            ),
-            input_width=int(
-                frame_width
-            ),
-            input_height=int(
-                frame_height
-            ),
+            valid=valid,
+            num_lanes_detected=len(lanes),
+            input_width=frame_width,
+            input_height=frame_height,
             model_output_shape=(
-                self.last_output_shapes[-1]
-                if self.last_output_shapes
+                output_shapes[-1]
+                if output_shapes
                 else tuple()
             ),
             error=None,
             objects=objects,
             drivable_area_mask=drivable_mask,
-            metadata={
-                "device": self.get_device_name(),
-                "fp16": self.fp16_active,
-                "lane_count": len(
-                    valid_lanes
-                ),
-                "lane_confidence": (
-                    perception_confidence
-                ),
-                "vehicle_count": len(
-                    [
-                        obj
-                        for obj in objects
-                        if obj.is_vehicle
-                    ]
-                ),
-                "object_count": len(
-                    objects
-                ),
-            },
+            metadata=metadata,
         )
-
-    # =========================================================================
-    # DIAGNOSTICS
-    # =========================================================================
-
-    def _update_diagnostics(
-        self,
-        probability: np.ndarray,
-        lane_mask: np.ndarray,
-        drivable_mask: Optional[np.ndarray],
-        rows: List[List[_RowSegment]],
-        tracks: List[_LaneTrack],
-        result: LaneDetectionResult,
-        inference_ms: float,
-    ) -> None:
-
-        active_pixels = int(
-            np.count_nonzero(
-                lane_mask
-            )
-        )
-
-        road_pixels = (
-            int(
-                np.count_nonzero(
-                    drivable_mask
-                )
-            )
-            if drivable_mask is not None
-            else 0
-        )
-
-        self.last_diagnostics = {
-            "device": self.get_device_name(),
-            "fp16": self.fp16_active,
-            "inference_ms": float(
-                inference_ms
-            ),
-            "probability_shape": tuple(
-                int(v)
-                for v in probability.shape
-            ),
-            "lane_mask_shape": tuple(
-                int(v)
-                for v
-                in lane_mask.shape
-            ),
-            "drivable_mask_shape": (
-                tuple(
-                    int(v)
-                    for v
-                    in drivable_mask.shape
-                )
-                if drivable_mask is not None
-                else None
-            ),
-            "active_lane_pixels": active_pixels,
-            "active_lane_pixel_ratio": (
-                active_pixels
-                / max(
-                    1,
-                    lane_mask.size,
-                )
-            ),
-            "drivable_pixels": road_pixels,
-            "row_count": len(
-                rows
-            ),
-            "segment_count": sum(
-                len(row)
-                for row in rows
-            ),
-            "raw_tracks": len(
-                tracks
-            ),
-            "valid_lanes": (
-                result.num_lanes_detected
-            ),
-            "vehicle_count": (
-                result.vehicle_count
-            ),
-            "object_count": (
-                result.object_count
-            ),
-            "model_output_shapes": list(
-                self.last_output_shapes
-            ),
-        }
 
     # =========================================================================
     # DETECT
@@ -3492,149 +2643,181 @@ class YOLOPLaneDetector:
         self,
         frame: np.ndarray,
     ) -> LaneDetectionResult:
-        """
-        Pipeline completo de uma imagem/frame.
 
-        Falha em objeto não derruba lanes.
-        Falha em drivable area não derruba lanes.
-        Falha geral do modelo gera resultado inválido.
-        """
+        start = time.perf_counter()
 
         self.last_error = None
         self.last_diagnostics = {}
 
-        try:
+        if (
+            not isinstance(
+                frame,
+                np.ndarray,
+            )
+            or frame.ndim != 3
+            or frame.shape[2] != 3
+        ):
 
-            frame_width, frame_height = (
-                self._validate_frame(
-                    frame
-                )
+            result = LaneDetectionResult(
+                valid=False,
+                error=(
+                    "Frame inválido. "
+                    "Esperado ndarray HxWx3."
+                ),
             )
 
-            start = time.perf_counter()
+            self.last_result = result
+            return result
 
-            (
-                prediction_output,
-                drivable_output,
-                lane_output,
-            ) = self.infer(
+        frame_height, frame_width = (
+            frame.shape[:2]
+        )
+
+        try:
+
+            outputs = self.infer(
                 frame
             )
 
-            inference_ms = (
-                time.perf_counter()
-                - start
-            ) * 1000.0
+            output_shapes = (
+                self.last_output_shapes
+            )
 
-            # -----------------------------------------------------------------
-            # Lane segmentation
-            # -----------------------------------------------------------------
+            tensors = _flatten_tensors(
+                outputs
+            )
 
-            canonical_lane_probability = (
-                self._decode_lane_output(
-                    lane_output
+            # ---------------------------------------------------------
+            # Segmentation.
+            #
+            # O detector identifica os tensors de segmentação
+            # por sua estrutura [N,2,H,W].
+            # ---------------------------------------------------------
+
+            lane_tensor = (
+                self._find_lane_segmentation(
+                    outputs
                 )
             )
 
-            canonical_lane_mask = (
-                canonical_lane_probability
-                >= self.lane_threshold
-            ).astype(
-                np.uint8
-            )
-
-            canonical_lane_mask = (
-                self._clean_mask(
-                    canonical_lane_mask
+            drivable_tensor = (
+                self._find_drivable_segmentation(
+                    outputs
                 )
             )
 
-            # -----------------------------------------------------------------
-            # Drivable segmentation
-            # -----------------------------------------------------------------
-
-            try:
-
-                canonical_drivable = (
-                    self._decode_drivable_output(
-                        drivable_output
-                    )
+            if lane_tensor is None:
+                raise RuntimeError(
+                    "Saída de lane segmentation "
+                    "não encontrada no YOLOPv2."
                 )
 
-                drivable_frame = (
-                    self._map_canonical_mask_to_frame(
-                        canonical_drivable,
-                        frame_width,
-                        frame_height,
-                    )
+            lane_seg = (
+                self._tensor_to_numpy(
+                    lane_tensor
                 )
+            )
 
-            except Exception as exc:
-
-                drivable_frame = None
-
-                self.last_diagnostics[
-                    "drivable_error"
-                ] = (
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
+            lane_probability_model = (
+                self._segmentation_probability(
+                    lane_seg
                 )
+            )
 
-            # -----------------------------------------------------------------
-            # Convert lane segmentation to actual frame coordinates.
-            # -----------------------------------------------------------------
+            # ---------------------------------------------------------
+            # A máscara é convertida diretamente para o frame original.
+            # ---------------------------------------------------------
 
             lane_probability = (
-                self._map_canonical_mask_to_frame(
-                    canonical_lane_probability,
+                self._resize_probability_to_frame(
+                    lane_probability_model,
                     frame_width,
                     frame_height,
-                )
-                .astype(
-                    np.float32,
-                    copy=False,
                 )
             )
 
             lane_mask = (
-                self._map_canonical_mask_to_frame(
-                    canonical_lane_mask,
-                    frame_width,
-                    frame_height,
+                self._build_lane_mask(
+                    lane_probability
                 )
             )
 
-            lane_mask = self._clean_mask(
-                lane_mask
-            )
+            # ---------------------------------------------------------
+            # Drivable area.
+            #
+            # Em modelos onde o primeiro tensor [1,2,H,W] encontrado
+            # também corresponde à lane segmentation, o uso da
+            # mesma estrutura como drivable é deliberadamente
+            # conservador: a área dirigível é apenas evidência
+            # auxiliar e nunca substitui a lane segmentation.
+            # ---------------------------------------------------------
 
-            self.last_lane_probability = (
-                lane_probability
-            )
+            drivable_probability = None
+            drivable_mask = None
 
-            self.last_lane_mask = (
-                lane_mask
-            )
+            if (
+                drivable_tensor is not None
+                and drivable_tensor
+                is not lane_tensor
+            ):
 
-            self.last_drivable_mask = (
-                drivable_frame
-            )
+                drivable_seg = (
+                    self._tensor_to_numpy(
+                        drivable_tensor
+                    )
+                )
 
-            # -----------------------------------------------------------------
-            # Extract row segments.
-            # -----------------------------------------------------------------
+                try:
+                    drivable_probability_model = (
+                        self._segmentation_probability(
+                            drivable_seg
+                        )
+                    )
 
-            rows = (
+                    drivable_probability = (
+                        self._resize_probability_to_frame(
+                            drivable_probability_model,
+                            frame_width,
+                            frame_height,
+                        )
+                    )
+
+                    drivable_mask = (
+                        self._build_drivable_mask(
+                            drivable_probability
+                        )
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "[YOLOPv2] Falha na "
+                        "drivable segmentation."
+                    )
+
+            # ---------------------------------------------------------
+            # Segmentação → segmentos.
+            #
+            # ATENÇÃO:
+            #
+            # lane_probability e lane_mask já possuem:
+            #
+            #     frame_height x frame_width
+            #
+            # Portanto x/y abaixo são coordenadas do frame.
+            # ---------------------------------------------------------
+
+            segments = (
                 self._extract_row_segments(
-                    lane_probability,
                     lane_mask,
-                    drivable_frame,
+                    lane_probability,
+                    drivable_probability,
                 )
             )
 
-            tracks = (
+            raw_tracks = (
                 self._associate_segments(
-                    rows
+                    segments,
+                    frame_width,
                 )
             )
 
@@ -3642,63 +2825,157 @@ class YOLOPLaneDetector:
                 List[LanePoint]
             ] = []
 
-            for track in tracks:
+            for track in raw_tracks:
 
-                if not self._validate_track(
-                    track
-                ):
-                    continue
-
-                lane = (
-                    self._track_to_lane(
-                        track,
-                        frame_width,
-                        frame_height,
-                    )
-                )
-
-                if (
-                    len(lane)
-                    >= self.min_points_per_lane
-                ):
-                    lanes.append(
-                        lane
-                    )
-
-            # -----------------------------------------------------------------
-            # Objects.
-            # -----------------------------------------------------------------
-
-            objects = (
-                self._decode_objects(
-                    prediction_output,
+                lane = self._track_to_lane(
+                    track,
                     frame_width,
                     frame_height,
                 )
+
+                if not self._validate_lane(
+                    lane,
+                    frame_width,
+                    frame_height,
+                ):
+                    continue
+
+                lanes.append(
+                    lane
+                )
+
+                if len(lanes) >= self.max_lanes:
+                    break
+
+            # ---------------------------------------------------------
+            # Objetos.
+            # ---------------------------------------------------------
+
+            objects = self._extract_objects(
+                outputs,
+                frame_width,
+                frame_height,
             )
 
-            # -----------------------------------------------------------------
-            # Public result.
-            # -----------------------------------------------------------------
+            # ---------------------------------------------------------
+            # Resultado.
+            # ---------------------------------------------------------
 
-            result = (
-                self._build_result(
-                    lanes=lanes,
-                    objects=objects,
-                    drivable_mask=drivable_frame,
-                    frame_width=frame_width,
-                    frame_height=frame_height,
+            inference_ms = float(
+                self.last_diagnostics.get(
+                    "inference_ms",
+                    0.0,
                 )
             )
 
-            self._update_diagnostics(
-                probability=lane_probability,
-                lane_mask=lane_mask,
-                drivable_mask=drivable_frame,
-                rows=rows,
-                tracks=tracks,
-                result=result,
+            result = self._build_lane_result(
+                lanes=lanes,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                objects=objects,
+                drivable_mask=drivable_mask,
+                output_shapes=output_shapes,
                 inference_ms=inference_ms,
+            )
+
+            # ---------------------------------------------------------
+            # Diagnóstico detalhado.
+            # ---------------------------------------------------------
+
+            active_lane_pixels = int(
+                np.count_nonzero(
+                    lane_mask
+                )
+            )
+
+            active_lane_ratio = (
+                active_lane_pixels
+                / float(
+                    frame_width
+                    * frame_height
+                )
+            )
+
+            self.last_diagnostics.update(
+                {
+                    "device": self.get_device_name(),
+                    "fp16": self.fp16_active,
+                    "inference_ms": inference_ms,
+                    "probability_shape": tuple(
+                        lane_probability.shape
+                    ),
+                    "lane_mask_shape": tuple(
+                        lane_mask.shape
+                    ),
+                    "drivable_mask_shape": (
+                        tuple(
+                            drivable_mask.shape
+                        )
+                        if drivable_mask
+                        is not None
+                        else None
+                    ),
+                    "active_lane_pixels": (
+                        active_lane_pixels
+                    ),
+                    "active_lane_pixel_ratio": (
+                        active_lane_ratio
+                    ),
+                    "drivable_pixels": (
+                        int(
+                            np.count_nonzero(
+                                drivable_mask
+                            )
+                        )
+                        if drivable_mask
+                        is not None
+                        else 0
+                    ),
+                    "row_count": (
+                        len(
+                            set(
+                                segment.y
+                                for segment
+                                in segments
+                            )
+                        )
+                    ),
+                    "segment_count": len(
+                        segments
+                    ),
+                    "raw_tracks": len(
+                        raw_tracks
+                    ),
+                    "valid_lanes": len(
+                        lanes
+                    ),
+                    "vehicle_count": sum(
+                        obj.is_vehicle
+                        for obj in objects
+                    ),
+                    "object_count": len(
+                        objects
+                    ),
+                    "model_output_shapes": (
+                        output_shapes
+                    ),
+                    "frame_width": (
+                        frame_width
+                    ),
+                    "frame_height": (
+                        frame_height
+                    ),
+                    "coordinate_system": (
+                        "original_frame"
+                    ),
+                    "total_ms": (
+                        (
+                            time.perf_counter()
+                            - start
+                        )
+                        * 1000.0
+                    ),
+                }
             )
 
             result.metadata.update(
@@ -3720,26 +2997,6 @@ class YOLOPLaneDetector:
                 "[YOLOPv2] Falha durante detecção."
             )
 
-            width = (
-                int(frame.shape[1])
-                if isinstance(
-                    frame,
-                    np.ndarray,
-                )
-                and frame.ndim >= 2
-                else self.input_width
-            )
-
-            height = (
-                int(frame.shape[0])
-                if isinstance(
-                    frame,
-                    np.ndarray,
-                )
-                and frame.ndim >= 2
-                else self.input_height
-            )
-
             result = LaneDetectionResult(
                 lanes=[],
                 lane_confidences=[],
@@ -3751,8 +3008,8 @@ class YOLOPLaneDetector:
                 right_confidence=0.0,
                 valid=False,
                 num_lanes_detected=0,
-                input_width=width,
-                input_height=height,
+                input_width=frame_width,
+                input_height=frame_height,
                 model_output_shape=(
                     self.last_output_shapes[-1]
                     if self.last_output_shapes
@@ -3763,7 +3020,18 @@ class YOLOPLaneDetector:
                 drivable_area_mask=None,
                 metadata={
                     "device": self.get_device_name(),
+                    "fp16": self.fp16_active,
                     "fatal_error": self.last_error,
+                    "model_output_shapes": (
+                        self.last_output_shapes
+                    ),
+                    "total_ms": (
+                        (
+                            time.perf_counter()
+                            - start
+                        )
+                        * 1000.0
+                    ),
                 },
             )
 
@@ -3772,7 +3040,7 @@ class YOLOPLaneDetector:
             return result
 
     # =========================================================================
-    # IMAGE UTILITY
+    # IMAGE UTILITIES
     # =========================================================================
 
     @staticmethod
@@ -3799,7 +3067,8 @@ class YOLOPLaneDetector:
 
         if image is None:
             raise RuntimeError(
-                f"Não foi possível carregar imagem: {path}"
+                f"Não foi possível carregar "
+                f"imagem: {path}"
             )
 
         return image
@@ -3839,7 +3108,7 @@ class YOLOPLaneDetector:
 
 
 # =============================================================================
-# PUBLIC COMPATIBILITY NAME
+# PUBLIC COMPATIBILITY
 # =============================================================================
 
 YOLOPDetector = YOLOPLaneDetector
@@ -3848,7 +3117,6 @@ YOLOPDetector = YOLOPLaneDetector
 # =============================================================================
 # FACTORY
 # =============================================================================
-
 
 def create_default_detector(
     model_path: str | Path = DEFAULT_MODEL_PATH,
@@ -3873,4 +3141,3 @@ __all__ = [
     "YOLOPLaneDetector",
     "create_default_detector",
 ]
-
