@@ -3,7 +3,7 @@ vision/lane_tracker.py
 
 Rastreamento temporal das linhas de faixa.
 
-Fluxo:
+Pipeline:
 
     YOLOP
       ↓
@@ -24,7 +24,8 @@ Responsabilidades:
     - controlar perda e recuperação;
     - calcular estabilidade temporal;
     - suavizar confiança;
-    - preservar LaneLine como representação da observação.
+    - preservar LaneLine como representação da observação;
+    - aceitar metadados do frame sem alterar a representação da lane.
 
 Este módulo NÃO:
 
@@ -35,13 +36,11 @@ Este módulo NÃO:
     - calcula posição do veículo;
     - decide atuação ADAS.
 
-Compatível com o contrato atual de:
+Compatível com:
 
     vision/lane_types.py
-
-e com:
-
     vision/yolop_detector.py
+    main.py
 """
 
 from __future__ import annotations
@@ -53,10 +52,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .lane_types import (
-    LaneLine,
-    LanePoint,
-)
+from .lane_types import LaneLine, LanePoint
 
 
 # =============================================================================
@@ -83,28 +79,19 @@ DEFAULT_STABILITY_ALPHA = 0.35
 class TrackedLane:
     """
     Estado temporal de uma LaneLine.
-
-    O tracker mantém a observação original em `line`.
-
-    Nenhum LaneModel é criado aqui.
     """
 
     track_id: int
 
     line: LaneLine = field(
-        default_factory=lambda: LaneLine(
-            lane_id=0
-        )
+        default_factory=lambda: LaneLine(lane_id=0)
     )
 
     confidence: float = 0.0
-
     stability: float = 0.0
 
     age: int = 0
-
     missed_frames: int = 0
-
     stable_frames: int = 0
 
     detected_this_frame: bool = False
@@ -112,12 +99,9 @@ class TrackedLane:
     last_timestamp: float = 0.0
 
     previous_center_x: Optional[float] = None
-
     current_center_x: Optional[float] = None
 
-    history: List[LaneLine] = field(
-        default_factory=list
-    )
+    history: List[LaneLine] = field(default_factory=list)
 
     @property
     def points(self) -> List[LanePoint]:
@@ -163,6 +147,11 @@ class TrackedLane:
         )
 
 
+# =============================================================================
+# RESULTADO
+# =============================================================================
+
+
 @dataclass(frozen=True)
 class LaneTrackingResult:
     """
@@ -172,21 +161,19 @@ class LaneTrackingResult:
     lanes: Tuple[TrackedLane, ...]
 
     timestamp: float
-
     frame_index: int
 
     valid: bool
 
     stable_count: int
-
     detected_count: int
-
     lost_count: int
 
     @property
     def active_lanes(
         self,
     ) -> Tuple[TrackedLane, ...]:
+
         return tuple(
             lane
             for lane in self.lanes
@@ -197,6 +184,7 @@ class LaneTrackingResult:
     def stable_lanes(
         self,
     ) -> Tuple[TrackedLane, ...]:
+
         return tuple(
             lane
             for lane in self.lanes
@@ -211,17 +199,26 @@ class LaneTrackingResult:
 
 class LaneTracker:
     """
-    Rastreador temporal das LaneLine.
+    Rastreador temporal de LaneLine.
 
-    A associação utiliza principalmente:
+    A associação utiliza:
 
         - posição horizontal inferior;
         - posição vertical;
         - extensão da lane;
         - distância ao track anterior.
 
-    O objetivo é preservar a identidade de uma mesma
-    marcação enquanto ela aparece em frames consecutivos.
+    O tracker mantém a identidade temporal das linhas
+    detectadas pelo YOLOP.
+
+    Compatibilidade adicional:
+
+        - frame_width;
+        - frame_height;
+        - min_fit_points.
+
+    Esses parâmetros são aceitos porque o pipeline principal
+    pode fornecê-los. Eles não alteram a geometria da lane.
     """
 
     def __init__(
@@ -229,6 +226,7 @@ class LaneTracker:
         max_lanes: int = DEFAULT_MAX_LANES,
         history_size: int = DEFAULT_HISTORY_SIZE,
         min_points: int = DEFAULT_MIN_POINTS,
+        min_fit_points: Optional[int] = None,
         match_distance: float = DEFAULT_MATCH_DISTANCE,
         max_missed_frames: int = DEFAULT_MAX_MISSED_FRAMES,
         min_stable_frames: int = DEFAULT_MIN_STABLE_FRAMES,
@@ -247,10 +245,22 @@ class LaneTracker:
             int(history_size),
         )
 
+        # ---------------------------------------------------------------------
+        # Compatibilidade:
+        #
+        # min_fit_points é aceito como alias de min_points.
+        # ---------------------------------------------------------------------
+
+        if min_fit_points is not None:
+            min_points = min_fit_points
+
         self.min_points = max(
             1,
             int(min_points),
         )
+
+        # Alias público para código legado/compatível.
+        self.min_fit_points = self.min_points
 
         self.match_distance = max(
             1.0,
@@ -291,6 +301,20 @@ class LaneTracker:
             )
         )
 
+        # ---------------------------------------------------------------------
+        # Metadados do frame.
+        #
+        # Não fazem parte do estado geométrico da lane.
+        # Servem apenas para compatibilidade com o pipeline.
+        # ---------------------------------------------------------------------
+
+        self.frame_width: Optional[int] = None
+        self.frame_height: Optional[int] = None
+
+        # ---------------------------------------------------------------------
+        # Estado interno.
+        # ---------------------------------------------------------------------
+
         self._tracks: Dict[
             int,
             TrackedLane,
@@ -300,9 +324,7 @@ class LaneTracker:
 
         self._frame_index = 0
 
-        self._last_timestamp: Optional[
-            float
-        ] = None
+        self._last_timestamp: Optional[float] = None
 
     # =========================================================================
     # PROPRIEDADES
@@ -312,9 +334,6 @@ class LaneTracker:
     def tracks(
         self,
     ) -> Tuple[TrackedLane, ...]:
-        """
-        Todos os tracks ainda mantidos pelo tracker.
-        """
 
         return tuple(
             self._tracks.values()
@@ -324,9 +343,6 @@ class LaneTracker:
     def active_tracks(
         self,
     ) -> Tuple[TrackedLane, ...]:
-        """
-        Tracks que ainda não expiraram.
-        """
 
         return tuple(
             track
@@ -381,12 +397,6 @@ class LaneTracker:
         cls,
         points: Sequence[LanePoint],
     ) -> List[LanePoint]:
-        """
-        Retorna somente LanePoint válidos e finitos.
-
-        O tracker trabalha com o LanePoint definido em
-        vision/lane_types.py.
-        """
 
         result: List[LanePoint] = []
 
@@ -402,7 +412,6 @@ class LaneTracker:
                 continue
 
             try:
-
                 if not point.valid:
                     continue
 
@@ -425,9 +434,7 @@ class LaneTracker:
             ):
                 continue
 
-            result.append(
-                point
-            )
+            result.append(point)
 
         return result
 
@@ -436,11 +443,6 @@ class LaneTracker:
         cls,
         points: Sequence[LanePoint],
     ) -> Optional[float]:
-        """
-        Calcula o X representativo da lane.
-
-        Dá maior importância aos pontos inferiores.
-        """
 
         valid = cls._valid_points(
             points
@@ -451,9 +453,7 @@ class LaneTracker:
 
         ordered = sorted(
             valid,
-            key=lambda point: float(
-                point.y
-            ),
+            key=lambda point: float(point.y),
             reverse=True,
         )
 
@@ -517,28 +517,15 @@ class LaneTracker:
             max(xs) - min(xs)
         )
 
+    # =========================================================================
+    # CÓPIA
+    # =========================================================================
+
     @classmethod
     def _copy_lane(
         cls,
         lane: LaneLine,
     ) -> LaneLine:
-        """
-        Cria uma cópia independente de LaneLine.
-
-        IMPORTANTE:
-
-        Usa somente os campos realmente existentes
-        no LaneLine atual.
-
-        Não acessa:
-
-            lane_type
-            side
-            projection_quality
-
-        porque esses campos não fazem parte do contrato
-        atual de vision/lane_types.py.
-        """
 
         points = [
             LanePoint(
@@ -564,11 +551,10 @@ class LaneTracker:
             0,
         )
 
-        if lane_id is None:
-            lane_id = 0
-
         try:
-            lane_id = int(lane_id)
+            lane_id = int(
+                lane_id
+            )
         except (
             TypeError,
             ValueError,
@@ -580,30 +566,60 @@ class LaneTracker:
             points=points,
             confidence=cls._clip01(
                 cls._safe_float(
-                    lane.confidence
+                    getattr(
+                        lane,
+                        "confidence",
+                        0.0,
+                    )
                 )
             ),
-            quality=lane.quality,
+            quality=getattr(
+                lane,
+                "quality",
+                LaneLine(
+                    lane_id=0
+                ).quality,
+            ),
             detected_directly=bool(
-                lane.detected_directly
+                getattr(
+                    lane,
+                    "detected_directly",
+                    True,
+                )
             ),
             projected=bool(
-                lane.projected
+                getattr(
+                    lane,
+                    "projected",
+                    False,
+                )
             ),
             valid=bool(
-                lane.valid
+                getattr(
+                    lane,
+                    "valid",
+                    bool(points),
+                )
             ),
             age_frames=max(
                 0,
                 int(
-                    lane.age_frames
-                )
+                    getattr(
+                        lane,
+                        "age_frames",
+                        0,
+                    )
+                ),
             ),
             missed_frames=max(
                 0,
                 int(
-                    lane.missed_frames
-                )
+                    getattr(
+                        lane,
+                        "missed_frames",
+                        0,
+                    )
+                ),
             ),
         )
 
@@ -616,21 +632,12 @@ class LaneTracker:
         cls,
         lane: object,
     ) -> Optional[LaneLine]:
-        """
-        Normaliza uma observação para LaneLine.
-
-        Aceita:
-
-            LaneLine
-            objeto com `.points`
-            sequência de LanePoint
-        """
 
         if lane is None:
             return None
 
         # ---------------------------------------------------------------------
-        # Já é LaneLine
+        # LaneLine
         # ---------------------------------------------------------------------
 
         if isinstance(
@@ -643,7 +650,7 @@ class LaneTracker:
             )
 
         # ---------------------------------------------------------------------
-        # Objeto compatível com LaneLine
+        # Objeto compatível
         # ---------------------------------------------------------------------
 
         elif hasattr(
@@ -675,9 +682,6 @@ class LaneTracker:
                 "lane_id",
                 0,
             )
-
-            if lane_id is None:
-                lane_id = 0
 
             try:
                 lane_id = int(
@@ -746,7 +750,7 @@ class LaneTracker:
             )
 
         # ---------------------------------------------------------------------
-        # Lista de LanePoint
+        # Sequence de LanePoint
         # ---------------------------------------------------------------------
 
         elif isinstance(
@@ -772,11 +776,6 @@ class LaneTracker:
                     point.confidence
                 )
                 for point in points
-                if math.isfinite(
-                    cls._safe_float(
-                        point.confidence
-                    )
-                )
             ]
 
             confidence = (
@@ -811,26 +810,16 @@ class LaneTracker:
             )
         )
 
-        if len(
-            normalized.points
-        ) < 1:
+        if not normalized.points:
             return None
 
-        # Se a LaneLine não possui confiança própria,
-        # calcula a partir dos pontos.
         if normalized.confidence <= 0.0:
 
             values = [
                 cls._safe_float(
                     point.confidence
                 )
-                for point
-                in normalized.points
-                if math.isfinite(
-                    cls._safe_float(
-                        point.confidence
-                    )
-                )
+                for point in normalized.points
             ]
 
             if values:
@@ -860,23 +849,15 @@ class LaneTracker:
         cls,
         detections: object,
     ) -> List[LaneLine]:
-        """
-        Extrai lanes de:
-
-            LaneDetectionResult
-            List[LaneLine]
-            List[List[LanePoint]]
-        """
 
         if detections is None:
             return []
 
-        # YOLOP LaneDetectionResult
+        # LaneDetectionResult
         if hasattr(
             detections,
             "lanes",
         ):
-
             detections = getattr(
                 detections,
                 "lanes",
@@ -895,25 +876,37 @@ class LaneTracker:
 
         for lane in detections:
 
-            normalized = (
-                cls._normalize_lane(
-                    lane
-                )
+            normalized = cls._normalize_lane(
+                lane
             )
 
             if normalized is None:
                 continue
 
-            if len(
-                normalized.points
-            ) < cls_min_points_placeholder():
-                continue
-
+            # O filtro real usa o parâmetro configurado no tracker.
+            # Como este método é classmethod, o filtro mínimo será
+            # aplicado posteriormente em _prepare_observations().
             result.append(
                 normalized
             )
 
         return result
+
+    def _prepare_observations(
+        self,
+        detections: object,
+    ) -> List[LaneLine]:
+
+        observations = self._extract_observations(
+            detections
+        )
+
+        return [
+            lane
+            for lane in observations
+            if len(lane.points)
+            >= self.min_points
+        ]
 
     # =========================================================================
     # CONFIANÇA
@@ -943,9 +936,7 @@ class LaneTracker:
             )
 
             if value > 0.0:
-                values.append(
-                    value
-                )
+                values.append(value)
 
         if not values:
             return 0.0
@@ -965,11 +956,6 @@ class LaneTracker:
         track: TrackedLane,
         lane: LaneLine,
     ) -> float:
-        """
-        Calcula distância entre uma observação e um track.
-
-        A região inferior possui maior peso.
-        """
 
         track_x = (
             track.current_center_x
@@ -1064,10 +1050,8 @@ class LaneTracker:
         timestamp: float,
     ) -> TrackedLane:
 
-        center_x = (
-            self._point_center_x(
-                lane.points
-            )
+        center_x = self._point_center_x(
+            lane.points
         )
 
         confidence = (
@@ -1076,17 +1060,13 @@ class LaneTracker:
             )
         )
 
-        copied_lane = (
-            self._copy_lane(
-                lane
-            )
+        copied_lane = self._copy_lane(
+            lane
         )
 
         copied_lane.age_frames = 1
         copied_lane.missed_frames = 0
-        copied_lane.confidence = (
-            confidence
-        )
+        copied_lane.confidence = confidence
         copied_lane.detected_directly = True
         copied_lane.valid = bool(
             copied_lane.points
@@ -1096,7 +1076,7 @@ class LaneTracker:
             track_id=self._next_track_id,
             line=copied_lane,
             confidence=confidence,
-            stability=0.0,
+            stability=1.0,
             age=1,
             missed_frames=0,
             stable_frames=1,
@@ -1123,11 +1103,6 @@ class LaneTracker:
         self,
         observations: Sequence[LaneLine],
     ) -> Dict[int, int]:
-        """
-        Associa:
-
-            observation_index -> track_id
-        """
 
         candidates = []
 
@@ -1143,9 +1118,7 @@ class LaneTracker:
         for (
             observation_index,
             lane,
-        ) in enumerate(
-            observations
-        ):
+        ) in enumerate(observations):
 
             for track_id in active_track_ids:
 
@@ -1188,10 +1161,7 @@ class LaneTracker:
             track_id,
         ) in candidates:
 
-            if (
-                observation_index
-                in used_observations
-            ):
+            if observation_index in used_observations:
                 continue
 
             if track_id in used_tracks:
@@ -1212,7 +1182,7 @@ class LaneTracker:
         return result
 
     # =========================================================================
-    # ATUALIZAÇÃO
+    # ATUALIZAÇÃO DE TRACK
     # =========================================================================
 
     def _update_track(
@@ -1240,18 +1210,13 @@ class LaneTracker:
             current_center
         )
 
-        track.line = (
-            self._copy_lane(
-                lane
-            )
+        track.line = self._copy_lane(
+            lane
         )
 
         track.age += 1
-
         track.missed_frames = 0
-
         track.detected_this_frame = True
-
         track.last_timestamp = timestamp
 
         # ---------------------------------------------------------------------
@@ -1264,9 +1229,7 @@ class LaneTracker:
             )
         )
 
-        if len(
-            track.history
-        ) > self.history_size:
+        if len(track.history) > self.history_size:
 
             del track.history[
                 : len(track.history)
@@ -1283,19 +1246,17 @@ class LaneTracker:
             )
         )
 
-        track.confidence = (
-            self._clip01(
+        track.confidence = self._clip01(
+            (
                 (
-                    (
-                        1.0
-                        - self.confidence_recovery
-                    )
-                    * track.confidence
+                    1.0
+                    - self.confidence_recovery
                 )
-                + (
-                    self.confidence_recovery
-                    * observed_confidence
-                )
+                * track.confidence
+            )
+            + (
+                self.confidence_recovery
+                * observed_confidence
             )
         )
 
@@ -1327,26 +1288,21 @@ class LaneTracker:
                 )
             )
 
-        track.stability = (
-            self._clip01(
+        track.stability = self._clip01(
+            (
                 (
-                    (
-                        1.0
-                        - self.stability_alpha
-                    )
-                    * track.stability
+                    1.0
+                    - self.stability_alpha
                 )
-                + (
-                    self.stability_alpha
-                    * observation_stability
-                )
+                * track.stability
+            )
+            + (
+                self.stability_alpha
+                * observation_stability
             )
         )
 
-        if (
-            observation_stability
-            >= 0.50
-        ):
+        if observation_stability >= 0.50:
 
             track.stable_frames += 1
 
@@ -1358,24 +1314,20 @@ class LaneTracker:
             )
 
         # ---------------------------------------------------------------------
-        # Metadados LaneLine
+        # Metadados
         # ---------------------------------------------------------------------
 
-        track.line.age_frames = (
-            track.age
-        )
-
+        track.line.age_frames = track.age
         track.line.missed_frames = 0
-
-        track.line.confidence = (
-            track.confidence
-        )
-
+        track.line.confidence = track.confidence
         track.line.detected_directly = True
-
         track.line.valid = bool(
             track.line.points
         )
+
+    # =========================================================================
+    # TRACK PERDIDO
+    # =========================================================================
 
     def _mark_missed(
         self,
@@ -1389,18 +1341,14 @@ class LaneTracker:
 
         track.last_timestamp = timestamp
 
-        track.confidence = (
-            self._clip01(
-                track.confidence
-                * self.confidence_decay
-            )
+        track.confidence = self._clip01(
+            track.confidence
+            * self.confidence_decay
         )
 
-        track.stability = (
-            self._clip01(
-                track.stability
-                * 0.85
-            )
+        track.stability = self._clip01(
+            track.stability
+            * 0.85
         )
 
         track.stable_frames = max(
@@ -1420,9 +1368,7 @@ class LaneTracker:
             track.confidence
         )
 
-        track.line.detected_directly = (
-            False
-        )
+        track.line.detected_directly = False
 
     # =========================================================================
     # LIMPEZA
@@ -1442,7 +1388,6 @@ class LaneTracker:
         ]
 
         for track_id in expired:
-
             del self._tracks[
                 track_id
             ]
@@ -1455,18 +1400,12 @@ class LaneTracker:
     def _sort_tracks(
         tracks: Sequence[TrackedLane],
     ) -> List[TrackedLane]:
-        """
-        Ordena espacialmente pelo X.
-
-        Isso não decide a faixa atual.
-        """
 
         return sorted(
             tracks,
             key=lambda track: (
                 float("inf")
-                if track.current_center_x
-                is None
+                if track.current_center_x is None
                 else track.current_center_x
             ),
         )
@@ -1509,14 +1448,10 @@ class LaneTracker:
         )
 
         return LaneTrackingResult(
-            lanes=tuple(
-                tracks
-            ),
+            lanes=tuple(tracks),
             timestamp=timestamp,
             frame_index=self._frame_index,
-            valid=(
-                detected_count > 0
-            ),
+            valid=detected_count > 0,
             stable_count=stable_count,
             detected_count=detected_count,
             lost_count=lost_count,
@@ -1530,18 +1465,67 @@ class LaneTracker:
         self,
         detections: object,
         timestamp: Optional[float] = None,
+        frame_width: Optional[int] = None,
+        frame_height: Optional[int] = None,
     ) -> LaneTrackingResult:
         """
         Atualiza o tracker.
 
-        Aceita:
+        Parâmetros:
 
-            LaneDetectionResult
+            detections:
+                LaneDetectionResult,
+                List[LaneLine] ou
+                List[List[LanePoint]].
 
-            List[LaneLine]
+            timestamp:
+                Timestamp monotônico opcional.
 
-            List[List[LanePoint]]
+            frame_width:
+                Largura do frame atual.
+
+            frame_height:
+                Altura do frame atual.
+
+        frame_width e frame_height são aceitos pelo pipeline
+        principal para manter o contrato entre módulos.
         """
+
+        # ---------------------------------------------------------------------
+        # Atualiza metadados do frame
+        # ---------------------------------------------------------------------
+
+        if frame_width is not None:
+
+            try:
+                width = int(frame_width)
+
+                if width > 0:
+                    self.frame_width = width
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        if frame_height is not None:
+
+            try:
+                height = int(frame_height)
+
+                if height > 0:
+                    self.frame_height = height
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        # ---------------------------------------------------------------------
+        # Timestamp
+        # ---------------------------------------------------------------------
 
         if timestamp is None:
             timestamp = time.monotonic()
@@ -1550,20 +1534,26 @@ class LaneTracker:
             timestamp
         )
 
+        # ---------------------------------------------------------------------
+        # Frame
+        # ---------------------------------------------------------------------
+
         self._frame_index += 1
 
-        self._last_timestamp = (
-            timestamp
-        )
+        self._last_timestamp = timestamp
+
+        # ---------------------------------------------------------------------
+        # Observações
+        # ---------------------------------------------------------------------
 
         observations = (
-            self._extract_observations(
+            self._prepare_observations(
                 detections
             )
         )
 
         # ---------------------------------------------------------------------
-        # Limite de lanes
+        # Limite
         # ---------------------------------------------------------------------
 
         observations = observations[
@@ -1574,10 +1564,8 @@ class LaneTracker:
         # Associação
         # ---------------------------------------------------------------------
 
-        associations = (
-            self._associate(
-                observations
-            )
+        associations = self._associate(
+            observations
         )
 
         matched_track_ids = set()
@@ -1589,9 +1577,7 @@ class LaneTracker:
         for (
             observation_index,
             lane,
-        ) in enumerate(
-            observations
-        ):
+        ) in enumerate(observations):
 
             track_id = associations.get(
                 observation_index
@@ -1624,17 +1610,12 @@ class LaneTracker:
         for (
             observation_index,
             lane,
-        ) in enumerate(
-            observations
-        ):
+        ) in enumerate(observations):
 
             if observation_index in associations:
                 continue
 
-            if (
-                len(self._tracks)
-                >= self.max_lanes
-            ):
+            if len(self._tracks) >= self.max_lanes:
                 break
 
             track = self._create_track(
@@ -1651,7 +1632,7 @@ class LaneTracker:
             )
 
         # ---------------------------------------------------------------------
-        # Marca tracks ausentes
+        # Marca ausentes
         # ---------------------------------------------------------------------
 
         for (
@@ -1683,18 +1664,23 @@ class LaneTracker:
             timestamp
         )
 
+    # =========================================================================
+    # ALIAS
+    # =========================================================================
+
     def track(
         self,
         detections: object,
         timestamp: Optional[float] = None,
+        frame_width: Optional[int] = None,
+        frame_height: Optional[int] = None,
     ) -> LaneTrackingResult:
-        """
-        Alias semântico para update().
-        """
 
         return self.update(
             detections,
             timestamp=timestamp,
+            frame_width=frame_width,
+            frame_height=frame_height,
         )
 
     # =========================================================================
@@ -1702,9 +1688,6 @@ class LaneTracker:
     # =========================================================================
 
     def reset(self) -> None:
-        """
-        Limpa completamente o estado temporal.
-        """
 
         self._tracks.clear()
 
@@ -1713,6 +1696,9 @@ class LaneTracker:
         self._frame_index = 0
 
         self._last_timestamp = None
+
+        self.frame_width = None
+        self.frame_height = None
 
     # =========================================================================
     # CONSULTA
@@ -1723,8 +1709,16 @@ class LaneTracker:
         track_id: int,
     ) -> Optional[TrackedLane]:
 
+        try:
+            track_id = int(track_id)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
         return self._tracks.get(
-            int(track_id)
+            track_id
         )
 
     def get_stable_tracks(
@@ -1764,21 +1758,6 @@ def create_default_lane_tracker(
     return LaneTracker(
         **kwargs
     )
-
-
-# =============================================================================
-# AUXILIAR INTERNO
-# =============================================================================
-
-def cls_min_points_placeholder() -> int:
-    """
-    Valor mínimo utilizado durante a extração.
-
-    O filtro definitivo é aplicado pelo próprio tracker
-    no processamento das observações.
-    """
-
-    return 1
 
 
 # =============================================================================
