@@ -35,7 +35,6 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from vision.lane_types import (
-    LaneLine,
     LaneModel,
     LanePoint,
     LanePolynomial,
@@ -79,11 +78,9 @@ def _clip01(value: Any) -> float:
 
 class LaneProjectionEngine:
     """
-    Engine de projeção.
+    Engine de projeção de uma linha de faixa.
 
-    Compatível com a API atual dos testes e com LaneModel.
-
-    Pode receber:
+    Aceita:
 
         project(list[LanePoint])
 
@@ -91,8 +88,8 @@ class LaneProjectionEngine:
 
         project(LaneModel)
 
-    O modelo matemático continua sendo o LanePolynomial cúbico
-    produzido por lane_model.py.
+    O modelo matemático utilizado é o LanePolynomial produzido
+    por lane_model.py.
     """
 
     def __init__(
@@ -157,19 +154,25 @@ class LaneProjectionEngine:
             except Exception:
                 continue
 
-            if not (
-                math.isfinite(float(point.x))
-                and math.isfinite(float(point.y))
-                and math.isfinite(float(point.confidence))
+            x = _finite(point.x)
+            y = _finite(point.y)
+            confidence = _finite(
+                point.confidence
+            )
+
+            if (
+                x is None
+                or y is None
+                or confidence is None
             ):
                 continue
 
             result.append(
                 LanePoint(
-                    x=float(point.x),
-                    y=float(point.y),
+                    x=x,
+                    y=y,
                     confidence=_clip01(
-                        point.confidence
+                        confidence
                     ),
                     valid=True,
                 )
@@ -193,19 +196,32 @@ class LaneProjectionEngine:
         if len(points) < self.min_points:
             return None
 
-        return fit_lane_model(
-            points,
-            min_points=self.min_points,
-        )
+        try:
+            return fit_lane_model(
+                points,
+                min_points=self.min_points,
+            )
+        except (
+            TypeError,
+            ValueError,
+            np.linalg.LinAlgError,
+        ):
+            return None
 
     # =========================================================================
     # MODEL VALIDATION
     # =========================================================================
 
-    @staticmethod
     def _validate_model(
+        self,
         model: Any,
     ) -> bool:
+        """
+        Valida o LaneModel usando apenas o contrato real
+        de LanePolynomial.
+
+        Não depende de métodos auxiliares inexistentes.
+        """
 
         if not isinstance(
             model,
@@ -213,13 +229,11 @@ class LaneProjectionEngine:
         ):
             return False
 
-        try:
-            if not model.is_valid():
-                return False
-        except Exception:
-            return False
-
-        polynomial = model.polynomial
+        polynomial = getattr(
+            model,
+            "polynomial",
+            None,
+        )
 
         if not isinstance(
             polynomial,
@@ -227,11 +241,55 @@ class LaneProjectionEngine:
         ):
             return False
 
-        if not polynomial.valid:
+        if not bool(
+            getattr(
+                polynomial,
+                "valid",
+                False,
+            )
+        ):
             return False
 
-        if not polynomial.is_finite():
+        values = (
+            getattr(polynomial, "a", None),
+            getattr(polynomial, "b", None),
+            getattr(polynomial, "c", None),
+            getattr(polynomial, "d", None),
+            getattr(polynomial, "fit_error", None),
+            getattr(polynomial, "confidence", None),
+            getattr(polynomial, "y_min", None),
+            getattr(polynomial, "y_max", None),
+        )
+
+        for value in values:
+
+            if _finite(value) is None:
+                return False
+
+        y_min = float(
+            polynomial.y_min
+        )
+
+        y_max = float(
+            polynomial.y_max
+        )
+
+        if y_max <= y_min:
             return False
+
+        sample_count = getattr(
+            polynomial,
+            "sample_count",
+            None,
+        )
+
+        if sample_count is not None:
+
+            try:
+                if int(sample_count) < self.min_points:
+                    return False
+            except (TypeError, ValueError):
+                return False
 
         return True
 
@@ -246,11 +304,19 @@ class LaneProjectionEngine:
     ) -> Optional[tuple[float, float]]:
 
         y_min = _finite(
-            polynomial.y_min
+            getattr(
+                polynomial,
+                "y_min",
+                None,
+            )
         )
 
         y_max = _finite(
-            polynomial.y_max
+            getattr(
+                polynomial,
+                "y_max",
+                None,
+            )
         )
 
         if (
@@ -263,11 +329,16 @@ class LaneProjectionEngine:
         if len(points) < 2:
             return None
 
-        ys = [
-            float(point.y)
-            for point in points
-            if math.isfinite(float(point.y))
-        ]
+        ys: list[float] = []
+
+        for point in points:
+
+            value = _finite(
+                point.y
+            )
+
+            if value is not None:
+                ys.append(value)
 
         if len(ys) < 2:
             return None
@@ -290,7 +361,9 @@ class LaneProjectionEngine:
         points: Sequence[LanePoint],
     ) -> LaneProjection:
 
-        if not self._validate_model(model):
+        if not self._validate_model(
+            model
+        ):
 
             return LaneProjection(
                 valid=False,
@@ -338,8 +411,7 @@ class LaneProjectionEngine:
             + self.max_projection_distance
         )
 
-        # A projeção deve representar a região observada
-        # mais a extrapolação limitada.
+        # Mantém uma quantidade razoável de amostras.
         samples = max(
             2,
             min(
@@ -376,9 +448,9 @@ class LaneProjectionEngine:
             ):
                 continue
 
-            if not (
-                math.isfinite(x_value)
-                and math.isfinite(y_value)
+            if (
+                not math.isfinite(x_value)
+                or not math.isfinite(y_value)
             ):
                 continue
 
@@ -387,23 +459,23 @@ class LaneProjectionEngine:
                 y_value - y_max,
             )
 
-            # Degradação suave da confiança fora
-            # do intervalo observado.
-            decay = max(
-                0.0,
-                1.0
-                - (
-                    distance
-                    / self.max_projection_distance
-                ),
-            )
+            if distance <= 0.0:
+
+                decay = 1.0
+
+            else:
+
+                decay = max(
+                    0.0,
+                    1.0
+                    - (
+                        distance
+                        / self.max_projection_distance
+                    ),
+                )
 
             point_confidence = _clip01(
-                confidence * (
-                    1.0
-                    if distance <= 0.0
-                    else decay
-                )
+                confidence * decay
             )
 
             projected.append(
@@ -425,9 +497,15 @@ class LaneProjectionEngine:
                 extrapolated=False,
             )
 
-        # Confiança da projeção.
+        # A projeção deve possuir qualidade proporcional
+        # à confiança da observação original.
         extrapolated_distance = (
             projection_end - y_max
+        )
+
+        extrapolation_ratio = _clip01(
+            extrapolated_distance
+            / self.max_projection_distance
         )
 
         projection_confidence = _clip01(
@@ -435,23 +513,24 @@ class LaneProjectionEngine:
             * (
                 1.0
                 - 0.25
-                * (
-                    extrapolated_distance
-                    / self.max_projection_distance
-                )
+                * extrapolation_ratio
             )
         )
 
         if projection_confidence >= 0.85:
+
             quality = ProjectionQuality.HIGH
 
         elif projection_confidence >= 0.65:
+
             quality = ProjectionQuality.MEDIUM
 
         elif projection_confidence >= 0.40:
+
             quality = ProjectionQuality.LOW
 
         else:
+
             quality = ProjectionQuality.NONE
 
         valid = (
@@ -469,13 +548,14 @@ class LaneProjectionEngine:
             horizon_y=y_min,
         )
 
-        # LaneProjection da versão atual de lane_types.py
-        # não possui confidence explicitamente no dataclass.
-        # Mantemos o atributo para compatibilidade com a API
-        # pública esperada pelos testes.
-        projection.confidence = (
-            projection_confidence
-        )
+        # Compatibilidade com versões de LaneProjection
+        # que não possuem confidence no dataclass.
+        try:
+            projection.confidence = (
+                projection_confidence
+            )
+        except Exception:
+            pass
 
         return projection
 
@@ -499,21 +579,36 @@ class LaneProjectionEngine:
             LaneModel
         """
 
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # LaneModel
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------------------
 
         if isinstance(
             data,
             LaneModel,
         ):
 
-            points = []
+            points: list[LanePoint] = []
 
-            if data.line is not None:
-                points = self._valid_points(
-                    data.line.points
+            line = getattr(
+                data,
+                "line",
+                None,
+            )
+
+            if line is not None:
+
+                line_points = getattr(
+                    line,
+                    "points",
+                    None,
                 )
+
+                if line_points is not None:
+
+                    points = self._valid_points(
+                        line_points
+                    )
 
             projection = self._project_model(
                 data,
@@ -521,15 +616,16 @@ class LaneProjectionEngine:
             )
 
             if horizon_y is not None:
-                projection.horizon_y = (
-                    float(horizon_y)
+
+                projection.horizon_y = float(
+                    horizon_y
                 )
 
             return projection
 
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # LanePoint sequence
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------------------
 
         if data is None:
 
@@ -539,9 +635,11 @@ class LaneProjectionEngine:
             )
 
         try:
+
             points = self._valid_points(
                 list(data)
             )
+
         except (
             TypeError,
             ValueError,
@@ -576,8 +674,9 @@ class LaneProjectionEngine:
         )
 
         if horizon_y is not None:
-            projection.horizon_y = (
-                float(horizon_y)
+
+            projection.horizon_y = float(
+                horizon_y
             )
 
         return projection
