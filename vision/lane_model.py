@@ -1,48 +1,70 @@
 """
 vision/lane_model.py
 
-Modelagem matemática das linhas de faixa.
+Modelagem matemática oficial das linhas de faixa.
 
-Responsabilidades
------------------
-LanePoint
-    ↓
-validação
-    ↓
-filtragem
-    ↓
-preparação
-    ↓
-ajuste polinomial cúbico
-    ↓
-rejeição robusta de outliers
-    ↓
-validação geométrica
-    ↓
-LanePolynomial
-    ↓
-LaneProjection
-    ↓
-LaneModel
+Responsabilidade
+----------------
+Este módulo transforma observações de LanePoint em um modelo
+matemático cúbico estável:
+
+    LanePoint
+        ↓
+    validação
+        ↓
+    filtragem
+        ↓
+    preparação
+        ↓
+    normalização
+        ↓
+    ajuste cúbico
+        ↓
+    rejeição robusta de outliers
+        ↓
+    ajuste final
+        ↓
+    LanePolynomial
+        ↓
+    LaneModel
 
 Este módulo NÃO realiza:
+
     - inferência YOLOP;
     - captura de tela;
     - ROI;
     - tracking temporal;
-    - associação semântica;
+    - associação de lanes;
+    - extrapolação/projeção espacial;
     - decisão ADAS;
     - controle do veículo.
 
+Modelo matemático oficial
+-------------------------
+
+A faixa é representada por:
+
+    x(y) = a*y³ + b*y² + c*y + d
+
+onde:
+
+    y -> coordenada vertical da imagem
+    x -> coordenada horizontal da faixa
+
+O ajuste é realizado com coordenadas Y normalizadas para
+reduzir problemas numéricos.
+
 Princípios
 ----------
+
+- somente polinômio cúbico;
+- determinístico;
+- numericamente estável;
+- robusto contra outliers;
+- somente dados finitos;
+- falha segura;
 - configuração centralizada em config.py;
-- nenhuma configuração paralela;
-- polinômio oficial cúbico;
-- normalização numérica;
-- rejeição robusta de outliers;
-- comportamento determinístico;
-- falha segura.
+- nenhuma extrapolação neste módulo.
 """
 
 from __future__ import annotations
@@ -53,32 +75,30 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from config import LANE_MODEL, LANE_PROJECTION
+from config import LANE_MODEL
 
 from .lane_types import (
     LaneLine,
     LaneModel,
     LanePoint,
     LanePolynomial,
-    LaneProjection,
     LaneQuality,
-    ProjectionQuality,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# CONFIGURATION VALIDATION
+# CONFIGURATION
 # =============================================================================
 
 
 def _validate_configuration() -> None:
-    """Valida os invariantes da configuração global."""
+    """Valida os invariantes necessários para o modelo."""
 
     if LANE_MODEL.polynomial_degree != 3:
         raise ValueError(
-            "LANE_MODEL.polynomial_degree deve ser 3."
+            "LANE_MODEL.polynomial_degree deve ser exatamente 3."
         )
 
     if LANE_MODEL.minimum_points < 4:
@@ -106,14 +126,9 @@ def _validate_configuration() -> None:
             "LANE_MODEL.minimum_confidence deve estar entre 0 e 1."
         )
 
-    if LANE_PROJECTION.samples < 2:
+    if LANE_MODEL.max_fit_error <= 0.0:
         raise ValueError(
-            "LANE_PROJECTION.samples deve ser >= 2."
-        )
-
-    if LANE_PROJECTION.minimum_points < 2:
-        raise ValueError(
-            "LANE_PROJECTION.minimum_points deve ser >= 2."
+            "LANE_MODEL.max_fit_error deve ser > 0."
         )
 
 
@@ -126,18 +141,37 @@ _validate_configuration()
 
 
 def _clip01(value: float) -> float:
-    return float(np.clip(float(value), 0.0, 1.0))
+    """Limita um valor ao intervalo [0, 1]."""
+
+    return float(
+        np.clip(
+            float(value),
+            0.0,
+            1.0,
+        )
+    )
 
 
 def _is_finite(value: float) -> bool:
-    return math.isfinite(float(value))
+    """Retorna True quando o valor é finito."""
+
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _safe_mean(values: Sequence[float]) -> float:
+    """Média segura ignorando valores não finitos."""
+
     if not values:
         return 0.0
 
-    array = np.asarray(values, dtype=np.float64)
+    array = np.asarray(
+        values,
+        dtype=np.float64,
+    )
+
     array = array[np.isfinite(array)]
 
     if array.size == 0:
@@ -147,10 +181,16 @@ def _safe_mean(values: Sequence[float]) -> float:
 
 
 def _safe_median(values: Sequence[float]) -> float:
+    """Mediana segura ignorando valores não finitos."""
+
     if not values:
         return 0.0
 
-    array = np.asarray(values, dtype=np.float64)
+    array = np.asarray(
+        values,
+        dtype=np.float64,
+    )
+
     array = array[np.isfinite(array)]
 
     if array.size == 0:
@@ -160,7 +200,7 @@ def _safe_median(values: Sequence[float]) -> float:
 
 
 # =============================================================================
-# POINT PREPARATION
+# POINT FILTERING
 # =============================================================================
 
 
@@ -169,11 +209,7 @@ def filter_lane_points(
     min_confidence: Optional[float] = None,
 ) -> List[LanePoint]:
     """
-    Remove pontos inválidos, não finitos e abaixo
-    do limite de confiança.
-
-    min_confidence existe como parâmetro de compatibilidade
-    da API, mas seu valor padrão vem exclusivamente de config.py.
+    Remove pontos inválidos, não finitos ou abaixo da confiança mínima.
     """
 
     threshold = (
@@ -189,10 +225,24 @@ def filter_lane_points(
         if not isinstance(point, LanePoint):
             continue
 
+        try:
+            x = float(point.x)
+            y = float(point.y)
+            confidence = float(point.confidence)
+        except (TypeError, ValueError):
+            continue
+
+        if not (
+            math.isfinite(x)
+            and math.isfinite(y)
+            and math.isfinite(confidence)
+        ):
+            continue
+
         if not point.is_valid():
             continue
 
-        if point.confidence < threshold:
+        if confidence < threshold:
             continue
 
         result.append(point)
@@ -203,7 +253,7 @@ def filter_lane_points(
 def sort_lane_points(
     points: Iterable[LanePoint],
 ) -> List[LanePoint]:
-    """Ordena pontos por Y crescente."""
+    """Ordena pontos pela coordenada Y crescente."""
 
     return sorted(
         points,
@@ -215,10 +265,10 @@ def remove_duplicate_y(
     points: Iterable[LanePoint],
 ) -> List[LanePoint]:
     """
-    Remove pontos com o mesmo Y.
+    Remove múltiplos pontos com o mesmo Y.
 
-    Em caso de duplicidade, mantém o ponto
-    de maior confiança.
+    Quando existem vários pontos no mesmo Y,
+    somente o de maior confiança é preservado.
     """
 
     best_by_y: dict[float, LanePoint] = {}
@@ -226,6 +276,7 @@ def remove_duplicate_y(
     for point in points:
 
         y = float(point.y)
+
         current = best_by_y.get(y)
 
         if (
@@ -236,7 +287,7 @@ def remove_duplicate_y(
 
     return sorted(
         best_by_y.values(),
-        key=lambda point: point.y,
+        key=lambda point: float(point.y),
     )
 
 
@@ -245,20 +296,18 @@ def limit_point_count(
     max_points: Optional[int] = None,
 ) -> List[LanePoint]:
     """
-    Limita a quantidade de pontos preservando
-    a distribuição vertical.
+    Limita a quantidade de pontos mantendo distribuição vertical.
+
+    O primeiro e o último ponto são sempre preservados.
     """
 
     if max_points is None:
-        max_points = max(
-            LANE_MODEL.minimum_points,
-            LANE_PROJECTION.samples,
-        )
+        return list(points)
 
-    maximum = max(
-        LANE_MODEL.minimum_points,
-        int(max_points),
-    )
+    maximum = int(max_points)
+
+    if maximum < LANE_MODEL.minimum_points:
+        maximum = LANE_MODEL.minimum_points
 
     if len(points) <= maximum:
         return list(points)
@@ -267,7 +316,8 @@ def limit_point_count(
         0,
         len(points) - 1,
         maximum,
-    ).astype(int)
+        dtype=np.int64,
+    )
 
     return [
         points[int(index)]
@@ -280,7 +330,9 @@ def prepare_lane_points(
     min_confidence: Optional[float] = None,
     max_points: Optional[int] = None,
 ) -> List[LanePoint]:
-    """Pipeline determinístico de preparação."""
+    """
+    Pipeline determinístico de preparação dos pontos.
+    """
 
     filtered = filter_lane_points(
         points,
@@ -298,13 +350,14 @@ def prepare_lane_points(
 
 
 # =============================================================================
-# STATISTICS
+# GEOMETRIC STATISTICS
 # =============================================================================
 
 
 def lane_y_span(
     points: Sequence[LanePoint],
 ) -> float:
+    """Extensão vertical observada."""
 
     if len(points) < 2:
         return 0.0
@@ -314,6 +367,9 @@ def lane_y_span(
         dtype=np.float64,
     )
 
+    if not np.all(np.isfinite(ys)):
+        return 0.0
+
     return float(
         np.max(ys) - np.min(ys)
     )
@@ -322,6 +378,7 @@ def lane_y_span(
 def lane_x_span(
     points: Sequence[LanePoint],
 ) -> float:
+    """Extensão horizontal observada."""
 
     if len(points) < 2:
         return 0.0
@@ -331,6 +388,9 @@ def lane_x_span(
         dtype=np.float64,
     )
 
+    if not np.all(np.isfinite(xs)):
+        return 0.0
+
     return float(
         np.max(xs) - np.min(xs)
     )
@@ -339,15 +399,17 @@ def lane_x_span(
 def lane_mean_confidence(
     points: Sequence[LanePoint],
 ) -> float:
+    """Confiança média dos pontos válidos."""
+
+    values = [
+        float(point.confidence)
+        for point in points
+        if point.is_valid()
+        and _is_finite(point.confidence)
+    ]
 
     return _clip01(
-        _safe_mean(
-            [
-                point.confidence
-                for point in points
-                if point.is_valid()
-            ]
-        )
+        _safe_mean(values)
     )
 
 
@@ -355,12 +417,13 @@ def lane_confidence_score(
     points: Sequence[LanePoint],
 ) -> float:
     """
-    Confiança estrutural da observação.
+    Calcula a qualidade estrutural da observação.
 
-    Combina:
-        - confiança dos pontos;
-        - quantidade de pontos;
-        - extensão vertical.
+    Componentes:
+
+        55% -> confiança média
+        25% -> quantidade de pontos
+        20% -> extensão vertical
     """
 
     if not points:
@@ -392,6 +455,7 @@ def classify_lane_quality(
     points: Sequence[LanePoint],
     polynomial: Optional[LanePolynomial] = None,
 ) -> LaneQuality:
+    """Classifica a qualidade geométrica da faixa."""
 
     if not points:
         return LaneQuality.NONE
@@ -406,22 +470,15 @@ def classify_lane_quality(
     ):
         return LaneQuality.POOR
 
-    if confidence < 0.35:
-        return LaneQuality.PARTIAL
-
-    if polynomial is not None:
+    if polynomial is not None and polynomial.valid:
 
         if (
-            polynomial.valid
-            and polynomial.confidence >= 0.75
+            polynomial.confidence >= 0.75
             and polynomial.fit_error <= 12.0
         ):
             return LaneQuality.EXCELLENT
 
-        if (
-            polynomial.valid
-            and polynomial.confidence >= 0.55
-        ):
+        if polynomial.confidence >= 0.55:
             return LaneQuality.GOOD
 
     if (
@@ -431,31 +488,47 @@ def classify_lane_quality(
     ):
         return LaneQuality.GOOD
 
-    return LaneQuality.PARTIAL
+    if confidence >= 0.35:
+        return LaneQuality.PARTIAL
+
+    return LaneQuality.POOR
 
 
 # =============================================================================
-# NUMERIC NORMALIZATION
+# NORMALIZATION
 # =============================================================================
 
 
 def _normalize_y(
     y: np.ndarray,
 ) -> Tuple[np.ndarray, float, float]:
+    """
+    Normaliza Y para:
 
-    center = float(np.mean(y))
+        z = (y - center) / scale
+    """
+
+    center = float(
+        np.mean(y)
+    )
 
     scale = float(
         np.max(
-            np.abs(y - center)
+            np.abs(
+                y - center
+            )
         )
     )
 
-    if scale < 1e-9:
+    if not math.isfinite(scale) or scale < 1e-12:
         scale = 1.0
 
+    normalized = (
+        y - center
+    ) / scale
+
     return (
-        (y - center) / scale,
+        normalized,
         center,
         scale,
     )
@@ -471,19 +544,15 @@ def _denormalize_coefficients(
 
         x = A*z³ + B*z² + C*z + D
 
-    em:
+    para:
 
         x = a*y³ + b*y² + c*y + d
-
-    com:
-
-        z = (y - center) / scale
     """
 
-    A, B, C, D = (
-        float(value)
-        for value in coefficients
-    )
+    A = float(coefficients[3])
+    B = float(coefficients[2])
+    C = float(coefficients[1])
+    D = float(coefficients[0])
 
     scale2 = scale * scale
     scale3 = scale2 * scale
@@ -517,19 +586,37 @@ def _denormalize_coefficients(
 
 
 # =============================================================================
-# FIT CONFIDENCE
+# POLYNOMIAL FIT
 # =============================================================================
+
+
+def _invalid_polynomial(
+    sample_count: int,
+    y_min: float = 0.0,
+    y_max: float = 0.0,
+) -> LanePolynomial:
+    """Cria um resultado de fitting inválido."""
+
+    return LanePolynomial(
+        valid=False,
+        sample_count=int(sample_count),
+        y_min=float(y_min),
+        y_max=float(y_max),
+    )
 
 
 def _calculate_fit_confidence(
     points: Sequence[LanePoint],
     fit_error: float,
 ) -> float:
+    """Calcula confiança do ajuste."""
 
     if not points:
         return 0.0
 
-    observation_score = lane_mean_confidence(points)
+    observation_score = lane_mean_confidence(
+        points
+    )
 
     count_score = _clip01(
         len(points) / 20.0
@@ -539,11 +626,13 @@ def _calculate_fit_confidence(
         lane_y_span(points) / 300.0
     )
 
-    if not _is_finite(fit_error):
+    if not math.isfinite(fit_error):
         error_score = 0.0
     else:
         error_score = float(
-            np.exp(-fit_error / 20.0)
+            np.exp(
+                -fit_error / 20.0
+            )
         )
 
     return _clip01(
@@ -554,11 +643,6 @@ def _calculate_fit_confidence(
     )
 
 
-# =============================================================================
-# POLYNOMIAL FIT
-# =============================================================================
-
-
 def fit_polynomial(
     points: Sequence[LanePoint],
     degree: int = 3,
@@ -566,42 +650,44 @@ def fit_polynomial(
     max_fit_error: Optional[float] = None,
 ) -> LanePolynomial:
     """
-    Ajusta o polinômio oficial cúbico:
+    Ajusta exclusivamente o polinômio cúbico oficial:
 
         x(y) = a*y³ + b*y² + c*y + d
 
-    degree é aceito para validar o contrato da API,
-    mas somente grau 3 é permitido.
+    O ajuste é realizado em Y normalizado.
     """
 
-    if degree != LANE_MODEL.polynomial_degree:
+    if degree != 3:
         raise ValueError(
-            "lane_model utiliza exclusivamente polinômio "
-            f"de grau {LANE_MODEL.polynomial_degree}."
+            "lane_model suporta exclusivamente "
+            "polinômio cúbico."
         )
 
-    minimum_points = (
+    minimum = (
         LANE_MODEL.minimum_points
         if min_points is None
         else int(min_points)
     )
 
-    fit_error_limit = (
+    if minimum < 4:
+        raise ValueError(
+            "min_points deve ser >= 4."
+        )
+
+    error_limit = (
         LANE_MODEL.max_fit_error
         if max_fit_error is None
         else float(max_fit_error)
     )
 
-    if minimum_points < 4:
+    if error_limit <= 0.0:
         raise ValueError(
-            "min_points deve ser >= 4."
+            "max_fit_error deve ser > 0."
         )
 
-    if len(points) < minimum_points:
-
-        return LanePolynomial(
-            valid=False,
-            sample_count=len(points),
+    if len(points) < minimum:
+        return _invalid_polynomial(
+            len(points)
         )
 
     xs = np.asarray(
@@ -618,26 +704,30 @@ def fit_polynomial(
         np.all(np.isfinite(xs))
         and np.all(np.isfinite(ys))
     ):
-        return LanePolynomial(
-            valid=False,
-            sample_count=len(points),
+        return _invalid_polynomial(
+            len(points)
         )
 
-    y_min = float(np.min(ys))
-    y_max = float(np.max(ys))
+    y_min = float(
+        np.min(ys)
+    )
 
-    if (
-        y_max - y_min
-        < LANE_MODEL.minimum_y_span
-    ):
-        return LanePolynomial(
-            valid=False,
-            sample_count=len(points),
-            y_min=y_min,
-            y_max=y_max,
+    y_max = float(
+        np.max(ys)
+    )
+
+    y_span = y_max - y_min
+
+    if y_span < LANE_MODEL.minimum_y_span:
+        return _invalid_polynomial(
+            len(points),
+            y_min,
+            y_max,
         )
 
-    normalized_y, center, scale = _normalize_y(ys)
+    normalized_y, center, scale = _normalize_y(
+        ys
+    )
 
     try:
 
@@ -653,19 +743,17 @@ def fit_polynomial(
         FloatingPointError,
     ):
 
-        return LanePolynomial(
-            valid=False,
-            sample_count=len(points),
-            y_min=y_min,
-            y_max=y_max,
+        return _invalid_polynomial(
+            len(points),
+            y_min,
+            y_max,
         )
 
     if len(coefficients) != 4:
-        return LanePolynomial(
-            valid=False,
-            sample_count=len(points),
-            y_min=y_min,
-            y_max=y_max,
+        return _invalid_polynomial(
+            len(points),
+            y_min,
+            y_max,
         )
 
     a, b, c, d = _denormalize_coefficients(
@@ -673,6 +761,16 @@ def fit_polynomial(
         center,
         scale,
     )
+
+    if not all(
+        math.isfinite(value)
+        for value in (a, b, c, d)
+    ):
+        return _invalid_polynomial(
+            len(points),
+            y_min,
+            y_max,
+        )
 
     polynomial = LanePolynomial(
         a=a,
@@ -685,13 +783,21 @@ def fit_polynomial(
         y_max=y_max,
     )
 
-    predicted = np.asarray(
-        [
-            polynomial.evaluate(y)
-            for y in ys
-        ],
-        dtype=np.float64,
+    predicted = (
+        a * ys**3
+        + b * ys**2
+        + c * ys
+        + d
     )
+
+    if not np.all(
+        np.isfinite(predicted)
+    ):
+        return _invalid_polynomial(
+            len(points),
+            y_min,
+            y_max,
+        )
 
     residuals = np.abs(
         xs - predicted
@@ -701,20 +807,18 @@ def fit_polynomial(
         residuals.tolist()
     )
 
-    polynomial.fit_error = fit_error
-
-    polynomial.confidence = (
-        _calculate_fit_confidence(
-            points,
-            fit_error,
-        )
+    confidence = _calculate_fit_confidence(
+        points,
+        fit_error,
     )
 
+    polynomial.fit_error = fit_error
+    polynomial.confidence = confidence
+
     if (
-        not _is_finite(fit_error)
-        or fit_error > fit_error_limit
-        or polynomial.confidence
-        < LANE_MODEL.minimum_confidence
+        not math.isfinite(fit_error)
+        or fit_error > error_limit
+        or confidence < LANE_MODEL.minimum_confidence
     ):
         polynomial.valid = False
 
@@ -726,16 +830,57 @@ def fit_polynomial(
 # =============================================================================
 
 
+def _polynomial_residuals(
+    points: Sequence[LanePoint],
+    polynomial: LanePolynomial,
+) -> np.ndarray:
+    """Calcula resíduos absolutos."""
+
+    if not points or not polynomial.valid:
+        return np.empty(
+            0,
+            dtype=np.float64,
+        )
+
+    xs = np.asarray(
+        [point.x for point in points],
+        dtype=np.float64,
+    )
+
+    ys = np.asarray(
+        [point.y for point in points],
+        dtype=np.float64,
+    )
+
+    predicted = np.asarray(
+        [
+            polynomial.evaluate(float(y))
+            for y in ys
+        ],
+        dtype=np.float64,
+    )
+
+    residuals = np.abs(
+        xs - predicted
+    )
+
+    return residuals
+
+
 def remove_polynomial_outliers(
     points: Sequence[LanePoint],
     polynomial: LanePolynomial,
     threshold: Optional[float] = None,
 ) -> List[LanePoint]:
     """
-    Remove pontos incompatíveis com o modelo.
+    Remove outliers utilizando MAD.
 
-    Usa MAD (Median Absolute Deviation) para robustez
-    contra outliers isolados.
+    MAD:
+
+        median(|residual - median(residual)|)
+
+    O método é robusto contra poucos pontos
+    extremamente afastados da curva.
     """
 
     if (
@@ -750,28 +895,37 @@ def remove_polynomial_outliers(
         else float(threshold)
     )
 
-    residuals: List[float] = []
-
-    for point in points:
-
-        predicted = polynomial.evaluate(point.y)
-
-        residuals.append(
-            abs(point.x - predicted)
+    if threshold_value <= 0.0:
+        raise ValueError(
+            "threshold deve ser > 0."
         )
 
-    median = _safe_median(residuals)
+    residuals = _polynomial_residuals(
+        points,
+        polynomial,
+    )
+
+    if residuals.size != len(points):
+        return list(points)
+
+    if not np.all(
+        np.isfinite(residuals)
+    ):
+        return list(points)
+
+    median = float(
+        np.median(residuals)
+    )
 
     deviations = np.abs(
-        np.asarray(residuals, dtype=np.float64)
-        - median
+        residuals - median
     )
 
-    mad = _safe_median(
-        deviations.tolist()
+    mad = float(
+        np.median(deviations)
     )
 
-    if mad < 1e-6:
+    if mad < 1e-9:
 
         limit = max(
             5.0,
@@ -780,22 +934,27 @@ def remove_polynomial_outliers(
 
     else:
 
+        robust_sigma = (
+            1.4826 * mad
+        )
+
         limit = max(
             5.0,
             median
-            + threshold_value * 1.4826 * mad,
+            + threshold_value
+            * robust_sigma,
         )
 
     return [
         point
         for point, residual
         in zip(points, residuals)
-        if residual <= limit
+        if float(residual) <= limit
     ]
 
 
 # =============================================================================
-# ROBUST LANE FIT
+# ROBUST FIT
 # =============================================================================
 
 
@@ -807,17 +966,19 @@ def fit_lane_model(
     max_fit_error: Optional[float] = None,
 ) -> Optional[LanePolynomial]:
     """
-    Pipeline completo:
+    Pipeline oficial de modelagem:
 
+        observações
+            ↓
         filtragem
             ↓
         preparação
             ↓
-        fitting inicial
+        ajuste inicial
             ↓
         rejeição de outliers
             ↓
-        fitting final
+        ajuste final
     """
 
     prepared = prepare_lane_points(
@@ -826,35 +987,67 @@ def fit_lane_model(
         max_points=max_points,
     )
 
-    minimum_points = (
+    minimum = (
         LANE_MODEL.minimum_points
         if min_points is None
         else int(min_points)
     )
 
-    if len(prepared) < minimum_points:
+    if minimum < 4:
+        raise ValueError(
+            "min_points deve ser >= 4."
+        )
+
+    if len(prepared) < minimum:
         return None
 
-    initial = fit_polynomial(
+    polynomial = fit_polynomial(
         prepared,
-        min_points=minimum_points,
+        degree=3,
+        min_points=minimum,
         max_fit_error=max_fit_error,
     )
 
-    if not initial.valid:
+    if not polynomial.valid:
         return None
 
-    cleaned = remove_polynomial_outliers(
-        prepared,
-        initial,
+    iterations = int(
+        LANE_MODEL.max_outlier_iterations
     )
 
-    if len(cleaned) < minimum_points:
-        cleaned = prepared
+    cleaned = list(prepared)
+
+    for _ in range(iterations):
+
+        filtered = remove_polynomial_outliers(
+            cleaned,
+            polynomial,
+        )
+
+        if len(filtered) < minimum:
+            break
+
+        if len(filtered) == len(cleaned):
+            break
+
+        cleaned = filtered
+
+        updated = fit_polynomial(
+            cleaned,
+            degree=3,
+            min_points=minimum,
+            max_fit_error=max_fit_error,
+        )
+
+        if not updated.valid:
+            break
+
+        polynomial = updated
 
     final = fit_polynomial(
         cleaned,
-        min_points=minimum_points,
+        degree=3,
+        min_points=minimum,
         max_fit_error=max_fit_error,
     )
 
@@ -862,146 +1055,6 @@ def fit_lane_model(
         return None
 
     return final
-
-
-# =============================================================================
-# PROJECTION
-# =============================================================================
-
-
-def project_lane(
-    polynomial: Optional[LanePolynomial],
-    points: Sequence[LanePoint],
-    projection_step: Optional[float] = None,
-    minimum_confidence: Optional[float] = None,
-    horizon_y: Optional[float] = None,
-) -> LaneProjection:
-    """
-    Gera pontos matemáticos da faixa.
-
-    A projeção não é considerada observação direta.
-    """
-
-    if polynomial is None:
-
-        return LaneProjection(
-            quality=ProjectionQuality.NONE,
-            valid=False,
-        )
-
-    if not polynomial.valid:
-
-        return LaneProjection(
-            polynomial=polynomial,
-            quality=ProjectionQuality.NONE,
-            valid=False,
-        )
-
-    minimum = (
-        LANE_PROJECTION.minimum_confidence
-        if minimum_confidence is None
-        else _clip01(minimum_confidence)
-    )
-
-    if polynomial.confidence < minimum:
-
-        return LaneProjection(
-            polynomial=polynomial,
-            quality=ProjectionQuality.LOW,
-            valid=False,
-        )
-
-    if len(points) < LANE_PROJECTION.minimum_points:
-
-        return LaneProjection(
-            polynomial=polynomial,
-            quality=ProjectionQuality.LOW,
-            valid=False,
-        )
-
-    observed_y_min = min(
-        float(point.y)
-        for point in points
-    )
-
-    observed_y_max = max(
-        float(point.y)
-        for point in points
-    )
-
-    if horizon_y is None:
-        horizon_y = observed_y_min
-
-    horizon_y = float(horizon_y)
-
-    if not _is_finite(horizon_y):
-        return LaneProjection(
-            polynomial=polynomial,
-            quality=ProjectionQuality.NONE,
-            valid=False,
-        )
-
-    samples = max(
-        2,
-        int(LANE_PROJECTION.samples),
-    )
-
-    ys = np.linspace(
-        observed_y_min,
-        observed_y_max,
-        samples,
-        dtype=np.float64,
-    )
-
-    projected_points: List[LanePoint] = []
-
-    for y in ys:
-
-        x = polynomial.evaluate(float(y))
-
-        if not (
-            _is_finite(x)
-            and _is_finite(float(y))
-        ):
-            continue
-
-        projected_points.append(
-            LanePoint(
-                x=float(x),
-                y=float(y),
-                confidence=polynomial.confidence,
-                valid=True,
-            )
-        )
-
-    if len(projected_points) < LANE_PROJECTION.minimum_points:
-
-        return LaneProjection(
-            polynomial=polynomial,
-            points=projected_points,
-            quality=ProjectionQuality.LOW,
-            extrapolated=False,
-            valid=False,
-            horizon_y=horizon_y,
-        )
-
-    if polynomial.confidence >= 0.80:
-        quality = ProjectionQuality.HIGH
-
-    elif polynomial.confidence >= 0.65:
-        quality = ProjectionQuality.MEDIUM
-
-    else:
-        quality = ProjectionQuality.LOW
-
-    return LaneProjection(
-        polynomial=polynomial,
-        points=projected_points,
-        quality=quality,
-        extrapolated=False,
-        valid=True,
-        horizon_y=horizon_y,
-    )
 
 
 # =============================================================================
@@ -1019,10 +1072,9 @@ def build_lane_model(
     max_fit_error: Optional[float] = None,
 ) -> LaneModel:
     """
-    Constrói um LaneModel completo.
+    Constrói o modelo matemático de uma lane.
 
-    lane_id deve ser fornecido pelo sistema responsável
-    pela identidade da faixa.
+    A identidade lane_id é fornecida externamente.
     """
 
     prepared = prepare_lane_points(
@@ -1031,14 +1083,14 @@ def build_lane_model(
         max_points=max_points,
     )
 
-    confidence = lane_confidence_score(
-        prepared
+    observation_confidence = (
+        lane_confidence_score(prepared)
     )
 
     line = LaneLine(
         lane_id=lane_id,
         points=prepared,
-        confidence=confidence,
+        confidence=observation_confidence,
         quality=LaneQuality.NONE,
         detected_directly=True,
         projected=False,
@@ -1070,13 +1122,8 @@ def build_lane_model(
             valid=False,
         )
 
-    projection = project_lane(
-        polynomial,
-        prepared,
-    )
-
     model_confidence = _clip01(
-        0.45 * line.confidence
+        0.45 * observation_confidence
         + 0.55 * polynomial.confidence
     )
 
@@ -1086,7 +1133,7 @@ def build_lane_model(
         lane_id=lane_id,
         line=line,
         polynomial=polynomial,
-        projection=projection,
+        projection=None,
         tracked=False,
         stable=False,
         valid=(
@@ -1112,8 +1159,15 @@ def update_lane_model(
     max_fit_error: Optional[float] = None,
 ) -> LaneModel:
     """
-    Recalcula o modelo preservando sua identidade temporal.
+    Recalcula o modelo mantendo identidade temporal básica.
+
+    Tracking propriamente dito continua pertencendo ao LaneTracker.
     """
+
+    if model is None:
+        raise ValueError(
+            "model não pode ser None."
+        )
 
     updated = build_lane_model(
         lane_id=model.lane_id,
@@ -1127,7 +1181,10 @@ def update_lane_model(
     updated.tracked = model.tracked
     updated.stable = model.stable
 
-    if updated.line is not None and model.line is not None:
+    if (
+        updated.line is not None
+        and model.line is not None
+    ):
 
         updated.line.age_frames = (
             model.line.age_frames + 1
@@ -1146,7 +1203,7 @@ def update_lane_model(
 def validate_lane_model(
     model: Optional[LaneModel],
 ) -> bool:
-    """Validação estrutural completa."""
+    """Valida estruturalmente um LaneModel."""
 
     if model is None:
         return False
@@ -1182,11 +1239,24 @@ def validate_lane_model(
     ):
         return False
 
+    coefficients = (
+        model.polynomial.a,
+        model.polynomial.b,
+        model.polynomial.c,
+        model.polynomial.d,
+    )
+
+    if not all(
+        _is_finite(value)
+        for value in coefficients
+    ):
+        return False
+
     return True
 
 
 # =============================================================================
-# EXPORTS
+# PUBLIC API
 # =============================================================================
 
 
@@ -1204,7 +1274,6 @@ __all__ = [
     "fit_polynomial",
     "remove_polynomial_outliers",
     "fit_lane_model",
-    "project_lane",
     "build_lane_model",
     "update_lane_model",
     "validate_lane_model",
