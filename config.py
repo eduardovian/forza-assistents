@@ -3,38 +3,40 @@ config.py
 
 Configuração central do Forza Assistents.
 
-Arquitetura:
+PRINCÍPIO FUNDAMENTAL
+---------------------
 
-    Screen Capture
-        ↓
+Este arquivo é a única fonte de verdade para configurações
+do sistema.
+
+Especialmente:
+
     ROI
-        ↓
+    ↓
+    ScreenCapture
+    ↓
     YOLOP
-        ↓
+    ↓
     Lane Tracker
-        ↓
-    Lane Geometry
-        ↓
-    Lane Models
-        ↓
-    Lane Projection
-        ↓
-    Lane Assignment
-        ↓
-    ADAS State
-        ↓
-    Main / Monitor
-        ↓
-    Futuramente: LKA / G29
+    ↓
+    Geometry
+    ↓
+    Projection
+    ↓
+    Assignment
+    ↓
+    ADAS
 
-Princípios:
-- configuração centralizada;
-- nenhuma lógica de visão neste arquivo;
-- compatibilidade com os módulos atuais;
-- MONITOR como modo padrão;
-- controle físico desabilitado por segurança;
-- parâmetros explícitos e facilmente ajustáveis;
-- preparado para execução em tempo real.
+Nenhum outro módulo deve definir um ROI próprio.
+
+O ROI é definido em coordenadas da tela:
+
+    (left, top, right, bottom)
+
+Exemplo:
+
+    ROI = (0, 700, 2560, 1600)
+
 """
 
 from __future__ import annotations
@@ -53,10 +55,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 WEIGHTS_DIR = PROJECT_ROOT / "weights"
 
-YOLOP_MODEL_PATH = WEIGHTS_DIR / "yolop-640-640.onnx"
+YOLOP_MODEL_PATH = (
+    WEIGHTS_DIR / "yolop-640-640.onnx"
+)
 
 CALIBRATION_DIR = PROJECT_ROOT / "calibration"
-CALIBRATION_FILE = CALIBRATION_DIR / "camera_calibration.json"
+
+CALIBRATION_FILE = (
+    CALIBRATION_DIR / "camera_calibration.json"
+)
 
 LOG_DIR = PROJECT_ROOT / "logs"
 
@@ -68,10 +75,6 @@ SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
 # ============================================================================
 
 class RuntimeMode(str, Enum):
-    """
-    Estado operacional do sistema.
-    """
-
     DISABLED = "disabled"
     MONITOR = "monitor"
     ASSIST = "assist"
@@ -81,38 +84,77 @@ DEFAULT_RUNTIME_MODE = RuntimeMode.MONITOR
 
 
 # ============================================================================
-# GLOBAL SAFETY
+# SCREEN / ROI
 # ============================================================================
 
 @dataclass(frozen=True)
-class SafetyConfig:
+class ROIConfig:
     """
-    Configurações de segurança do sistema.
+    Configuração central da região de interesse.
 
-    O projeto deve permanecer em MONITOR até que toda a cadeia
-    de percepção e decisão seja validada em condições reais.
+    Coordenadas referentes à tela inteira:
+
+        left
+        top
+        right
+        bottom
+
+    Exemplo para uma tela 2560x1600:
+
+        (0, 700, 2560, 1600)
+
     """
 
-    enable_control: bool = False
+    enabled: bool = True
 
-    emergency_stop_enabled: bool = True
+    # ROI da tela.
+    left: int = 0
+    top: int = 700
+    right: int = 2560
+    bottom: int = 1600
 
-    require_valid_lane: bool = True
+    # Permite validar automaticamente o ROI
+    # contra a resolução capturada.
+    clamp_to_frame: bool = True
 
-    require_geometry_valid: bool = True
+    @property
+    def rectangle(self) -> Tuple[int, int, int, int]:
+        """
+        Retorna o ROI no formato:
 
-    require_assignment_valid: bool = True
+            (left, top, right, bottom)
+        """
 
-    minimum_adas_confidence: float = 0.55
+        return (
+            self.left,
+            self.top,
+            self.right,
+            self.bottom,
+        )
 
-    maximum_allowed_detection_age_frames: int = 5
+    @property
+    def width(self) -> int:
+        return max(
+            0,
+            self.right - self.left,
+        )
 
-    maximum_lost_frames_before_disable: int = 15
+    @property
+    def height(self) -> int:
+        return max(
+            0,
+            self.bottom - self.top,
+        )
 
-    zero_command_on_invalid_state: bool = True
+    @property
+    def size(self) -> Tuple[int, int]:
+        return (
+            self.width,
+            self.height,
+        )
 
 
-SAFETY = SafetyConfig()
+ROI = ROIConfig()
 
 
 # ============================================================================
@@ -124,10 +166,17 @@ class CaptureConfig:
     """
     Configuração da captura da tela.
 
-    A captura deve permanecer independente da inferência.
+    IMPORTANTE:
+
+    O ROI utilizado pelo sistema vem exclusivamente de:
+
+        ROI
+
+    Não deve existir outro ROI definido em main.py,
+    ScreenCapture ou qualquer outro módulo.
     """
 
-    backend: str = "dxcam"
+    backend: str = "dxgi"
 
     monitor_index: int = 0
 
@@ -137,25 +186,16 @@ class CaptureConfig:
 
     capture_full_screen: bool = True
 
-    # ROI na tela original.
-    #
-    # x1, y1, x2, y2
-    roi: Tuple[int, int, int, int] = (
-        300,
-        700,
-        2200,
-        1600,
-    )
+    # ROI centralizado.
+    use_roi: bool = ROI.enabled
 
-    # Quando True, o ROI acima é usado diretamente.
-    # Quando False, o sistema pode utilizar a imagem inteira.
-    use_roi: bool = True
+    roi: Tuple[int, int, int, int] = ROI.rectangle
 
-    # Evita cópias desnecessárias quando possível.
     copy_frame: bool = False
 
-    # BGR é utilizado pelo OpenCV.
     output_color_format: str = "BGR"
+
+    max_buffer_size: int = 2
 
 
 CAPTURE = CaptureConfig()
@@ -167,9 +207,6 @@ CAPTURE = CaptureConfig()
 
 @dataclass(frozen=True)
 class YOLOPConfig:
-    """
-    Configuração do detector YOLOP.
-    """
 
     model_path: Path = YOLOP_MODEL_PATH
 
@@ -191,20 +228,12 @@ class YOLOPConfig:
 
     enable_dynamic_provider_fallback: bool = True
 
-    # Número máximo de lanes que o pipeline aceita.
-    #
-    # Importante:
-    # o detector deve preservar todas as linhas detectadas.
     max_lanes: int = 16
 
-    # Número mínimo de pontos para uma lane ser considerada.
     minimum_lane_points: int = 4
 
-    # Permite manter detecções de baixa confiança para posterior
-    # filtragem pelo tracker/modelo.
     preserve_low_confidence_lanes: bool = True
 
-    # Normalização esperada pelo modelo.
     input_scale: float = 1.0 / 255.0
 
     mean: Tuple[float, float, float] = (
@@ -229,12 +258,6 @@ YOLOP = YOLOPConfig()
 
 @dataclass(frozen=True)
 class LaneTrackerConfig:
-    """
-    Rastreamento temporal das lanes.
-
-    O detector trabalha frame a frame.
-    O tracker fornece continuidade temporal.
-    """
 
     max_lost_frames: int = 12
 
@@ -271,22 +294,24 @@ LANE_TRACKER = LaneTrackerConfig()
 @dataclass(frozen=True)
 class LaneGeometryConfig:
     """
-    Estima a geometria da faixa atual.
+    Geometria trabalha sobre o FRAME JÁ RECORTADO pelo ROI.
 
-    Trabalha com:
-    - posição lateral;
-    - heading;
-    - largura;
-    - curvatura;
-    - extensão observada;
-    - confiança.
+    Portanto:
+
+        image_width
+        image_height
+
+    representam as dimensões do ROI.
+
+    Não representam a tela inteira.
     """
 
-    image_width: int = 1987
+    # Dimensões esperadas do ROI.
+    #
+    # São derivadas automaticamente da configuração central.
+    image_width: int = ROI.width
 
-    image_height: int = 698
-
-    roi_height: int = 700
+    image_height: int = ROI.height
 
     min_lane_confidence: float = 0.35
 
@@ -336,9 +361,6 @@ LANE_GEOMETRY = LaneGeometryConfig()
 
 @dataclass(frozen=True)
 class LaneModelConfig:
-    """
-    Configuração da modelagem matemática das lanes.
-    """
 
     polynomial_degree: int = 2
 
@@ -368,9 +390,6 @@ LANE_MODEL = LaneModelConfig()
 
 @dataclass(frozen=True)
 class LaneProjectionConfig:
-    """
-    Projeção das lanes para pontos úteis ao ADAS.
-    """
 
     enabled: bool = True
 
@@ -402,10 +421,6 @@ LANE_PROJECTION = LaneProjectionConfig()
 
 @dataclass(frozen=True)
 class LaneAssignmentConfig:
-    """
-    Determina qual lane representa a faixa atual e quais são
-    as lanes à esquerda e à direita.
-    """
 
     enabled: bool = True
 
@@ -434,14 +449,11 @@ LANE_ASSIGNMENT = LaneAssignmentConfig()
 
 
 # ============================================================================
-# ADAS STATE
+# ADAS
 # ============================================================================
 
 @dataclass(frozen=True)
 class ADASConfig:
-    """
-    Máquina de estados do ADAS.
-    """
 
     enabled: bool = True
 
@@ -483,11 +495,6 @@ ADAS = ADASConfig()
 
 @dataclass(frozen=True)
 class TemporalFilterConfig:
-    """
-    Suavização temporal das métricas.
-
-    Reduz jitter sem introduzir atraso excessivo.
-    """
 
     enabled: bool = True
 
@@ -512,16 +519,40 @@ TEMPORAL_FILTER = TemporalFilterConfig()
 
 
 # ============================================================================
-# CONTROL / LKA
+# SAFETY
+# ============================================================================
+
+@dataclass(frozen=True)
+class SafetyConfig:
+
+    enable_control: bool = False
+
+    emergency_stop_enabled: bool = True
+
+    require_valid_lane: bool = True
+
+    require_geometry_valid: bool = True
+
+    require_assignment_valid: bool = True
+
+    minimum_adas_confidence: float = 0.55
+
+    maximum_allowed_detection_age_frames: int = 5
+
+    maximum_lost_frames_before_disable: int = 15
+
+    zero_command_on_invalid_state: bool = True
+
+
+SAFETY = SafetyConfig()
+
+
+# ============================================================================
+# LKA
 # ============================================================================
 
 @dataclass(frozen=True)
 class LKAConfig:
-    """
-    Configuração futura do Lane Keeping Assist.
-
-    Por segurança, o controle permanece desabilitado.
-    """
 
     enabled: bool = False
 
@@ -557,11 +588,6 @@ LKA = LKAConfig()
 
 @dataclass(frozen=True)
 class G29Config:
-    """
-    Interface do Logitech G29.
-
-    Permanece desabilitada durante a fase de validação.
-    """
 
     enabled: bool = False
 
@@ -586,16 +612,11 @@ G29 = G29Config()
 
 
 # ============================================================================
-# VISUALIZATION / DEBUG
+# VISUALIZATION
 # ============================================================================
 
 @dataclass(frozen=True)
 class VisualizationConfig:
-    """
-    Debug visual do sistema.
-
-    Extremamente importante durante a fase de validação no jogo.
-    """
 
     enabled: bool = True
 
@@ -639,9 +660,6 @@ VISUALIZATION = VisualizationConfig()
 
 @dataclass(frozen=True)
 class PerformanceConfig:
-    """
-    Metas de execução em tempo real.
-    """
 
     target_capture_fps: int = 60
 
@@ -675,9 +693,6 @@ PERFORMANCE = PerformanceConfig()
 
 @dataclass(frozen=True)
 class LoggingConfig:
-    """
-    Logging operacional.
-    """
 
     enabled: bool = True
 
@@ -713,11 +728,8 @@ LOGGING = LoggingConfig()
 
 @dataclass(frozen=True)
 class HotkeyConfig:
-    """
-    Teclas de operação durante os testes.
-    """
 
-    toggle_monitor: str = "F8"
+    toggle_monitor: str = "m"
 
     emergency_stop: str = "F9"
 
@@ -730,14 +742,11 @@ HOTKEYS = HotkeyConfig()
 
 
 # ============================================================================
-# DEBUG / DEVELOPMENT
+# DEBUG
 # ============================================================================
 
 @dataclass(frozen=True)
 class DebugConfig:
-    """
-    Opções úteis durante desenvolvimento.
-    """
 
     enabled: bool = True
 
@@ -766,11 +775,8 @@ DEBUG = DebugConfig()
 
 
 # ============================================================================
-# COMPATIBILITY / LEGACY
+# LEGACY UFLD
 # ============================================================================
-
-# Compatibilidade com código antigo que ainda possa importar
-# constantes relacionadas ao UFLD.
 
 UFLD_INPUT_WIDTH = 800
 UFLD_INPUT_HEIGHT = 288
@@ -784,19 +790,26 @@ UFLD_ROW_ANCHORS = 18
 
 @dataclass(frozen=True)
 class SystemConfig:
-    """
-    Configuração global do sistema.
-    """
 
     project_root: Path = PROJECT_ROOT
 
     runtime_mode: RuntimeMode = DEFAULT_RUNTIME_MODE
 
-    safety: SafetyConfig = field(default=SAFETY)
+    roi: ROIConfig = field(
+        default=ROI
+    )
 
-    capture: CaptureConfig = field(default=CAPTURE)
+    safety: SafetyConfig = field(
+        default=SAFETY
+    )
 
-    yolop: YOLOPConfig = field(default=YOLOP)
+    capture: CaptureConfig = field(
+        default=CAPTURE
+    )
+
+    yolop: YOLOPConfig = field(
+        default=YOLOP
+    )
 
     lane_tracker: LaneTrackerConfig = field(
         default=LANE_TRACKER
@@ -818,15 +831,21 @@ class SystemConfig:
         default=LANE_ASSIGNMENT
     )
 
-    adas: ADASConfig = field(default=ADAS)
+    adas: ADASConfig = field(
+        default=ADAS
+    )
 
     temporal_filter: TemporalFilterConfig = field(
         default=TEMPORAL_FILTER
     )
 
-    lka: LKAConfig = field(default=LKA)
+    lka: LKAConfig = field(
+        default=LKA
+    )
 
-    g29: G29Config = field(default=G29)
+    g29: G29Config = field(
+        default=G29
+    )
 
     visualization: VisualizationConfig = field(
         default=VISUALIZATION
@@ -858,14 +877,72 @@ CONFIG = SystemConfig()
 
 def validate_config() -> None:
     """
-    Valida configurações críticas antes da inicialização.
+    Validação central da configuração.
     """
 
-    if CAPTURE.target_fps <= 0:
-        raise ValueError("CAPTURE.target_fps must be > 0")
+    # ------------------------------------------------------------------------
+    # ROI
+    # ------------------------------------------------------------------------
 
-    if YOLOP.input_width <= 0 or YOLOP.input_height <= 0:
-        raise ValueError("YOLOP input dimensions must be > 0")
+    if ROI.enabled:
+
+        if ROI.left < 0:
+            raise ValueError(
+                "ROI.left must be >= 0"
+            )
+
+        if ROI.top < 0:
+            raise ValueError(
+                "ROI.top must be >= 0"
+            )
+
+        if ROI.right <= ROI.left:
+            raise ValueError(
+                "ROI.right must be greater than ROI.left"
+            )
+
+        if ROI.bottom <= ROI.top:
+            raise ValueError(
+                "ROI.bottom must be greater than ROI.top"
+            )
+
+        if ROI.width <= 0:
+            raise ValueError(
+                "ROI width must be > 0"
+            )
+
+        if ROI.height <= 0:
+            raise ValueError(
+                "ROI height must be > 0"
+            )
+
+    # ------------------------------------------------------------------------
+    # Capture
+    # ------------------------------------------------------------------------
+
+    if CAPTURE.target_fps <= 0:
+        raise ValueError(
+            "CAPTURE.target_fps must be > 0"
+        )
+
+    if CAPTURE.max_buffer_size <= 0:
+        raise ValueError(
+            "CAPTURE.max_buffer_size must be > 0"
+        )
+
+    # ------------------------------------------------------------------------
+    # YOLOP
+    # ------------------------------------------------------------------------
+
+    if YOLOP.input_width <= 0:
+        raise ValueError(
+            "YOLOP.input_width must be > 0"
+        )
+
+    if YOLOP.input_height <= 0:
+        raise ValueError(
+            "YOLOP.input_height must be > 0"
+        )
 
     if not 0.0 <= YOLOP.confidence_threshold <= 1.0:
         raise ValueError(
@@ -877,6 +954,10 @@ def validate_config() -> None:
             "YOLOP.lane_confidence_threshold must be between 0 and 1"
         )
 
+    # ------------------------------------------------------------------------
+    # Tracker
+    # ------------------------------------------------------------------------
+
     if LANE_TRACKER.max_lost_frames < 0:
         raise ValueError(
             "LANE_TRACKER.max_lost_frames must be >= 0"
@@ -887,33 +968,67 @@ def validate_config() -> None:
             "LANE_TRACKER.history_size must be > 0"
         )
 
+    # ------------------------------------------------------------------------
+    # Geometry
+    # ------------------------------------------------------------------------
+
     if LANE_GEOMETRY.min_points < 2:
         raise ValueError(
             "LANE_GEOMETRY.min_points must be >= 2"
         )
+
+    if LANE_GEOMETRY.image_width <= 0:
+        raise ValueError(
+            "LANE_GEOMETRY.image_width must be > 0"
+        )
+
+    if LANE_GEOMETRY.image_height <= 0:
+        raise ValueError(
+            "LANE_GEOMETRY.image_height must be > 0"
+        )
+
+    # ------------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------------
 
     if LANE_MODEL.polynomial_degree < 1:
         raise ValueError(
             "LANE_MODEL.polynomial_degree must be >= 1"
         )
 
+    # ------------------------------------------------------------------------
+    # Projection
+    # ------------------------------------------------------------------------
+
     if LANE_PROJECTION.samples <= 0:
         raise ValueError(
             "LANE_PROJECTION.samples must be > 0"
         )
+
+    # ------------------------------------------------------------------------
+    # Safety
+    # ------------------------------------------------------------------------
 
     if not 0.0 <= SAFETY.minimum_adas_confidence <= 1.0:
         raise ValueError(
             "SAFETY.minimum_adas_confidence must be between 0 and 1"
         )
 
+    # ------------------------------------------------------------------------
+    # LKA
+    # ------------------------------------------------------------------------
+
     if not 0.0 <= LKA.max_steering <= 1.0:
         raise ValueError(
             "LKA.max_steering must be between 0 and 1"
         )
 
-    # Controle físico nunca deve ser habilitado acidentalmente.
+    # ------------------------------------------------------------------------
+    # Physical control safety
+    # ------------------------------------------------------------------------
+
     if DEFAULT_RUNTIME_MODE != RuntimeMode.ASSIST:
+
         if G29.enabled:
             raise ValueError(
                 "G29 cannot be enabled outside ASSIST mode"
@@ -945,10 +1060,27 @@ def get_log_directory() -> Path:
     return LOG_DIR
 
 
+def get_roi() -> Tuple[int, int, int, int]:
+    """
+    Retorna o ROI oficial do sistema.
+
+    Este é o método recomendado pelos módulos.
+    """
+
+    return ROI.rectangle
+
+
+def get_roi_size() -> Tuple[int, int]:
+    """
+    Retorna:
+
+        (width, height)
+    """
+
+    return ROI.size
+
+
 def ensure_directories() -> None:
-    """
-    Cria somente diretórios necessários.
-    """
 
     LOG_DIR.mkdir(
         parents=True,
