@@ -75,7 +75,12 @@ ROI_Y2_RATIO = 1.00
 # =============================================================================
 # IMAGE LOADING
 # =============================================================================
-
+@pytest.mark.skipif(
+    not IMAGE_PATH.exists(),
+    reason="Fixture yolop_test.png não disponível",
+)
+def test_yolop_full_pipeline() -> None:
+    
 def load_image(path: Path) -> np.ndarray:
     """
     Carrega uma imagem usando bytes + imdecode.
@@ -718,3 +723,5 @@ def test_yolop_full_pipeline() -> None:
     )
 
     print("=" * 72)
+
+    

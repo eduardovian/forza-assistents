@@ -1,71 +1,224 @@
 """
-Forza Horizon ADAS/LKA
-Filtro temporal robusto para detecção e geometria de faixas.
+vision/temporal_filter.py
 
-Objetivos:
-- Reduzir jitter entre frames.
-- Preservar curvas reais.
-- Rejeitar saltos impossíveis.
-- Não inventar faixas quando a detecção desaparece.
-- Manter compatibilidade com UFLDLaneDetector e LaneGeometry.
+Filtro temporal EMA para detecções e geometria de faixa.
+
+Responsabilidades
+-----------------
+- Suavizar detecções de faixa entre frames.
+- Reduzir jitter espacial.
+- Tolerar perdas temporárias de detecção.
+- Aplicar decay durante frames inválidos.
+- Nunca transformar uma detecção inválida em uma detecção válida.
+- Preservar a estrutura de LaneDetectionResult.
+- Funcionar independentemente do detector utilizado (YOLOP, UFLD etc.).
+
+O filtro não faz:
+- classificação de faixas;
+- modelagem geométrica;
+- projeção;
+- controle de direção.
+
+Essas responsabilidades pertencem aos módulos seguintes do pipeline.
 """
 
 from __future__ import annotations
 
-import logging
 from dataclasses import replace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence
 
-import numpy as np
+import math
 
-from .detection_types import LaneDetectionResult, LanePoint
-from .lane_geometry import LaneGeometryResult
+from .detection_types import (
+    LaneDetectionResult,
+    LanePoint,
+)
 
-logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CONFIGURAÇÃO
+# ============================================================================
+
+
+DEFAULT_ALPHA = 0.45
+DEFAULT_INVALID_DECAY = 0.80
+DEFAULT_MAX_MISSED_FRAMES = 8
+
+DEFAULT_MIN_CONFIDENCE = 0.05
+DEFAULT_MAX_POINT_DISTANCE = 100.0
+
+
+# ============================================================================
+# UTILITÁRIOS
+# ============================================================================
+
+
+def _finite(value: float) -> bool:
+    """Retorna True somente para valores numéricos finitos."""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _valid_point(point: LanePoint) -> bool:
+    """
+    Valida um LanePoint sem alterar seu estado.
+
+    Um ponto somente participa do filtro se:
+    - x e y forem finitos;
+    - confidence for finita;
+    - valid estiver ativo;
+    - confidence for positiva.
+    """
+    return (
+        bool(getattr(point, "valid", True))
+        and _finite(point.x)
+        and _finite(point.y)
+        and _finite(point.confidence)
+        and float(point.confidence) > 0.0
+    )
+
+
+def _distance(a: LanePoint, b: LanePoint) -> float:
+    return math.hypot(
+        float(a.x) - float(b.x),
+        float(a.y) - float(b.y),
+    )
+
+
+def _copy_point(
+    point: LanePoint,
+    *,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    confidence: Optional[float] = None,
+    valid: Optional[bool] = None,
+) -> LanePoint:
+    """
+    Cria uma cópia segura do LanePoint.
+
+    Mantém compatibilidade com dataclasses que possam receber
+    atributos adicionais através de replace().
+    """
+    values = {
+        "x": float(point.x if x is None else x),
+        "y": float(point.y if y is None else y),
+        "confidence": float(
+            point.confidence
+            if confidence is None
+            else confidence
+        ),
+        "valid": bool(
+            point.valid
+            if valid is None
+            else valid
+        ),
+    }
+
+    try:
+        return replace(point, **values)
+    except TypeError:
+        return LanePoint(**values)
+
+
+# ============================================================================
+# EMA DE PONTOS
+# ============================================================================
 
 
 class EMATemporalFilter:
     """
-    Filtro temporal para lanes e geometria.
+    Filtro temporal EMA para LaneDetectionResult.
 
-    O filtro trabalha separadamente nas duas bordas da faixa.
+    Parâmetros
+    ----------
+    alpha:
+        Peso da detecção atual.
 
-    Características:
-    - EMA adaptativa.
-    - Rejeição de saltos grandes.
-    - Decaimento controlado quando uma lane desaparece.
-    - Não transforma ausência de detecção em detecção válida.
+        1.0 -> sem suavização.
+        0.0 -> mantém completamente o estado anterior.
+
+    invalid_decay:
+        Fator aplicado à confiança quando a detecção atual está ausente
+        ou inválida.
+
+    max_missed_frames:
+        Número máximo de frames que o estado anterior pode ser mantido
+        durante uma perda temporária.
+
+    max_point_distance:
+        Distância máxima permitida para associar um novo ponto ao ponto
+        filtrado anterior.
     """
 
     def __init__(
         self,
-        alpha: float = 0.35,
-        min_alpha: float = 0.15,
-        max_alpha: float = 0.65,
-        max_x_jump: float = 90.0,
-        max_y_jump: float = 20.0,
-        max_missing_frames: int = 3,
-        min_valid_points: int = 3,
-    ):
-        self.alpha = float(np.clip(alpha, 0.01, 1.0))
-        self.min_alpha = float(np.clip(min_alpha, 0.01, 1.0))
-        self.max_alpha = float(np.clip(max_alpha, self.min_alpha, 1.0))
+        alpha: float = DEFAULT_ALPHA,
+        invalid_decay: float = DEFAULT_INVALID_DECAY,
+        max_missed_frames: int = DEFAULT_MAX_MISSED_FRAMES,
+        max_point_distance: float = DEFAULT_MAX_POINT_DISTANCE,
+    ) -> None:
 
-        self.max_x_jump = float(max_x_jump)
-        self.max_y_jump = float(max_y_jump)
-        self.max_missing_frames = int(max(0, max_missing_frames))
-        self.min_valid_points = int(max(1, min_valid_points))
+        if not _finite(alpha):
+            raise ValueError("alpha deve ser finito.")
 
-        self._left: Optional[List[LanePoint]] = None
-        self._right: Optional[List[LanePoint]] = None
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha deve estar entre 0 e 1.")
 
-        self._geometry: Optional[LaneGeometryResult] = None
+        if not _finite(invalid_decay):
+            raise ValueError("invalid_decay deve ser finito.")
 
-        self._left_missing = 0
-        self._right_missing = 0
-        self._geometry_missing = 0
+        if not 0.0 <= invalid_decay <= 1.0:
+            raise ValueError(
+                "invalid_decay deve estar entre 0 e 1."
+            )
 
-        self.reset()
+        if int(max_missed_frames) < 0:
+            raise ValueError(
+                "max_missed_frames não pode ser negativo."
+            )
+
+        if not _finite(max_point_distance):
+            raise ValueError(
+                "max_point_distance deve ser finito."
+            )
+
+        if float(max_point_distance) <= 0.0:
+            raise ValueError(
+                "max_point_distance deve ser positivo."
+            )
+
+        self.alpha = float(alpha)
+        self.invalid_decay = float(invalid_decay)
+        self.max_missed_frames = int(max_missed_frames)
+        self.max_point_distance = float(max_point_distance)
+
+        self._previous: Optional[LaneDetectionResult] = None
+        self._missed_frames = 0
+
+    # ------------------------------------------------------------------
+    # PROPRIEDADES
+    # ------------------------------------------------------------------
+
+    @property
+    def previous(self) -> Optional[LaneDetectionResult]:
+        """Último estado filtrado."""
+        return self._previous
+
+    @property
+    def missed_frames(self) -> int:
+        """Quantidade de frames consecutivos sem detecção válida."""
+        return self._missed_frames
+
+    @property
+    def initialized(self) -> bool:
+        """Indica se o filtro já recebeu uma detecção."""
+        return self._previous is not None
 
     # ------------------------------------------------------------------
     # RESET
@@ -73,543 +226,414 @@ class EMATemporalFilter:
 
     def reset(self) -> None:
         """Limpa completamente o estado temporal."""
-        self._left = None
-        self._right = None
-        self._geometry = None
-
-        self._left_missing = 0
-        self._right_missing = 0
-        self._geometry_missing = 0
+        self._previous = None
+        self._missed_frames = 0
 
     # ------------------------------------------------------------------
-    # UTILITÁRIOS
+    # PONTO
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _valid_points(points: List[LanePoint]) -> List[LanePoint]:
-        """Retorna somente pontos geometricamente válidos."""
-        return [
-            p
-            for p in points
-            if p.valid
-            and np.isfinite(p.x)
-            and np.isfinite(p.y)
-            and np.isfinite(p.confidence)
-            and p.confidence > 0.0
-        ]
-
-    def _lane_is_valid(self, lane: List[LanePoint]) -> bool:
-        return len(self._valid_points(lane)) >= self.min_valid_points
-
-    @staticmethod
-    def _ema(old: float, new: float, alpha: float) -> float:
-        return old + alpha * (new - old)
-
-    def _adaptive_alpha(self, old_x: float, new_x: float) -> float:
-        """
-        Quanto maior o deslocamento, menor a confiança no novo frame.
-
-        Isso evita que um único erro do detector faça a linha "pular".
-        """
-        distance = abs(new_x - old_x)
-
-        if distance >= self.max_x_jump:
-            return self.min_alpha
-
-        ratio = distance / max(self.max_x_jump, 1e-6)
-
-        return (
-            self.max_alpha
-            - ratio * (self.max_alpha - self.min_alpha)
-        )
-
-    # ------------------------------------------------------------------
-    # LANE FILTER
-    # ------------------------------------------------------------------
-
-    def _filter_lane(
+    def _smooth_point(
         self,
-        current: List[LanePoint],
-        previous: Optional[List[LanePoint]],
-    ) -> List[LanePoint]:
+        previous: LanePoint,
+        current: LanePoint,
+    ) -> LanePoint:
         """
-        Suaviza uma lane mantendo os mesmos row anchors.
-
-        Pontos inválidos não são convertidos artificialmente em válidos.
+        Aplica EMA espacial entre dois pontos associados.
         """
 
-        if previous is None:
-            return list(current)
+        alpha = self.alpha
 
-        if len(current) != len(previous):
-            return list(current)
-
-        result: List[LanePoint] = []
-
-        for current_point, previous_point in zip(current, previous):
-
-            # ----------------------------------------------------------
-            # Novo ponto inválido
-            # ----------------------------------------------------------
-            if not current_point.valid:
-
-                # Mantemos o ponto anterior apenas como histórico,
-                # mas não declaramos o novo frame como válido.
-                result.append(
-                    LanePoint(
-                        x=previous_point.x,
-                        y=previous_point.y,
-                        confidence=max(
-                            0.0,
-                            previous_point.confidence * 0.85
-                        ),
-                        valid=False,
-                    )
-                )
-                continue
-
-            # ----------------------------------------------------------
-            # Primeiro ponto válido
-            # ----------------------------------------------------------
-            if not previous_point.valid:
-                result.append(current_point)
-                continue
-
-            # ----------------------------------------------------------
-            # Verificações numéricas
-            # ----------------------------------------------------------
-            if not (
-                np.isfinite(current_point.x)
-                and np.isfinite(current_point.y)
-                and np.isfinite(previous_point.x)
-                and np.isfinite(previous_point.y)
-            ):
-                result.append(
-                    LanePoint(
-                        x=previous_point.x,
-                        y=previous_point.y,
-                        confidence=0.0,
-                        valid=False,
-                    )
-                )
-                continue
-
-            dx = abs(current_point.x - previous_point.x)
-            dy = abs(current_point.y - previous_point.y)
-
-            # ----------------------------------------------------------
-            # Salto impossível
-            # ----------------------------------------------------------
-            if dx > self.max_x_jump or dy > self.max_y_jump:
-                alpha = self.min_alpha
-            else:
-                alpha = self._adaptive_alpha(
-                    previous_point.x,
-                    current_point.x,
-                )
-
-            filtered_x = self._ema(
-                previous_point.x,
-                current_point.x,
-                alpha,
-            )
-
-            filtered_y = self._ema(
-                previous_point.y,
-                current_point.y,
-                alpha,
-            )
-
-            filtered_confidence = self._ema(
-                previous_point.confidence,
-                current_point.confidence,
-                alpha,
-            )
-
-            result.append(
-                LanePoint(
-                    x=float(filtered_x),
-                    y=float(filtered_y),
-                    confidence=float(
-                        np.clip(filtered_confidence, 0.0, 1.0)
-                    ),
-                    valid=True,
-                )
-            )
-
-        return result
-
-    # ------------------------------------------------------------------
-    # DETECTION
-    # ------------------------------------------------------------------
-
-    def filter_detection(
-        self,
-        detection: LaneDetectionResult,
-    ) -> LaneDetectionResult:
-        """
-        Filtra uma detecção completa.
-
-        Importante:
-        o filtro nunca transforma uma detecção inválida em válida
-        apenas porque existia uma detecção anterior.
-        """
-
-        if detection is None:
-            return detection
-
-        current_left = detection.left_lane
-        current_right = detection.right_lane
-
-        left_valid = self._lane_is_valid(current_left)
-        right_valid = self._lane_is_valid(current_right)
-
-        # --------------------------------------------------------------
-        # LEFT
-        # --------------------------------------------------------------
-
-        if left_valid:
-            filtered_left = self._filter_lane(
-                current_left,
-                self._left,
-            )
-            self._left = filtered_left
-            self._left_missing = 0
-        else:
-            self._left_missing += 1
-
-            if (
-                self._left is not None
-                and self._left_missing <= self.max_missing_frames
-            ):
-                filtered_left = self._decay_lane(self._left)
-            else:
-                filtered_left = list(current_left)
-
-        # --------------------------------------------------------------
-        # RIGHT
-        # --------------------------------------------------------------
-
-        if right_valid:
-            filtered_right = self._filter_lane(
-                current_right,
-                self._right,
-            )
-            self._right = filtered_right
-            self._right_missing = 0
-        else:
-            self._right_missing += 1
-
-            if (
-                self._right is not None
-                and self._right_missing <= self.max_missing_frames
-            ):
-                filtered_right = self._decay_lane(self._right)
-            else:
-                filtered_right = list(current_right)
-
-        # --------------------------------------------------------------
-        # ADDITIONAL LANES
-        # --------------------------------------------------------------
-
-        additional_lanes = [
-            list(lane)
-            for lane in detection.additional_lanes
-        ]
-
-        # --------------------------------------------------------------
-        # CONFIDENCE
-        # --------------------------------------------------------------
-
-        left_conf = self._lane_confidence(filtered_left)
-        right_conf = self._lane_confidence(filtered_right)
-
-        left_points = sum(
-            1 for p in filtered_left if p.valid
+        x = (
+            alpha * float(current.x)
+            + (1.0 - alpha) * float(previous.x)
         )
 
-        right_points = sum(
-            1 for p in filtered_right if p.valid
+        y = (
+            alpha * float(current.y)
+            + (1.0 - alpha) * float(previous.y)
         )
 
-        valid = (
-            left_points >= self.min_valid_points
-            and right_points >= self.min_valid_points
+        confidence = (
+            alpha * float(current.confidence)
+            + (1.0 - alpha) * float(previous.confidence)
         )
 
-        return LaneDetectionResult(
-            left_lane=filtered_left,
-            right_lane=filtered_right,
-            additional_lanes=additional_lanes,
-            left_confidence=float(left_conf),
-            right_confidence=float(right_conf),
-            valid=valid,
-            num_lanes_detected=detection.num_lanes_detected,
-        )
+        confidence = _clamp(confidence, 0.0, 1.0)
 
-    def _decay_lane(
-        self,
-        lane: List[LanePoint],
-    ) -> List[LanePoint]:
-        """
-        Reduz progressivamente a confiança de uma lane desaparecida.
-
-        Não mantém a lane como válida indefinidamente.
-        """
-
-        result = []
-
-        for point in lane:
-            confidence = point.confidence * 0.70
-
-            result.append(
-                LanePoint(
-                    x=point.x,
-                    y=point.y,
-                    confidence=float(confidence),
-                    valid=False,
-                )
-            )
-
-        return result
-
-    @staticmethod
-    def _lane_confidence(
-        lane: List[LanePoint],
-    ) -> float:
-        values = [
-            p.confidence
-            for p in lane
-            if p.valid and p.confidence > 0.0
-        ]
-
-        if not values:
-            return 0.0
-
-        return float(np.mean(values))
-
-    # ------------------------------------------------------------------
-    # GEOMETRY
-    # ------------------------------------------------------------------
-
-    def filter_geometry(
-        self,
-        geometry: LaneGeometryResult,
-    ) -> LaneGeometryResult:
-        """
-        Suaviza a geometria calculada.
-
-        A geometria só é suavizada quando válida.
-        Uma geometria inválida não deve ser usada para fabricar
-        uma trajetória aparentemente válida.
-        """
-
-        if geometry is None:
-            return geometry
-
-        if not geometry.valid:
-            self._geometry_missing += 1
-
-            # Depois de alguns frames sem geometria válida,
-            # descartamos completamente o histórico.
-            if self._geometry_missing > self.max_missing_frames:
-                self._geometry = None
-
-            return geometry
-
-        self._geometry_missing = 0
-
-        if self._geometry is None:
-            self._geometry = geometry
-            return geometry
-
-        previous = self._geometry
-
-        alpha = self._geometry_alpha(
-            previous,
-            geometry,
-        )
-
-        filtered_center_line = self._filter_points(
-            previous.center_line,
-            geometry.center_line,
-            alpha,
-        )
-
-        filtered_left = self._filter_xy_points(
-            previous.left_lane_screen,
-            geometry.left_lane_screen,
-            alpha,
-        )
-
-        filtered_right = self._filter_xy_points(
-            previous.right_lane_screen,
-            geometry.right_lane_screen,
-            alpha,
-        )
-
-        result = replace(
-            geometry,
-            lane_center_x=float(
-                self._ema(
-                    previous.lane_center_x,
-                    geometry.lane_center_x,
-                    alpha,
-                )
-            ),
-            lane_center_y=float(
-                self._ema(
-                    previous.lane_center_y,
-                    geometry.lane_center_y,
-                    alpha,
-                )
-            ),
-            lateral_error=float(
-                self._ema(
-                    previous.lateral_error,
-                    geometry.lateral_error,
-                    alpha,
-                )
-            ),
-            heading_error=float(
-                self._ema(
-                    previous.heading_error,
-                    geometry.heading_error,
-                    alpha,
-                )
-            ),
-            lane_width=float(
-                self._ema(
-                    previous.lane_width,
-                    geometry.lane_width,
-                    alpha,
-                )
-            ),
-            curvature=float(
-                self._ema(
-                    previous.curvature,
-                    geometry.curvature,
-                    alpha,
-                )
-            ),
-            center_line=filtered_center_line,
-            left_lane_screen=filtered_left,
-            right_lane_screen=filtered_right,
+        return _copy_point(
+            current,
+            x=x,
+            y=y,
+            confidence=confidence,
             valid=True,
         )
 
-        self._geometry = result
+    # ------------------------------------------------------------------
+    # ASSOCIAÇÃO
+    # ------------------------------------------------------------------
 
-        return result
-
-    def _geometry_alpha(
+    def _associate_points(
         self,
-        previous: LaneGeometryResult,
-        current: LaneGeometryResult,
-    ) -> float:
+        previous_points: Sequence[LanePoint],
+        current_points: Sequence[LanePoint],
+    ) -> List[LanePoint]:
         """
-        Reduz alpha quando há uma mudança geométrica muito grande.
-        """
+        Associa pontos atuais aos pontos anteriores pelo vizinho mais próximo.
 
-        center_jump = abs(
-            current.lane_center_x -
-            previous.lane_center_x
-        )
-
-        heading_jump = abs(
-            current.heading_error -
-            previous.heading_error
-        )
-
-        if center_jump > 150.0:
-            return self.min_alpha
-
-        if heading_jump > 0.35:
-            return self.min_alpha
-
-        ratio = center_jump / 150.0
-
-        return float(
-            np.clip(
-                self.max_alpha
-                - ratio * (
-                    self.max_alpha -
-                    self.min_alpha
-                ),
-                self.min_alpha,
-                self.max_alpha,
-            )
-        )
-
-    @staticmethod
-    def _filter_points(
-        previous: List[Tuple[float, float]],
-        current: List[Tuple[float, float]],
-        alpha: float,
-    ) -> List[Tuple[float, float]]:
-        """
-        Suaviza center_line.
-
-        Quando as quantidades de pontos são diferentes,
-        não tenta fazer correspondência por índice de forma cega.
-        Nesse caso utiliza a linha atual.
+        Cada ponto anterior pode ser utilizado uma única vez.
         """
 
-        if not previous:
-            return list(current)
+        previous_valid = [
+            point
+            for point in previous_points
+            if _valid_point(point)
+        ]
 
-        if not current:
-            return list(previous)
+        current_valid = [
+            point
+            for point in current_points
+            if _valid_point(point)
+        ]
 
-        if len(previous) != len(current):
-            return list(current)
+        if not previous_valid:
+            return [
+                _copy_point(point)
+                for point in current_valid
+            ]
 
-        result = []
+        result: List[LanePoint] = []
+        used_previous: set[int] = set()
 
-        for (px, py), (cx, cy) in zip(previous, current):
-            x = px + alpha * (cx - px)
-            y = py + alpha * (cy - py)
+        for current in current_valid:
 
-            result.append(
-                (
-                    float(x),
-                    float(y),
+            best_index: Optional[int] = None
+            best_distance = float("inf")
+
+            for index, previous in enumerate(previous_valid):
+
+                if index in used_previous:
+                    continue
+
+                distance = _distance(current, previous)
+
+                if distance < best_distance:
+                    best_distance = distance
+                    best_index = index
+
+            if (
+                best_index is not None
+                and best_distance <= self.max_point_distance
+            ):
+                previous = previous_valid[best_index]
+                used_previous.add(best_index)
+
+                result.append(
+                    self._smooth_point(
+                        previous,
+                        current,
+                    )
                 )
-            )
+            else:
+                # Novo ponto legítimo.
+                result.append(
+                    _copy_point(current)
+                )
 
         return result
 
-    @staticmethod
-    def _filter_xy_points(
-        previous: List[Tuple[float, float]],
-        current: List[Tuple[float, float]],
-        alpha: float,
-    ) -> List[Tuple[float, float]]:
+    # ------------------------------------------------------------------
+    # LANES
+    # ------------------------------------------------------------------
+
+    def _filter_lanes(
+        self,
+        previous_lanes: Sequence[Sequence[LanePoint]],
+        current_lanes: Sequence[Sequence[LanePoint]],
+    ) -> List[List[LanePoint]]:
         """
-        Suaviza pontos de uma lane na tela.
+        Filtra todas as lanes da detecção.
+
+        A associação entre lanes é feita pela posição média horizontal
+        para evitar que uma lane seja suavizada com outra.
         """
 
-        if not previous:
-            return list(current)
+        previous = [
+            list(lane)
+            for lane in previous_lanes
+        ]
+
+        current = [
+            list(lane)
+            for lane in current_lanes
+        ]
 
         if not current:
-            return list(previous)
+            return []
 
-        if len(previous) != len(current):
-            return list(current)
+        if not previous:
+            return [
+                [
+                    _copy_point(point)
+                    for point in lane
+                    if _valid_point(point)
+                ]
+                for lane in current
+            ]
 
-        result = []
+        def lane_center(
+            lane: Sequence[LanePoint],
+        ) -> Optional[float]:
 
-        for (px, py), (cx, cy) in zip(previous, current):
+            valid = [
+                point
+                for point in lane
+                if _valid_point(point)
+            ]
 
-            x = px + alpha * (cx - px)
-            y = py + alpha * (cy - py)
+            if not valid:
+                return None
 
-            result.append(
-                (
-                    float(x),
-                    float(y),
+            return sum(
+                float(point.x)
+                for point in valid
+            ) / len(valid)
+
+        previous_centers = [
+            lane_center(lane)
+            for lane in previous
+        ]
+
+        current_centers = [
+            lane_center(lane)
+            for lane in current
+        ]
+
+        result: List[List[LanePoint]] = []
+        used_previous: set[int] = set()
+
+        for current_lane, current_center in zip(
+            current,
+            current_centers,
+        ):
+
+            if current_center is None:
+                continue
+
+            best_index: Optional[int] = None
+            best_distance = float("inf")
+
+            for index, previous_center in enumerate(
+                previous_centers
+            ):
+
+                if index in used_previous:
+                    continue
+
+                if previous_center is None:
+                    continue
+
+                distance = abs(
+                    current_center - previous_center
                 )
-            )
+
+                if distance < best_distance:
+                    best_distance = distance
+                    best_index = index
+
+            if best_index is not None:
+                used_previous.add(best_index)
+
+                filtered = self._associate_points(
+                    previous[best_index],
+                    current_lane,
+                )
+            else:
+                filtered = [
+                    _copy_point(point)
+                    for point in current_lane
+                    if _valid_point(point)
+                ]
+
+            if filtered:
+                result.append(filtered)
 
         return result
+
+    # ------------------------------------------------------------------
+    # INVALID / DECAY
+    # ------------------------------------------------------------------
+
+    def _decay_previous(
+        self,
+    ) -> Optional[LaneDetectionResult]:
+        """
+        Mantém temporariamente o estado anterior com confiança reduzida.
+
+        Depois de max_missed_frames, o estado é descartado.
+        """
+
+        if self._previous is None:
+            return None
+
+        self._missed_frames += 1
+
+        if self._missed_frames > self.max_missed_frames:
+            self.reset()
+            return None
+
+        lanes: List[List[LanePoint]] = []
+
+        for lane in self._previous.lanes:
+            filtered_lane: List[LanePoint] = []
+
+            for point in lane:
+
+                confidence = (
+                    float(point.confidence)
+                    * self.invalid_decay
+                )
+
+                confidence = _clamp(
+                    confidence,
+                    0.0,
+                    1.0,
+                )
+
+                filtered_lane.append(
+                    _copy_point(
+                        point,
+                        confidence=confidence,
+                        valid=confidence > 0.0,
+                    )
+                )
+
+            if filtered_lane:
+                lanes.append(filtered_lane)
+
+        previous = self._previous
+
+        try:
+            result = replace(
+                previous,
+                lanes=lanes,
+            )
+        except TypeError:
+            result = LaneDetectionResult(
+                lanes=lanes,
+            )
+
+        self._previous = result
+
+        return result
+
+    # ------------------------------------------------------------------
+    # PROCESSAMENTO
+    # ------------------------------------------------------------------
+
+    def update(
+        self,
+        detection: Optional[LaneDetectionResult],
+    ) -> Optional[LaneDetectionResult]:
+        """
+        Processa uma nova detecção.
+
+        Regras:
+        1. Primeira detecção válida -> inicializa.
+        2. Detecção válida subsequente -> EMA.
+        3. Detecção ausente/inválida -> decay.
+        4. Após limite de perdas -> estado descartado.
+        """
+
+        if detection is None:
+            return self._decay_previous()
+
+        current_lanes = [
+            lane
+            for lane in detection.lanes
+            if lane
+        ]
+
+        has_valid_points = any(
+            _valid_point(point)
+            for lane in current_lanes
+            for point in lane
+        )
+
+        if not has_valid_points:
+            return self._decay_previous()
+
+        self._missed_frames = 0
+
+        if self._previous is None:
+
+            lanes = [
+                [
+                    _copy_point(point)
+                    for point in lane
+                    if _valid_point(point)
+                ]
+                for lane in current_lanes
+            ]
+
+        else:
+
+            lanes = self._filter_lanes(
+                self._previous.lanes,
+                current_lanes,
+            )
+
+        try:
+            result = replace(
+                detection,
+                lanes=lanes,
+            )
+        except TypeError:
+            result = LaneDetectionResult(
+                lanes=lanes,
+            )
+
+        self._previous = result
+
+        return result
+
+    # ------------------------------------------------------------------
+    # ALIAS
+    # ------------------------------------------------------------------
+
+    def filter(
+        self,
+        detection: Optional[LaneDetectionResult],
+    ) -> Optional[LaneDetectionResult]:
+        """
+        Alias semântico para update().
+        """
+        return self.update(detection)
+
+
+# ============================================================================
+# FUNÇÃO DE CONVENIÊNCIA
+# ============================================================================
+
+
+def create_default_filter() -> EMATemporalFilter:
+    """
+    Cria o filtro temporal padrão utilizado pelo pipeline.
+    """
+    return EMATemporalFilter(
+        alpha=DEFAULT_ALPHA,
+        invalid_decay=DEFAULT_INVALID_DECAY,
+        max_missed_frames=DEFAULT_MAX_MISSED_FRAMES,
+        max_point_distance=DEFAULT_MAX_POINT_DISTANCE,
+    )
+
+
+__all__ = [
+    "EMATemporalFilter",
+    "create_default_filter",
+    "DEFAULT_ALPHA",
+    "DEFAULT_INVALID_DECAY",
+    "DEFAULT_MAX_MISSED_FRAMES",
+    "DEFAULT_MIN_CONFIDENCE",
+    "DEFAULT_MAX_POINT_DISTANCE",
+]
