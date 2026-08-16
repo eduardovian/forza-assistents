@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vision.yolop_detector import LanePoint, LaneDetectionResult
+from vision.detection_types import LanePoint, LaneDetectionResult
 from vision.lane_geometry import LaneGeometry, LaneGeometryResult
 
 
@@ -26,7 +26,7 @@ class TestLaneGeometry(unittest.TestCase):
 
     def _create_lane_points(self, x_base, num_points=18, curve_amp=0):
         """Cria pontos de lane simulados com 18 row anchors."""
-        from vision.ufld_detector import CULANE_ROW_ANCHORS
+        from vision.yolop_detector import CULANE_ROW_ANCHORS
         points = []
         for i in range(num_points):
             y = CULANE_ROW_ANCHORS[i]
@@ -137,7 +137,7 @@ class TestLaneGeometry(unittest.TestCase):
     def test_heading_curved(self):
         """Faixa curva -> heading diferente de 0."""
         # Cria lanes com inclinação (x aumenta com y)
-        from vision.ufld_detector import CULANE_ROW_ANCHORS
+        from vision.yolop_detector import CULANE_ROW_ANCHORS
         left_points = []
         right_points = []
         for i in range(18):

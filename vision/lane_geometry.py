@@ -53,7 +53,7 @@ import numpy as np
 
 from config import LANE_GEOMETRY, ROI, YOLOP
 from .lane_types import LanePoint
-
+from vision.detection_types import LanePoint, LaneDetectionResult
 
 # =============================================================================
 # TIPOS
