@@ -2,9 +2,11 @@
 vision/lane_geometry.py
 
 Forza Assistents
+================
+
 Geometria observada das faixas.
 
-Responsabilidade:
+Pipeline:
 
     YOLOP / LaneTracker
             ↓
@@ -16,15 +18,15 @@ Responsabilidade:
             ↓
     avaliação de pares candidatos
             ↓
-    seleção da faixa atual
+    seleção da faixa observada
             ↓
-    centro observado
+    centro da faixa
             ↓
     largura
             ↓
     erro lateral
             ↓
-    heading observado
+    heading
             ↓
     curvatura observada
             ↓
@@ -32,73 +34,98 @@ Responsabilidade:
             ↓
     LaneGeometryResult
 
-PRINCÍPIO FUNDAMENTAL
-=====================
-
+RESPONSABILIDADE
+----------------
 Este módulo trabalha SOMENTE com geometria observada.
 
-Não:
+Não executa:
 
-    - executa inferência;
-    - faz tracking temporal;
-    - cria lanes;
-    - extrapola lanes;
-    - prevê trajetória;
-    - inventa pontos ausentes;
-    - usa memória temporal;
-    - decide atuação ADAS.
+    - inferência;
+    - captura;
+    - definição de ROI;
+    - tracking temporal;
+    - extrapolação;
+    - previsão;
+    - associação temporal;
+    - decisão ADAS;
+    - controle do veículo.
 
 A projeção/extrapolação pertence ao lane_projection.py.
-A associação temporal pertence ao lane_tracker.py.
+O tracking pertence ao lane_tracker.py.
 A associação semântica pertence ao lane_assignment.py.
 
-COMPATIBILIDADE
-===============
+CONFIGURAÇÃO
+------------
+Toda configuração vem exclusivamente de config.py:
 
-Aceita:
+    ROI
+    YOLOP
+    LANE_GEOMETRY
 
-    LaneDetectionResult
-    List[List[LanePoint]]
+Nenhum ROI ou parâmetro equivalente é redefinido neste módulo.
 
-e mantém compatibilidade com consumidores legados que utilizam:
+COORDENADAS
+-----------
+O detector trabalha no frame recortado pelo ROI.
 
-    ufld_width
-    ufld_height
+Portanto:
 
-O detector atual YOLOP permanece como fonte primária.
+    detector coordinates
+            ↓
+        ROI coordinates
+            ↓
+        screen coordinates
+
+A transformação utiliza exclusivamente o ROI calibrado.
+
+SEGURANÇA
+---------
+Geometria inválida retorna:
+
+    valid=False
+
+e métricas numéricas seguras.
+
+Nunca são produzidos NaN ou infinito como saída válida.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+import math
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from config import LANE_GEOMETRY, ROI, YOLOP
+
 from .lane_types import LanePoint
-from .yolop_detector import LaneDetectionResult
+
+try:
+    from .yolop_detector import LaneDetectionResult
+except ImportError:  # pragma: no cover
+    LaneDetectionResult = object
 
 
-# ============================================================================
+# =============================================================================
 # TIPOS
-# ============================================================================
+# =============================================================================
 
 Point = Tuple[float, float]
 
 
-# ============================================================================
+# =============================================================================
 # RESULTADO
-# ============================================================================
+# =============================================================================
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class LaneGeometryResult:
     """
-    Resultado da geometria observada.
+    Resultado da geometria observada no frame atual.
 
-    Todas as coordenadas presentes neste objeto correspondem
-    exclusivamente a informação observada no frame atual.
+    Todas as coordenadas são observadas.
+    Nenhuma informação é extrapolada neste módulo.
     """
 
     lane_center_x: float
@@ -134,262 +161,96 @@ class LaneGeometryResult:
     enough_for_projection: bool = False
 
 
-# ============================================================================
-# GEOMETRIA
-# ============================================================================
+# =============================================================================
+# LANE GEOMETRY
+# =============================================================================
 
 
 class LaneGeometry:
     """
-    Processador industrial de geometria observada.
+    Processador stateless da geometria observada.
 
-    Características:
+    Princípios:
 
-        - aceita múltiplas lanes;
-        - não depende de uma única coordenada Y;
-        - seleção por pares candidatos;
-        - largura avaliada em múltiplos níveis;
+        - configuração centralizada;
+        - nenhuma memória temporal;
+        - nenhuma extrapolação;
+        - múltiplas lanes;
+        - seleção por pares;
+        - validação geométrica;
         - robustez contra outliers;
-        - centro calculado somente na região realmente observada;
-        - heading robusto;
-        - curvatura observada;
         - confiança composta;
-        - nenhuma extrapolação.
-
-    A classe é deliberadamente stateless.
-
-    Isso é importante para manter a arquitetura:
-
-        detector
-            ↓
-        tracker
-            ↓
-        geometry
-            ↓
-        projection
-            ↓
-        assignment
-            ↓
-        ADAS
+        - falha segura.
     """
 
-    # ------------------------------------------------------------------------
-    # DEFAULTS
-    # ------------------------------------------------------------------------
-
-    DEFAULT_SCREEN_WIDTH = 2560
-    DEFAULT_SCREEN_HEIGHT = 1600
-
-    DEFAULT_ROI = (
-        300,
-        700,
-        2200,
-        1600,
-    )
-
-    DEFAULT_DETECTOR_WIDTH = 640
-    DEFAULT_DETECTOR_HEIGHT = 640
-
-    DEFAULT_MIN_POINTS = 5
-    DEFAULT_SAMPLES = 40
-
-    DEFAULT_MIN_LANE_WIDTH = 180.0
-    DEFAULT_MAX_LANE_WIDTH = 1400.0
-
-    DEFAULT_MIN_OBSERVED_SPAN = 80.0
-    DEFAULT_PROJECTION_MIN_SPAN = 180.0
-
-    DEFAULT_OUTLIER_THRESHOLD = 100.0
-
-    # Região inferior possui maior importância para controle lateral.
-    DEFAULT_NEAR_WEIGHT = 0.75
-    DEFAULT_FAR_WEIGHT = 0.25
-
-    # ------------------------------------------------------------------------
-    # CONSTRUÇÃO
-    # ------------------------------------------------------------------------
-
-    def __init__(
-        self,
-        screen_width: int = DEFAULT_SCREEN_WIDTH,
-        screen_height: int = DEFAULT_SCREEN_HEIGHT,
-        roi: Tuple[int, int, int, int] = DEFAULT_ROI,
-        detector_width: int = DEFAULT_DETECTOR_WIDTH,
-        detector_height: int = DEFAULT_DETECTOR_HEIGHT,
-        near_weight: float = DEFAULT_NEAR_WEIGHT,
-        far_weight: float = DEFAULT_FAR_WEIGHT,
-        min_points: int = DEFAULT_MIN_POINTS,
-        samples: int = DEFAULT_SAMPLES,
-        min_lane_width: float = DEFAULT_MIN_LANE_WIDTH,
-        max_lane_width: float = DEFAULT_MAX_LANE_WIDTH,
-        min_observed_span: float = DEFAULT_MIN_OBSERVED_SPAN,
-        outlier_threshold: float = DEFAULT_OUTLIER_THRESHOLD,
-        projection_min_span: float = DEFAULT_PROJECTION_MIN_SPAN,
-        ufld_width: Optional[int] = None,
-        ufld_height: Optional[int] = None,
-    ) -> None:
-
-        self.screen_width = int(screen_width)
-        self.screen_height = int(screen_height)
-
-        if self.screen_width <= 0:
-            raise ValueError(
-                "screen_width deve ser maior que zero."
-            )
-
-        if self.screen_height <= 0:
-            raise ValueError(
-                "screen_height deve ser maior que zero."
-            )
-
-        (
-            self.roi_left,
-            self.roi_top,
-            self.roi_right,
-            self.roi_bottom,
-        ) = map(int, roi)
-
-        if self.roi_left < 0 or self.roi_top < 0:
-            raise ValueError(
-                "ROI não pode possuir coordenadas negativas."
-            )
-
-        if self.roi_right <= self.roi_left:
-            raise ValueError(
-                "ROI inválida: right <= left."
-            )
-
-        if self.roi_bottom <= self.roi_top:
-            raise ValueError(
-                "ROI inválida: bottom <= top."
-            )
-
-        if self.roi_right > self.screen_width:
-            raise ValueError(
-                "ROI excede a largura da tela."
-            )
-
-        if self.roi_bottom > self.screen_height:
-            raise ValueError(
-                "ROI excede a altura da tela."
-            )
-
-        self.roi_width = float(
-            self.roi_right - self.roi_left
-        )
-
-        self.roi_height = float(
-            self.roi_bottom - self.roi_top
-        )
-
-        # --------------------------------------------------------------------
-        # Compatibilidade.
-        #
-        # YOLOP é a arquitetura atual.
-        # ufld_* são aliases históricos.
-        # --------------------------------------------------------------------
-
-        if ufld_width is not None:
-            detector_width = ufld_width
-
-        if ufld_height is not None:
-            detector_height = ufld_height
-
-        self.detector_width = float(
-            detector_width
-        )
-
-        self.detector_height = float(
-            detector_height
-        )
-
-        if self.detector_width <= 0.0:
-            raise ValueError(
-                "detector_width deve ser maior que zero."
-            )
-
-        if self.detector_height <= 0.0:
-            raise ValueError(
-                "detector_height deve ser maior que zero."
-            )
-
-        self.near_weight = float(
-            np.clip(
-                near_weight,
-                0.0,
-                1.0,
-            )
-        )
-
-        self.far_weight = float(
-            np.clip(
-                far_weight,
-                0.0,
-                1.0,
-            )
-        )
-
-        if (
-            self.near_weight
-            + self.far_weight
-            <= 0.0
-        ):
-            self.near_weight = 0.75
-            self.far_weight = 0.25
-
-        self.min_points = max(
-            2,
-            int(min_points),
-        )
-
-        self.samples = max(
-            8,
-            int(samples),
-        )
-
-        self.min_lane_width = float(
-            min_lane_width
-        )
-
-        self.max_lane_width = float(
-            max_lane_width
-        )
-
-        if self.min_lane_width <= 0.0:
-            raise ValueError(
-                "min_lane_width deve ser maior que zero."
-            )
-
-        if self.max_lane_width < self.min_lane_width:
-            raise ValueError(
-                "max_lane_width deve ser >= min_lane_width."
-            )
-
-        self.min_observed_span = max(
-            1.0,
-            float(min_observed_span),
-        )
-
-        self.projection_min_span = max(
-            self.min_observed_span,
-            float(projection_min_span),
-        )
-
-        self.outlier_threshold = max(
-            1.0,
-            float(outlier_threshold),
-        )
-
-        self.image_center_x = (
-            self.screen_width / 2.0
-        )
-
-        self.image_center_y = (
-            self.screen_height / 2.0
-        )
+    def __init__(self) -> None:
+        self._validate_configuration()
 
     # =========================================================================
-    # NUMERIC HELPERS
+    # CONFIGURAÇÃO
+    # =========================================================================
+
+    @staticmethod
+    def _validate_configuration() -> None:
+        """
+        Valida os contratos necessários para a geometria.
+        """
+
+        if not ROI.enabled:
+            raise RuntimeError(
+                "ROI calibrado não está habilitado. "
+                "Execute a calibração antes de iniciar a geometria."
+            )
+
+        ROI.validate()
+
+        if YOLOP.input_width <= 0:
+            raise ValueError(
+                "YOLOP.input_width deve ser > 0."
+            )
+
+        if YOLOP.input_height <= 0:
+            raise ValueError(
+                "YOLOP.input_height deve ser > 0."
+            )
+
+        if LANE_GEOMETRY.min_points < 2:
+            raise ValueError(
+                "LANE_GEOMETRY.min_points deve ser >= 2."
+            )
+
+        if LANE_GEOMETRY.min_observed_span <= 0:
+            raise ValueError(
+                "LANE_GEOMETRY.min_observed_span deve ser > 0."
+            )
+
+        if (
+            LANE_GEOMETRY.min_lane_width
+            <= 0.0
+        ):
+            raise ValueError(
+                "LANE_GEOMETRY.min_lane_width deve ser > 0."
+            )
+
+        if (
+            LANE_GEOMETRY.max_lane_width
+            <= LANE_GEOMETRY.min_lane_width
+        ):
+            raise ValueError(
+                "LANE_GEOMETRY.max_lane_width deve ser "
+                "maior que min_lane_width."
+            )
+
+        if (
+            LANE_GEOMETRY.polynomial_degree
+            != 3
+        ):
+            raise ValueError(
+                "LaneGeometry exige polynomial_degree=3."
+            )
+
+    # =========================================================================
+    # NUMERIC
     # =========================================================================
 
     @staticmethod
@@ -416,44 +277,48 @@ class LaneGeometry:
         )
 
     # =========================================================================
-    # COORDENADAS
+    # COORDINATE TRANSFORM
     # =========================================================================
 
+    @staticmethod
     def _detector_to_screen(
-        self,
         x: float,
         y: float,
-        detector_width: Optional[float] = None,
-        detector_height: Optional[float] = None,
+        detector_width: float,
+        detector_height: float,
     ) -> Point:
+        """
+        Converte coordenadas do detector para coordenadas da tela.
 
-        width = (
-            self.detector_width
-            if detector_width is None
-            else float(detector_width)
-        )
+        O ROI vem exclusivamente de config.py.
+        """
 
-        height = (
-            self.detector_height
-            if detector_height is None
-            else float(detector_height)
-        )
-
-        if width <= 0.0 or height <= 0.0:
+        if detector_width <= 0.0:
             raise ValueError(
-                "Dimensões do detector inválidas."
+                "detector_width inválido."
+            )
+
+        if detector_height <= 0.0:
+            raise ValueError(
+                "detector_height inválido."
             )
 
         screen_x = (
-            self.roi_left
-            + (float(x) / width)
-            * self.roi_width
+            ROI.left
+            + (
+                float(x)
+                / detector_width
+            )
+            * ROI.width
         )
 
         screen_y = (
-            self.roi_top
-            + (float(y) / height)
-            * self.roi_height
+            ROI.top
+            + (
+                float(y)
+                / detector_height
+            )
+            * ROI.height
         )
 
         return (
@@ -461,21 +326,26 @@ class LaneGeometry:
             float(screen_y),
         )
 
-    def _get_detection_dimensions(
-        self,
+    @staticmethod
+    def _detection_dimensions(
         detection: object,
     ) -> Tuple[float, float]:
+        """
+        Obtém as dimensões reais utilizadas pelo detector.
+
+        YOLOP permanece como fallback oficial.
+        """
 
         width = getattr(
             detection,
             "input_width",
-            self.detector_width,
+            YOLOP.input_width,
         )
 
         height = getattr(
             detection,
             "input_height",
-            self.detector_height,
+            YOLOP.input_height,
         )
 
         try:
@@ -484,7 +354,9 @@ class LaneGeometry:
             TypeError,
             ValueError,
         ):
-            width = self.detector_width
+            width = float(
+                YOLOP.input_width
+            )
 
         try:
             height = float(height)
@@ -492,19 +364,25 @@ class LaneGeometry:
             TypeError,
             ValueError,
         ):
-            height = self.detector_height
+            height = float(
+                YOLOP.input_height
+            )
 
         if (
             not math.isfinite(width)
             or width <= 0.0
         ):
-            width = self.detector_width
+            width = float(
+                YOLOP.input_width
+            )
 
         if (
             not math.isfinite(height)
             or height <= 0.0
         ):
-            height = self.detector_height
+            height = float(
+                YOLOP.input_height
+            )
 
         return (
             width,
@@ -512,101 +390,69 @@ class LaneGeometry:
         )
 
     # =========================================================================
-    # PONTOS
+    # LANE CONVERSION
     # =========================================================================
 
     def _convert_lane(
         self,
         lane: Sequence[LanePoint],
-        detector_width: Optional[float] = None,
-        detector_height: Optional[float] = None,
+        detector_width: float,
+        detector_height: float,
     ) -> List[Point]:
+        """
+        Valida e converte uma lane para coordenadas de tela.
+        """
 
-        if lane is None:
+        if not lane:
             return []
 
         points: List[Point] = []
 
-        width = (
-            self.detector_width
-            if detector_width is None
-            else float(detector_width)
-        )
-
-        height = (
-            self.detector_height
-            if detector_height is None
-            else float(detector_height)
-        )
-
-        if width <= 0.0 or height <= 0.0:
-            return []
-
         for point in lane:
 
-            if point is None:
-                continue
-
-            try:
-                valid = bool(point.valid)
-                x = float(point.x)
-                y = float(point.y)
-                confidence = float(
-                    point.confidence
-                )
-            except (
-                AttributeError,
-                TypeError,
-                ValueError,
+            if not isinstance(
+                point,
+                LanePoint,
             ):
                 continue
 
-            if not valid:
+            if not point.is_valid():
                 continue
 
             if (
-                not math.isfinite(x)
-                or not math.isfinite(y)
-                or not math.isfinite(confidence)
+                point.confidence
+                < LANE_GEOMETRY.min_lane_confidence
             ):
                 continue
 
-            if confidence <= 0.0:
-                continue
+            x = float(point.x)
+            y = float(point.y)
 
             if (
                 x < 0.0
-                or x > width
+                or x > detector_width
                 or y < 0.0
-                or y > height
+                or y > detector_height
             ):
                 continue
 
             sx, sy = self._detector_to_screen(
                 x=x,
                 y=y,
-                detector_width=width,
-                detector_height=height,
+                detector_width=detector_width,
+                detector_height=detector_height,
             )
 
-            if (
-                not math.isfinite(sx)
-                or not math.isfinite(sy)
-            ):
-                continue
-
-            if (
-                sx < 0.0
-                or sx > self.screen_width
-                or sy < 0.0
-                or sy > self.screen_height
+            if not (
+                self._finite(sx)
+                and self._finite(sy)
             ):
                 continue
 
             points.append(
                 (
-                    float(sx),
-                    float(sy),
+                    sx,
+                    sy,
                 )
             )
 
@@ -614,65 +460,99 @@ class LaneGeometry:
             key=lambda point: point[1]
         )
 
-        return points
+        return self._remove_duplicate_points(
+            points
+        )
+
+    @staticmethod
+    def _remove_duplicate_points(
+        points: Sequence[Point],
+    ) -> List[Point]:
+
+        if not points:
+            return []
+
+        result: List[Point] = [
+            points[0]
+        ]
+
+        for point in points[1:]:
+
+            previous = result[-1]
+
+            if abs(
+                point[1]
+                - previous[1]
+            ) < 1e-6:
+                continue
+
+            result.append(point)
+
+        return result
 
     # =========================================================================
-    # OUTLIERS
+    # OUTLIER REJECTION
     # =========================================================================
 
     def _remove_outliers(
         self,
         points: Sequence[Point],
     ) -> List[Point]:
+        """
+        Rejeição robusta baseada em residual MAD.
 
-        if len(points) < 4:
+        A geometria continua observacional:
+        nenhum ponto novo é criado.
+        """
+
+        if (
+            not LANE_GEOMETRY.enable_outlier_rejection
+            or len(points) < 5
+        ):
             return list(points)
 
-        arr = np.asarray(
+        array = np.asarray(
             points,
             dtype=np.float64,
         )
 
         if (
-            arr.ndim != 2
-            or arr.shape[1] != 2
+            array.ndim != 2
+            or array.shape[1] != 2
             or not np.all(
-                np.isfinite(arr)
+                np.isfinite(array)
             )
         ):
             return list(points)
 
-        y = arr[:, 1]
-        x = arr[:, 0]
+        x = array[:, 0]
+        y = array[:, 1]
 
-        if float(np.ptp(y)) < 1.0:
-            return list(points)
-
-        y_mean = float(
+        y_center = float(
             np.mean(y)
         )
 
-        y_std = float(
+        y_scale = float(
             np.std(y)
         )
 
-        y_norm = (
-            y - y_mean
-        ) / max(
-            y_std,
-            1.0,
-        )
+        if y_scale < 1e-6:
+            return list(points)
+
+        normalized_y = (
+            y - y_center
+        ) / y_scale
 
         try:
-            coeff = np.polyfit(
-                y_norm,
+            coefficients = np.polyfit(
+                normalized_y,
                 x,
-                1,
+                2,
             )
 
             predicted = np.polyval(
-                coeff,
-                y_norm,
+                coefficients,
+                normalized_y,
             )
 
         except (
@@ -682,162 +562,119 @@ class LaneGeometry:
         ):
             return list(points)
 
-        residual = np.abs(
+        residuals = np.abs(
             x - predicted
         )
 
         median = float(
-            np.median(residual)
+            np.median(residuals)
         )
 
         mad = float(
             np.median(
                 np.abs(
-                    residual - median
+                    residuals - median
                 )
             )
         )
 
-        threshold = max(
-            self.outlier_threshold,
-            median
-            + 4.0
-            * max(
-                mad,
-                1.0,
-            ),
-        )
+        if mad < 1e-6:
+            limit = max(
+                5.0,
+                median * 2.0,
+            )
+        else:
+            robust_sigma = (
+                1.4826 * mad
+            )
 
-        keep = (
-            residual <= threshold
-        )
+            limit = (
+                median
+                + LANE_GEOMETRY.outlier_sigma
+                * robust_sigma
+            )
 
         filtered = [
-            (
-                float(arr[i, 0]),
-                float(arr[i, 1]),
-            )
-            for i in range(
-                len(arr)
-            )
-            if bool(keep[i])
+            point
+            for point, residual
+            in zip(points, residuals)
+            if residual <= limit
         ]
 
-        if len(filtered) < self.min_points:
+        if len(filtered) < (
+            LANE_GEOMETRY.min_points
+        ):
             return list(points)
 
         return filtered
 
     # =========================================================================
-    # PREPARAÇÃO
-    # =========================================================================
-
-    def _prepare_lane(
-        self,
-        lane: Sequence[Point],
-    ) -> List[Point]:
-
-        if lane is None:
-            return []
-
-        if len(lane) < self.min_points:
-            return []
-
-        clean = self._remove_outliers(
-            lane
-        )
-
-        if len(clean) < self.min_points:
-            return []
-
-        # --------------------------------------------------------------------
-        # Remove duplicatas de Y.
-        #
-        # Não cria informação.
-        # Apenas evita que múltiplos pontos no mesmo nível
-        # prejudiquem a interpolação.
-        # --------------------------------------------------------------------
-
-        by_y: dict[float, List[float]] = {}
-
-        for x, y in clean:
-
-            if (
-                not math.isfinite(x)
-                or not math.isfinite(y)
-            ):
-                continue
-
-            by_y.setdefault(
-                float(y),
-                [],
-            ).append(
-                float(x)
-            )
-
-        result: List[Point] = []
-
-        for y in sorted(by_y):
-
-            xs = by_y[y]
-
-            if not xs:
-                continue
-
-            result.append(
-                (
-                    float(
-                        np.median(xs)
-                    ),
-                    float(y),
-                )
-            )
-
-        if len(result) < self.min_points:
-            return []
-
-        return result
-
-    # =========================================================================
-    # INTERPOLAÇÃO
+    # GEOMETRIC METRICS
     # =========================================================================
 
     @staticmethod
-    def _x_at_y(
+    def _lane_span(
+        lane: Sequence[Point],
+    ) -> float:
+
+        if len(lane) < 2:
+            return 0.0
+
+        ys = [
+            point[1]
+            for point in lane
+        ]
+
+        return float(
+            max(ys) - min(ys)
+        )
+
+    @staticmethod
+    def _lane_mean_x(
+        lane: Sequence[Point],
+    ) -> float:
+
+        if not lane:
+            return 0.0
+
+        return float(
+            np.mean(
+                [
+                    point[0]
+                    for point in lane
+                ]
+            )
+        )
+
+    @staticmethod
+    def _interpolate_x(
         lane: Sequence[Point],
         y: float,
     ) -> Optional[float]:
+        """
+        Interpolação linear exclusivamente dentro
+        da região observada.
+
+        Não extrapola.
+        """
 
         if len(lane) < 2:
             return None
 
-        arr = np.asarray(
+        ordered = sorted(
             lane,
+            key=lambda point: point[1],
+        )
+
+        ys = np.asarray(
+            [point[1] for point in ordered],
             dtype=np.float64,
         )
 
-        if (
-            arr.ndim != 2
-            or arr.shape[1] != 2
-            or not np.all(
-                np.isfinite(arr)
-            )
-        ):
-            return None
-
-        order = np.argsort(
-            arr[:, 1]
+        xs = np.asarray(
+            [point[0] for point in ordered],
+            dtype=np.float64,
         )
-
-        ys = arr[
-            order,
-            1,
-        ]
-
-        xs = arr[
-            order,
-            0,
-        ]
 
         if (
             y < ys[0]
@@ -847,902 +684,251 @@ class LaneGeometry:
 
         return float(
             np.interp(
-                float(y),
+                y,
                 ys,
                 xs,
             )
         )
 
-    @staticmethod
-    def _lane_y_range(
-        lane: Sequence[Point],
+    def _common_observed_range(
+        self,
+        left: Sequence[Point],
+        right: Sequence[Point],
     ) -> Optional[Tuple[float, float]]:
 
-        if not lane:
-            return None
-
-        ys = np.asarray(
-            [
-                point[1]
-                for point in lane
-            ],
-            dtype=np.float64,
-        )
-
         if (
-            ys.size == 0
-            or not np.all(
-                np.isfinite(ys)
-            )
+            len(left) < 2
+            or len(right) < 2
         ):
             return None
 
-        return (
-            float(np.min(ys)),
-            float(np.max(ys)),
+        left_min = min(
+            point[1]
+            for point in left
         )
 
-    # =========================================================================
-    # ORDENAÇÃO
-    # =========================================================================
-
-    def _reference_y(
-        self,
-        lane: Optional[Sequence[Point]] = None,
-    ) -> float:
-
-        if lane:
-
-            y_range = self._lane_y_range(
-                lane
-            )
-
-            if y_range is not None:
-
-                return float(
-                    y_range[1]
-                    - max(
-                        5.0,
-                        (
-                            y_range[1]
-                            - y_range[0]
-                        )
-                        * 0.10,
-                    )
-                )
-
-        return float(
-            self.roi_bottom
-            - self.roi_height * 0.10
+        left_max = max(
+            point[1]
+            for point in left
         )
 
-    def _lane_position(
-        self,
-        lane: Sequence[Point],
-    ) -> Optional[float]:
-
-        y_range = self._lane_y_range(
-            lane
+        right_min = min(
+            point[1]
+            for point in right
         )
 
-        if y_range is None:
+        right_max = max(
+            point[1]
+            for point in right
+        )
+
+        lower = max(
+            left_min,
+            right_min,
+        )
+
+        upper = min(
+            left_max,
+            right_max,
+        )
+
+        if upper <= lower:
             return None
 
-        reference_y = self._reference_y(
-            lane
+        return (
+            lower,
+            upper,
         )
 
-        x = self._x_at_y(
-            lane,
-            reference_y,
-        )
-
-        if x is not None:
-            return x
-
-        # Fallback estritamente observado.
-        return float(
-            lane[-1][0]
-        )
-
-    def _sort_lanes(
+    def _sample_pair_geometry(
         self,
-        lanes: Sequence[List[Point]],
-    ) -> List[List[Point]]:
-
-        positioned = []
-
-        for index, lane in enumerate(lanes):
-
-            x = self._lane_position(
-                lane
-            )
-
-            if x is None:
-                continue
-
-            positioned.append(
-                (
-                    float(x),
-                    index,
-                )
-            )
-
-        positioned.sort(
-            key=lambda item: item[0]
-        )
-
-        return [
-            lanes[index]
-            for _, index in positioned
+        left: Sequence[Point],
+        right: Sequence[Point],
+    ) -> Optional[
+        Tuple[
+            float,
+            float,
+            float,
+            float,
+            float,
         ]
-
-    # =========================================================================
-    # SOBREPOSIÇÃO
-    # =========================================================================
-
-    def _overlap_range(
-        self,
-        left: Sequence[Point],
-        right: Sequence[Point],
-    ) -> Optional[Tuple[float, float]]:
-
-        left_range = self._lane_y_range(
-            left
-        )
-
-        right_range = self._lane_y_range(
-            right
-        )
-
-        if (
-            left_range is None
-            or right_range is None
-        ):
-            return None
-
-        y_min = max(
-            left_range[0],
-            right_range[0],
-        )
-
-        y_max = min(
-            left_range[1],
-            right_range[1],
-        )
-
-        if y_max <= y_min:
-            return None
-
-        return (
-            float(y_min),
-            float(y_max),
-        )
-
-    # =========================================================================
-    # LARGURA
-    # =========================================================================
-
-    def _sample_pair(
-        self,
-        left: Sequence[Point],
-        right: Sequence[Point],
-        samples: Optional[int] = None,
-    ) -> Tuple[
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
     ]:
+        """
+        Avalia a geometria no intervalo realmente observado.
 
-        overlap = self._overlap_range(
+        Retorna:
+
+            lane_center_x
+            lane_center_y
+            lane_width
+            heading
+            curvature
+        """
+
+        common = self._common_observed_range(
             left,
             right,
         )
 
-        if overlap is None:
-            return (
-                np.empty(0),
-                np.empty(0),
-                np.empty(0),
-            )
+        if common is None:
+            return None
 
-        y_min, y_max = overlap
+        y_min, y_max = common
 
         span = y_max - y_min
 
-        if span < 1.0:
-            return (
-                np.empty(0),
-                np.empty(0),
-                np.empty(0),
-            )
+        if span < (
+            LANE_GEOMETRY.min_observed_span
+        ):
+            return None
 
-        count = (
-            self.samples
-            if samples is None
-            else max(
-                4,
-                int(samples),
-            )
+        sample_count = max(
+            8,
+            min(
+                64,
+                int(
+                    LANE_GEOMETRY.min_points
+                    * 4
+                ),
+            ),
         )
 
         ys = np.linspace(
             y_min,
             y_max,
-            count,
+            sample_count,
         )
 
-        left_xs = []
-        right_xs = []
-        valid_ys = []
+        centers: List[float] = []
+        widths: List[float] = []
 
         for y in ys:
 
-            lx = self._x_at_y(
+            left_x = self._interpolate_x(
                 left,
                 float(y),
             )
 
-            rx = self._x_at_y(
+            right_x = self._interpolate_x(
                 right,
                 float(y),
             )
 
             if (
-                lx is None
-                or rx is None
+                left_x is None
+                or right_x is None
             ):
                 continue
 
-            if rx <= lx:
+            width = (
+                right_x - left_x
+            )
+
+            if width <= 0.0:
                 continue
-
-            left_xs.append(
-                float(lx)
-            )
-
-            right_xs.append(
-                float(rx)
-            )
-
-            valid_ys.append(
-                float(y)
-            )
-
-        if not valid_ys:
-            return (
-                np.empty(0),
-                np.empty(0),
-                np.empty(0),
-            )
-
-        return (
-            np.asarray(
-                valid_ys,
-                dtype=np.float64,
-            ),
-            np.asarray(
-                left_xs,
-                dtype=np.float64,
-            ),
-            np.asarray(
-                right_xs,
-                dtype=np.float64,
-            ),
-        )
-
-    def _compute_lane_width(
-        self,
-        left: Sequence[Point],
-        right: Sequence[Point],
-    ) -> float:
-
-        (
-            _ys,
-            left_x,
-            right_x,
-        ) = self._sample_pair(
-            left,
-            right,
-            samples=24,
-        )
-
-        if left_x.size == 0:
-            return 0.0
-
-        widths = (
-            right_x - left_x
-        )
-
-        widths = widths[
-            np.isfinite(widths)
-        ]
-
-        widths = widths[
-            (
-                widths
-                >= self.min_lane_width
-            )
-            & (
-                widths
-                <= self.max_lane_width
-            )
-        ]
-
-        if widths.size == 0:
-            return 0.0
-
-        return float(
-            np.median(widths)
-        )
-
-    # =========================================================================
-    # CONSISTÊNCIA DE LARGURA
-    # =========================================================================
-
-    def _width_consistency(
-        self,
-        left: Sequence[Point],
-        right: Sequence[Point],
-    ) -> float:
-
-        (
-            _ys,
-            left_x,
-            right_x,
-        ) = self._sample_pair(
-            left,
-            right,
-            samples=24,
-        )
-
-        if left_x.size < 4:
-            return 0.0
-
-        widths = (
-            right_x - left_x
-        )
-
-        if not np.all(
-            np.isfinite(widths)
-        ):
-            return 0.0
-
-        median = float(
-            np.median(widths)
-        )
-
-        if median <= 0.0:
-            return 0.0
-
-        mad = float(
-            np.median(
-                np.abs(
-                    widths - median
-                )
-            )
-        )
-
-        # 0 = inconsistente
-        # 1 = praticamente constante
-        normalized = (
-            mad / median
-        )
-
-        return float(
-            np.clip(
-                1.0
-                - normalized * 4.0,
-                0.0,
-                1.0,
-            )
-        )
-
-    # =========================================================================
-    # CENTRO
-    # =========================================================================
-
-    def _compute_center_line(
-        self,
-        left: Sequence[Point],
-        right: Sequence[Point],
-    ) -> List[Point]:
-
-        (
-            ys,
-            left_x,
-            right_x,
-        ) = self._sample_pair(
-            left,
-            right,
-            samples=self.samples,
-        )
-
-        if ys.size == 0:
-            return []
-
-        center_x = (
-            left_x + right_x
-        ) * 0.5
-
-        result: List[Point] = []
-
-        for x, y in zip(
-            center_x,
-            ys,
-        ):
 
             if (
-                not math.isfinite(
-                    float(x)
-                )
-                or not math.isfinite(
-                    float(y)
-                )
+                width
+                < LANE_GEOMETRY.min_lane_width
             ):
                 continue
 
-            result.append(
+            if (
+                width
+                > LANE_GEOMETRY.max_lane_width
+            ):
+                continue
+
+            centers.append(
                 (
-                    float(x),
-                    float(y),
-                )
+                    left_x
+                    + right_x
+                ) / 2.0
             )
 
-        return result
+            widths.append(width)
 
-    # =========================================================================
-    # SELEÇÃO DE PARES
-    # =========================================================================
-
-    def _pair_score(
-        self,
-        left: Sequence[Point],
-        right: Sequence[Point],
-    ) -> Optional[float]:
-
-        (
-            ys,
-            left_x,
-            right_x,
-        ) = self._sample_pair(
-            left,
-            right,
-            samples=24,
-        )
-
-        if ys.size < max(
-            4,
-            self.min_points,
-        ):
+        if len(centers) < 3:
             return None
 
-        widths = (
-            right_x - left_x
+        center_array = np.asarray(
+            centers,
+            dtype=np.float64,
         )
 
-        valid_widths = widths[
-            (
-                widths
-                >= self.min_lane_width
+        width_array = np.asarray(
+            widths,
+            dtype=np.float64,
+        )
+
+        # Região inferior possui maior peso.
+        weights = np.linspace(
+            LANE_GEOMETRY.far_weight
+            if hasattr(
+                LANE_GEOMETRY,
+                "far_weight",
             )
-            & (
-                widths
-                <= self.max_lane_width
+            else 0.25,
+            LANE_GEOMETRY.near_weight
+            if hasattr(
+                LANE_GEOMETRY,
+                "near_weight",
             )
-        ]
-
-        if valid_widths.size < 4:
-            return None
-
-        median_width = float(
-            np.median(
-                valid_widths
-            )
+            else 0.75,
+            len(center_array),
         )
 
-        width_consistency = (
-            self._width_consistency(
-                left,
-                right,
-            )
-        )
-
-        observed_span = float(
-            ys[-1] - ys[0]
-        )
-
-        if observed_span <= 0.0:
-            return None
-
-        center_x = (
-            left_x + right_x
-        ) * 0.5
-
-        # --------------------------------------------------------------------
-        # Avaliamos mais fortemente a região inferior.
-        # --------------------------------------------------------------------
-
-        relative = (
-            ys - ys[0]
-        ) / max(
-            observed_span,
-            1.0,
-        )
-
-        weights = (
-            self.far_weight
-            + (
-                self.near_weight
-                - self.far_weight
-            )
-            * relative
-        )
-
-        weights = np.maximum(
+        weights = np.asarray(
             weights,
-            1e-6,
-        )
-
-        weighted_center = float(
-            np.average(
-                center_x,
-                weights=weights,
-            )
-        )
-
-        center_distance = abs(
-            weighted_center
-            - self.image_center_x
-        )
-
-        # Normalização baseada na metade útil da tela.
-        center_score = float(
-            np.clip(
-                1.0
-                - center_distance
-                / max(
-                    self.roi_width * 0.5,
-                    1.0,
-                ),
-                0.0,
-                1.0,
-            )
-        )
-
-        span_score = float(
-            np.clip(
-                observed_span
-                / max(
-                    self.roi_height * 0.60,
-                    1.0,
-                ),
-                0.0,
-                1.0,
-            )
-        )
-
-        ideal_width = (
-            self.min_lane_width
-            + self.max_lane_width
-        ) * 0.5
-
-        width_range = (
-            self.max_lane_width
-            - self.min_lane_width
-        )
-
-        if width_range <= 0.0:
-            width_score = 0.0
-        else:
-            width_score = float(
-                np.clip(
-                    1.0
-                    - abs(
-                        median_width
-                        - ideal_width
-                    )
-                    / max(
-                        width_range * 0.5,
-                        1.0,
-                    ),
-                    0.0,
-                    1.0,
-                )
-            )
-
-        # --------------------------------------------------------------------
-        # Score final.
-        #
-        # A proximidade ao veículo é importante, mas não pode dominar
-        # completamente a geometria.
-        # --------------------------------------------------------------------
-
-        score = (
-            center_score * 0.35
-            + width_score * 0.20
-            + width_consistency * 0.25
-            + span_score * 0.20
-        )
-
-        return float(
-            np.clip(
-                score,
-                0.0,
-                1.0,
-            )
-        )
-
-    def _select_current_lane(
-        self,
-        lanes: Sequence[List[Point]],
-    ) -> Optional[Tuple[int, int]]:
-
-        if len(lanes) < 2:
-            return None
-
-        candidates = []
-
-        for index in range(
-            len(lanes) - 1
-        ):
-
-            left = lanes[index]
-            right = lanes[index + 1]
-
-            score = self._pair_score(
-                left,
-                right,
-            )
-
-            if score is None:
-                continue
-
-            (
-                ys,
-                left_x,
-                right_x,
-            ) = self._sample_pair(
-                left,
-                right,
-                samples=24,
-            )
-
-            if ys.size == 0:
-                continue
-
-            center_x = (
-                left_x + right_x
-            ) * 0.5
-
-            relative = (
-                ys - ys[0]
-            ) / max(
-                ys[-1] - ys[0],
-                1.0,
-            )
-
-            weights = (
-                self.far_weight
-                + (
-                    self.near_weight
-                    - self.far_weight
-                )
-                * relative
-            )
-
-            center = float(
-                np.average(
-                    center_x,
-                    weights=weights,
-                )
-            )
-
-            distance = abs(
-                center
-                - self.image_center_x
-            )
-
-            candidates.append(
-                (
-                    score,
-                    distance,
-                    index,
-                    index + 1,
-                )
-            )
-
-        if not candidates:
-            return None
-
-        # --------------------------------------------------------------------
-        # Score domina.
-        # Distância ao centro desempata.
-        # --------------------------------------------------------------------
-
-        candidates.sort(
-            key=lambda item: (
-                -item[0],
-                item[1],
-            )
-        )
-
-        _, _, left_index, right_index = (
-            candidates[0]
-        )
-
-        return (
-            left_index,
-            right_index,
-        )
-
-    # =========================================================================
-    # ERRO LATERAL
-    # =========================================================================
-
-    def _compute_lateral_error(
-        self,
-        center_line: Sequence[Point],
-    ) -> float:
-
-        if not center_line:
-            return 0.0
-
-        # --------------------------------------------------------------------
-        # Não utilizamos um Y fixo que pode estar fora da observação.
-        #
-        # Usamos a região inferior realmente observada.
-        # --------------------------------------------------------------------
-
-        arr = np.asarray(
-            center_line,
             dtype=np.float64,
         )
 
-        if (
-            arr.ndim != 2
-            or arr.shape[1] != 2
-            or not np.all(
-                np.isfinite(arr)
-            )
-        ):
-            return 0.0
+        weights /= np.sum(weights)
 
-        y_max = float(
-            np.max(arr[:, 1])
-        )
-
-        y_min = float(
-            np.min(arr[:, 1])
-        )
-
-        observed_span = (
-            y_max - y_min
-        )
-
-        if observed_span <= 0.0:
-            center_x = float(
-                arr[-1, 0]
-            )
-        else:
-            # Região inferior observada.
-            reference_y = (
-                y_max
-                - observed_span * 0.12
-            )
-
-            x = self._x_at_y(
-                center_line,
-                reference_y,
-            )
-
-            center_x = (
-                float(x)
-                if x is not None
-                else float(arr[-1, 0])
-            )
-
-        error = (
-            center_x
-            - self.image_center_x
-        )
-
-        # --------------------------------------------------------------------
-        # Normalização:
-        #
-        # ±1 corresponde aproximadamente a ±metade da região útil.
-        # --------------------------------------------------------------------
-
-        denominator = max(
-            self.roi_width * 0.5,
-            1.0,
-        )
-
-        return float(
-            np.clip(
-                error / denominator,
-                -1.0,
-                1.0,
+        center_x = float(
+            np.sum(
+                center_array
+                * weights
             )
         )
 
-    # =========================================================================
-    # HEADING
-    # =========================================================================
-
-    def _compute_heading_error(
-        self,
-        center_line: Sequence[Point],
-    ) -> float:
-
-        if len(center_line) < 5:
-            return 0.0
-
-        arr = np.asarray(
-            center_line,
-            dtype=np.float64,
-        )
-
-        if (
-            arr.ndim != 2
-            or arr.shape[1] != 2
-            or not np.all(
-                np.isfinite(arr)
+        lane_width = float(
+            np.sum(
+                width_array
+                * weights
             )
-        ):
-            return 0.0
-
-        # --------------------------------------------------------------------
-        # Utilizamos a região inferior observada.
-        # --------------------------------------------------------------------
-
-        start = max(
-            0,
-            int(
-                len(arr) * 0.55
-            ),
         )
 
-        local = arr[
-            start:
-        ]
-
-        if len(local) < 3:
-            return 0.0
-
-        x = local[:, 0]
-        y = local[:, 1]
-
-        if float(np.ptp(y)) < 1.0:
-            return 0.0
-
-        # --------------------------------------------------------------------
-        # Regressão robusta x=f(y).
-        #
-        # Isso é significativamente mais estável que calcular apenas
-        # diferenças entre pontos consecutivos.
-        # --------------------------------------------------------------------
-
-        y_mean = float(
-            np.mean(y)
-        )
-
-        y_scale = float(
-            np.std(y)
-        )
-
-        if y_scale < 1e-6:
-            return 0.0
-
-        y_norm = (
-            y - y_mean
-        ) / y_scale
+        # ---------------------------------------------------------------------
+        # Heading
+        # ---------------------------------------------------------------------
 
         try:
-            coeff = np.polyfit(
-                y_norm,
-                x,
-                1,
+            center_coefficients = np.polyfit(
+                ys[
+                    :len(center_array)
+                ],
+                center_array,
+                2,
+            )
+
+            derivative_coefficients = (
+                np.polyder(
+                    center_coefficients
+                )
+            )
+
+            heading_slope = float(
+                np.polyval(
+                    derivative_coefficients,
+                    y_max,
+                )
+            )
+
+            heading = float(
+                np.arctan(
+                    heading_slope
+                )
             )
 
         except (
@@ -1750,439 +936,583 @@ class LaneGeometry:
             ValueError,
             FloatingPointError,
         ):
-            return 0.0
+            heading = 0.0
 
-        slope_normalized = float(
-            coeff[0]
-        )
+        # ---------------------------------------------------------------------
+        # Curvatura
+        # ---------------------------------------------------------------------
 
-        # slope original:
-        #
-        # dx/dy = coeff / std(y)
-        #
-        slope = (
-            slope_normalized
-            / y_scale
-        )
-
-        if not math.isfinite(
-            slope
-        ):
-            return 0.0
-
-        angle = math.atan(
-            slope
-        )
-
-        # ±45 graus -> ±1.
-        max_angle = math.radians(
-            45.0
-        )
-
-        return float(
-            np.clip(
-                angle / max_angle,
-                -1.0,
-                1.0,
-            )
-        )
-
-    # =========================================================================
-    # CURVATURA
-    # =========================================================================
-
-    def _compute_curvature(
-        self,
-        center_line: Sequence[Point],
-    ) -> float:
-
-        if len(center_line) < 7:
-            return 0.0
-
-        arr = np.asarray(
-            center_line,
-            dtype=np.float64,
-        )
-
-        if (
-            arr.ndim != 2
-            or arr.shape[1] != 2
-            or not np.all(
-                np.isfinite(arr)
-            )
-        ):
-            return 0.0
-
-        x = arr[:, 0]
-        y = arr[:, 1]
-
-        if float(
-            np.ptp(y)
-        ) < 20.0:
-            return 0.0
-
-        # --------------------------------------------------------------------
-        # Remove pequenos problemas de espaçamento de Y.
-        # --------------------------------------------------------------------
-
-        order = np.argsort(y)
-
-        y = y[order]
-        x = x[order]
-
-        unique_y, unique_indices = (
-            np.unique(
-                y,
-                return_index=True,
-            )
-        )
-
-        x = x[
-            unique_indices
-        ]
-
-        y = unique_y
-
-        if len(y) < 7:
-            return 0.0
+        curvature = 0.0
 
         try:
+            if len(center_array) >= 5:
 
-            dx_dy = np.gradient(
-                x,
-                y,
-            )
+                polynomial = np.polyfit(
+                    ys[
+                        :len(center_array)
+                    ],
+                    center_array,
+                    3,
+                )
 
-            d2x_dy2 = np.gradient(
-                dx_dy,
-                y,
-            )
+                first = np.polyval(
+                    np.polyder(
+                        polynomial,
+                        1,
+                    ),
+                    y_max,
+                )
+
+                second = np.polyval(
+                    np.polyder(
+                        polynomial,
+                        2,
+                    ),
+                    y_max,
+                )
+
+                denominator = (
+                    1.0
+                    + first * first
+                ) ** 1.5
+
+                if denominator > 1e-9:
+                    curvature = float(
+                        second
+                        / denominator
+                    )
 
         except (
+            np.linalg.LinAlgError,
             ValueError,
             FloatingPointError,
         ):
-            return 0.0
-
-        denominator = np.power(
-            1.0
-            + dx_dy * dx_dy,
-            1.5,
-        )
-
-        valid = (
-            denominator > 1e-9
-        )
-
-        if not np.any(valid):
-            return 0.0
-
-        values = (
-            np.abs(
-                d2x_dy2[valid]
-            )
-            / denominator[valid]
-        )
-
-        values = values[
-            np.isfinite(values)
-        ]
-
-        if values.size == 0:
-            return 0.0
-
-        curvature = float(
-            np.median(values)
-        )
-
-        # --------------------------------------------------------------------
-        # Normalização visual.
-        #
-        # A unidade interna permanece estável entre frames.
-        # --------------------------------------------------------------------
-
-        return float(
-            np.clip(
-                curvature * 500.0,
-                0.0,
-                1.0,
-            )
-        )
-
-    # =========================================================================
-    # CENTRO REPRESENTATIVO
-    # =========================================================================
-
-    def _compute_weighted_center(
-        self,
-        center_line: Sequence[Point],
-    ) -> Tuple[float, float]:
-
-        if not center_line:
-            return (
-                self.image_center_x,
-                self.image_center_y,
-            )
-
-        arr = np.asarray(
-            center_line,
-            dtype=np.float64,
-        )
-
-        if (
-            arr.ndim != 2
-            or arr.shape[1] != 2
-            or not np.all(
-                np.isfinite(arr)
-            )
-        ):
-            return (
-                self.image_center_x,
-                self.image_center_y,
-            )
-
-        y = arr[:, 1]
-
-        relative = (
-            y - self.roi_top
-        ) / max(
-            self.roi_height,
-            1.0,
-        )
-
-        relative = np.clip(
-            relative,
-            0.0,
-            1.0,
-        )
-
-        weights = (
-            self.far_weight
-            + (
-                self.near_weight
-                - self.far_weight
-            )
-            * relative
-        )
-
-        weights = np.maximum(
-            weights,
-            1e-6,
-        )
-
-        total = float(
-            np.sum(weights)
-        )
-
-        if total <= 0.0:
-            weights = np.ones(
-                len(arr),
-                dtype=np.float64,
-            )
-
-        weights /= float(
-            np.sum(weights)
-        )
-
-        center_x = float(
-            np.average(
-                arr[:, 0],
-                weights=weights,
-            )
-        )
-
-        center_y = float(
-            np.average(
-                arr[:, 1],
-                weights=weights,
-            )
-        )
+            curvature = 0.0
 
         return (
             center_x,
-            center_y,
+            float(
+                (y_min + y_max)
+                / 2.0
+            ),
+            lane_width,
+            heading,
+            curvature,
         )
 
     # =========================================================================
-    # CONFIANÇA
+    # PAIR SCORING
     # =========================================================================
 
-    def _compute_geometry_confidence(
+    def _pair_score(
         self,
         left: Sequence[Point],
         right: Sequence[Point],
-        center: Sequence[Point],
-        lane_width: float,
+        left_confidence: float,
+        right_confidence: float,
+    ) -> Optional[
+        Tuple[
+            float,
+            float,
+            float,
+            float,
+            float,
+            float,
+        ]
+    ]:
+        """
+        Avalia um par candidato.
+
+        Retorna:
+
+            score
+            center_x
+            center_y
+            width
+            heading
+            curvature
+        """
+
+        metrics = self._sample_pair_geometry(
+            left,
+            right,
+        )
+
+        if metrics is None:
+            return None
+
+        (
+            center_x,
+            center_y,
+            width,
+            heading,
+            curvature,
+        ) = metrics
+
+        span = min(
+            self._lane_span(left),
+            self._lane_span(right),
+        )
+
+        detection_confidence = (
+            0.5 * self._clip01(
+                left_confidence
+            )
+            + 0.5 * self._clip01(
+                right_confidence
+            )
+        )
+
+        span_score = self._clip01(
+            span / 300.0
+        )
+
+        expected_width = (
+            LANE_GEOMETRY.expected_lane_width
+        )
+
+        tolerance = max(
+            1.0,
+            LANE_GEOMETRY.lane_width_tolerance,
+        )
+
+        width_error = abs(
+            width - expected_width
+        ) / max(
+            expected_width,
+            1.0,
+        )
+
+        width_score = self._clip01(
+            1.0
+            - (
+                width_error
+                / tolerance
+            )
+        )
+
+        heading_score = self._clip01(
+            1.0
+            - (
+                abs(heading)
+                / max(
+                    LANE_GEOMETRY.max_heading_error,
+                    1e-6,
+                )
+            )
+        )
+
+        curvature_score = self._clip01(
+            1.0
+            - (
+                abs(curvature)
+                / max(
+                    LANE_GEOMETRY.max_curvature_score,
+                    1e-6,
+                )
+            )
+        )
+
+        geometry_score = (
+            0.60 * heading_score
+            + 0.40 * curvature_score
+        )
+
+        score = _weighted_confidence(
+            detection_confidence,
+            span_score,
+            width_score,
+            geometry_score,
+        )
+
+        return (
+            score,
+            center_x,
+            center_y,
+            width,
+            heading,
+            curvature,
+        )
+
+    # =========================================================================
+    # PAIR SELECTION
+    # =========================================================================
+
+    def _select_pair(
+        self,
+        lanes: Sequence[Sequence[Point]],
+        confidences: Sequence[float],
+    ) -> Optional[
+        Tuple[
+            int,
+            int,
+            float,
+            float,
+            float,
+            float,
+            float,
+        ]
+    ]:
+        """
+        Seleciona o melhor par esquerda/direita.
+
+        O critério considera:
+
+            - confiança;
+            - extensão vertical;
+            - largura;
+            - heading;
+            - curvatura;
+            - proximidade do centro da imagem.
+        """
+
+        if len(lanes) < 2:
+            return None
+
+        image_center_x = (
+            ROI.left
+            + ROI.width / 2.0
+        )
+
+        candidates = []
+
+        for left_index in range(
+            len(lanes)
+        ):
+
+            left = lanes[
+                left_index
+            ]
+
+            left_mean_x = (
+                self._lane_mean_x(left)
+            )
+
+            if left_mean_x >= image_center_x:
+                continue
+
+            for right_index in range(
+                len(lanes)
+            ):
+
+                if (
+                    left_index
+                    == right_index
+                ):
+                    continue
+
+                right = lanes[
+                    right_index
+                ]
+
+                right_mean_x = (
+                    self._lane_mean_x(right)
+                )
+
+                if (
+                    right_mean_x
+                    <= image_center_x
+                ):
+                    continue
+
+                pair = self._pair_score(
+                    left,
+                    right,
+                    confidences[
+                        left_index
+                    ],
+                    confidences[
+                        right_index
+                    ],
+                )
+
+                if pair is None:
+                    continue
+
+                (
+                    score,
+                    center_x,
+                    center_y,
+                    width,
+                    heading,
+                    curvature,
+                ) = pair
+
+                center_distance = (
+                    abs(
+                        center_x
+                        - image_center_x
+                    )
+                    / max(
+                        ROI.width,
+                        1,
+                    )
+                )
+
+                center_score = self._clip01(
+                    1.0
+                    - center_distance
+                )
+
+                final_score = (
+                    0.85 * score
+                    + 0.15 * center_score
+                )
+
+                candidates.append(
+                    (
+                        final_score,
+                        left_index,
+                        right_index,
+                        center_x,
+                        center_y,
+                        width,
+                        heading,
+                        curvature,
+                    )
+                )
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        (
+            score,
+            left_index,
+            right_index,
+            center_x,
+            center_y,
+            width,
+            heading,
+            curvature,
+        ) = candidates[0]
+
+        return (
+            left_index,
+            right_index,
+            score,
+            center_x,
+            center_y,
+            width,
+            heading,
+        )
+
+    # =========================================================================
+    # CENTER LINE
+    # =========================================================================
+
+    def _build_center_line(
+        self,
+        left: Sequence[Point],
+        right: Sequence[Point],
+    ) -> List[Point]:
+        """
+        Cria centro somente onde ambas as lanes
+        possuem observação.
+
+        Não extrapola.
+        """
+
+        common = self._common_observed_range(
+            left,
+            right,
+        )
+
+        if common is None:
+            return []
+
+        y_min, y_max = common
+
+        sample_count = max(
+            8,
+            min(
+                64,
+                int(
+                    LANE_GEOMETRY.min_points
+                    * 4
+                ),
+            ),
+        )
+
+        ys = np.linspace(
+            y_min,
+            y_max,
+            sample_count,
+        )
+
+        result: List[Point] = []
+
+        for y in ys:
+
+            left_x = self._interpolate_x(
+                left,
+                float(y),
+            )
+
+            right_x = self._interpolate_x(
+                right,
+                float(y),
+            )
+
+            if (
+                left_x is None
+                or right_x is None
+            ):
+                continue
+
+            center_x = (
+                left_x
+                + right_x
+            ) / 2.0
+
+            if not self._finite(
+                center_x
+            ):
+                continue
+
+            result.append(
+                (
+                    float(center_x),
+                    float(y),
+                )
+            )
+
+        return result
+
+    # =========================================================================
+    # ADDITIONAL LANES
+    # =========================================================================
+
+    @staticmethod
+    def _additional_lanes(
+        lanes: Sequence[Sequence[Point]],
+        left_index: int,
+        right_index: int,
+    ) -> List[List[Point]]:
+
+        return [
+            list(lane)
+            for index, lane in enumerate(lanes)
+            if index not in {
+                left_index,
+                right_index,
+            }
+        ]
+
+    # =========================================================================
+    # CONFIDENCE
+    # =========================================================================
+
+    def _geometry_confidence(
+        self,
+        left_confidence: float,
+        right_confidence: float,
+        span: float,
+        width: float,
+        heading: float,
+        curvature: float,
     ) -> float:
 
-        if (
-            len(left) < self.min_points
-            or len(right) < self.min_points
-            or len(center) < self.min_points
-        ):
-            return 0.0
+        detection_score = (
+            0.5 * self._clip01(
+                left_confidence
+            )
+            + 0.5 * self._clip01(
+                right_confidence
+            )
+        )
 
-        if not (
-            self.min_lane_width
-            <= lane_width
-            <= self.max_lane_width
-        ):
-            return 0.0
+        span_score = self._clip01(
+            span / 300.0
+        )
 
-        # --------------------------------------------------------------------
-        # Quantidade de observações.
-        # --------------------------------------------------------------------
+        expected_width = (
+            LANE_GEOMETRY.expected_lane_width
+        )
 
-        point_score = float(
-            np.clip(
-                min(
-                    len(left),
-                    len(right),
-                )
+        width_error = abs(
+            width - expected_width
+        ) / max(
+            expected_width,
+            1.0,
+        )
+
+        width_score = self._clip01(
+            1.0
+            - width_error
+        )
+
+        heading_score = self._clip01(
+            1.0
+            - (
+                abs(heading)
                 / max(
-                    self.min_points * 3.0,
-                    1.0,
-                ),
-                0.0,
-                1.0,
-            )
-        )
-
-        # --------------------------------------------------------------------
-        # Extensão vertical.
-        # --------------------------------------------------------------------
-
-        y = np.asarray(
-            [
-                point[1]
-                for point in center
-            ],
-            dtype=np.float64,
-        )
-
-        if y.size == 0:
-            return 0.0
-
-        observed_span = float(
-            np.ptp(y)
-        )
-
-        span_score = float(
-            np.clip(
-                observed_span
-                / max(
-                    self.roi_height * 0.60,
-                    1.0,
-                ),
-                0.0,
-                1.0,
-            )
-        )
-
-        # --------------------------------------------------------------------
-        # Consistência da largura.
-        # --------------------------------------------------------------------
-
-        width_consistency = (
-            self._width_consistency(
-                left,
-                right,
-            )
-        )
-
-        # --------------------------------------------------------------------
-        # Largura.
-        #
-        # Não penalizamos demais larguras legítimas próximas das bordas
-        # do intervalo.
-        # --------------------------------------------------------------------
-
-        width_range = (
-            self.max_lane_width
-            - self.min_lane_width
-        )
-
-        if width_range <= 0.0:
-
-            width_score = 1.0
-
-        else:
-
-            normalized = (
-                lane_width
-                - self.min_lane_width
-            ) / width_range
-
-            width_score = float(
-                np.clip(
-                    1.0
-                    - abs(
-                        normalized
-                        - 0.5
-                    ) * 0.8,
-                    0.0,
-                    1.0,
+                    LANE_GEOMETRY.max_heading_error,
+                    1e-6,
                 )
             )
-
-        confidence = (
-            point_score * 0.20
-            + span_score * 0.30
-            + width_consistency * 0.30
-            + width_score * 0.20
         )
 
-        return float(
-            np.clip(
-                confidence,
-                0.0,
-                1.0,
+        curvature_score = self._clip01(
+            1.0
+            - (
+                abs(curvature)
+                / max(
+                    LANE_GEOMETRY.max_curvature_score,
+                    1e-6,
+                )
             )
+        )
+
+        geometry_score = (
+            0.65 * heading_score
+            + 0.35 * curvature_score
+        )
+
+        return _weighted_confidence(
+            detection_score,
+            span_score,
+            width_score,
+            geometry_score,
         )
 
     # =========================================================================
-    # RESULTADO INVÁLIDO
+    # INVALID RESULT
     # =========================================================================
 
-    def _invalid_result(
-        self,
-        additional_lanes: Optional[
-            List[List[Point]]
-        ] = None,
-        left: Optional[
-            List[Point]
-        ] = None,
-        right: Optional[
-            List[Point]
-        ] = None,
-    ) -> LaneGeometryResult:
+    def _invalid_result(self) -> LaneGeometryResult:
+        """
+        Falha segura.
+        """
+
+        center_x = (
+            ROI.left
+            + ROI.width / 2.0
+        )
+
+        center_y = (
+            ROI.top
+            + ROI.height / 2.0
+        )
 
         return LaneGeometryResult(
-            lane_center_x=self.image_center_x,
-            lane_center_y=self.image_center_y,
-            image_center_x=self.image_center_x,
-            image_center_y=self.image_center_y,
+            lane_center_x=center_x,
+            lane_center_y=center_y,
+            image_center_x=center_x,
+            image_center_y=center_y,
             lateral_error=0.0,
             heading_error=0.0,
             lane_width=0.0,
             curvature=0.0,
             center_line=[],
             valid=False,
-            left_lane_screen=(
-                left
-                if left is not None
-                else []
-            ),
-            right_lane_screen=(
-                right
-                if right is not None
-                else []
-            ),
-            additional_lanes_screen=(
-                additional_lanes
-                if additional_lanes is not None
-                else []
-            ),
+            left_lane_screen=[],
+            right_lane_screen=[],
+            additional_lanes_screen=[],
             selected_left_index=-1,
             selected_right_index=-1,
             geometry_confidence=0.0,
@@ -2193,100 +1523,7 @@ class LaneGeometry:
         )
 
     # =========================================================================
-    # EXTRAÇÃO DAS LANES
-    # =========================================================================
-
-    def _extract_lanes(
-        self,
-        detection: object,
-        detector_width: float,
-        detector_height: float,
-    ) -> List[List[Point]]:
-
-        # --------------------------------------------------------------------
-        # Prioridade:
-        #
-        # 1. detection.lanes
-        #
-        # Isso é importante porque o YOLOP atual entrega todas as lanes.
-        # Não queremos perder as lanes adicionais.
-        # --------------------------------------------------------------------
-
-        raw_lanes = getattr(
-            detection,
-            "lanes",
-            None,
-        )
-
-        candidates = []
-
-        if raw_lanes:
-
-            candidates.extend(
-                raw_lanes
-            )
-
-        else:
-
-            # Compatibilidade com resultados antigos.
-            left = getattr(
-                detection,
-                "left_lane",
-                [],
-            )
-
-            right = getattr(
-                detection,
-                "right_lane",
-                [],
-            )
-
-            additional = getattr(
-                detection,
-                "additional_lanes",
-                [],
-            )
-
-            if left:
-                candidates.append(
-                    left
-                )
-
-            if additional:
-                candidates.extend(
-                    additional
-                )
-
-            if right:
-                candidates.append(
-                    right
-                )
-
-        result = []
-
-        for lane in candidates:
-
-            converted = self._convert_lane(
-                lane,
-                detector_width,
-                detector_height,
-            )
-
-            prepared = self._prepare_lane(
-                converted
-            )
-
-            if len(prepared) < self.min_points:
-                continue
-
-            result.append(
-                prepared
-            )
-
-        return result
-
-    # =========================================================================
-    # PIPELINE PRINCIPAL
+    # PUBLIC API
     # =========================================================================
 
     def compute(
@@ -2294,150 +1531,207 @@ class LaneGeometry:
         detection: LaneDetectionResult,
     ) -> LaneGeometryResult:
         """
-        Calcula a geometria observada.
+        Calcula a geometria observada do frame.
 
-        A seleção da faixa é feita por evidência geométrica do frame atual.
+        Não possui memória temporal.
         """
 
         if detection is None:
             return self._invalid_result()
 
+        if not getattr(
+            detection,
+            "valid",
+            False,
+        ):
+            return self._invalid_result()
+
         detector_width, detector_height = (
-            self._get_detection_dimensions(
+            self._detection_dimensions(
                 detection
             )
         )
 
-        lanes = self._extract_lanes(
+        raw_lanes = getattr(
             detection,
-            detector_width,
-            detector_height,
+            "lanes",
+            None,
         )
+
+        confidences = getattr(
+            detection,
+            "lane_confidences",
+            None,
+        )
+
+        # ---------------------------------------------------------------------
+        # Compatibilidade com o formato antigo do detector.
+        # ---------------------------------------------------------------------
+
+        if not raw_lanes:
+
+            raw_lanes = []
+
+            left_lane = getattr(
+                detection,
+                "left_lane",
+                [],
+            )
+
+            right_lane = getattr(
+                detection,
+                "right_lane",
+                [],
+            )
+
+            if left_lane:
+                raw_lanes.append(
+                    left_lane
+                )
+
+            if right_lane:
+                raw_lanes.append(
+                    right_lane
+                )
+
+            additional = getattr(
+                detection,
+                "additional_lanes",
+                [],
+            )
+
+            raw_lanes.extend(
+                additional
+            )
+
+        if not raw_lanes:
+            return self._invalid_result()
+
+        if not confidences:
+
+            confidences = [
+                1.0
+                for _ in raw_lanes
+            ]
+
+        confidences = list(
+            confidences
+        )
+
+        while len(confidences) < len(
+            raw_lanes
+        ):
+            confidences.append(
+                LANE_GEOMETRY.min_lane_confidence
+            )
+
+        lanes: List[List[Point]] = []
+
+        lane_confidences: List[float] = []
+
+        original_indices: List[int] = []
+
+        for index, raw_lane in enumerate(
+            raw_lanes
+        ):
+
+            converted = self._convert_lane(
+                raw_lane,
+                detector_width,
+                detector_height,
+            )
+
+            converted = self._remove_outliers(
+                converted
+            )
+
+            if len(converted) < (
+                LANE_GEOMETRY.min_points
+            ):
+                continue
+
+            span = self._lane_span(
+                converted
+            )
+
+            if span < (
+                LANE_GEOMETRY.min_observed_span
+            ):
+                continue
+
+            lanes.append(
+                converted
+            )
+
+            lane_confidences.append(
+                self._clip01(
+                    confidences[index]
+                )
+            )
+
+            original_indices.append(
+                index
+            )
 
         if len(lanes) < 2:
             return self._invalid_result()
 
-        # --------------------------------------------------------------------
-        # Ordenação espacial.
-        # --------------------------------------------------------------------
-
-        ordered_lanes = self._sort_lanes(
-            lanes
-        )
-
-        if len(ordered_lanes) < 2:
-            return self._invalid_result(
-                additional_lanes=ordered_lanes
-            )
-
-        # --------------------------------------------------------------------
-        # Seleção do par atual.
-        #
-        # Diferentemente da implementação anterior, NÃO exigimos que todas
-        # as lanes tenham observação no mesmo Y.
-        # --------------------------------------------------------------------
-
-        selected = self._select_current_lane(
-            ordered_lanes
+        selected = self._select_pair(
+            lanes,
+            lane_confidences,
         )
 
         if selected is None:
-            return self._invalid_result(
-                additional_lanes=ordered_lanes
-            )
+            return self._invalid_result()
 
-        left_index, right_index = selected
+        (
+            left_index,
+            right_index,
+            pair_score,
+            lane_center_x,
+            lane_center_y,
+            lane_width,
+            heading,
+        ) = selected
 
-        selected_left = ordered_lanes[
+        left_lane = lanes[
             left_index
         ]
 
-        selected_right = ordered_lanes[
+        right_lane = lanes[
             right_index
         ]
 
-        # --------------------------------------------------------------------
-        # Centro.
-        # --------------------------------------------------------------------
-
-        center_line = self._compute_center_line(
-            selected_left,
-            selected_right,
+        left_confidence = (
+            lane_confidences[
+                left_index
+            ]
         )
 
-        if len(center_line) < self.min_points:
-            return self._invalid_result(
-                additional_lanes=ordered_lanes,
-                left=selected_left,
-                right=selected_right,
-            )
-
-        # --------------------------------------------------------------------
-        # Largura.
-        # --------------------------------------------------------------------
-
-        lane_width = self._compute_lane_width(
-            selected_left,
-            selected_right,
+        right_confidence = (
+            lane_confidences[
+                right_index
+            ]
         )
 
-        if not (
-            self.min_lane_width
-            <= lane_width
-            <= self.max_lane_width
-        ):
-            return self._invalid_result(
-                additional_lanes=ordered_lanes,
-                left=selected_left,
-                right=selected_right,
-            )
-
-        # --------------------------------------------------------------------
-        # Métricas.
-        # --------------------------------------------------------------------
-
-        lateral_error = (
-            self._compute_lateral_error(
-                center_line
+        center_line = (
+            self._build_center_line(
+                left_lane,
+                right_lane,
             )
         )
 
-        heading_error = (
-            self._compute_heading_error(
-                center_line
-            )
+        if len(center_line) < 2:
+            return self._invalid_result()
+
+        observed_y_min = min(
+            point[1]
+            for point in center_line
         )
 
-        curvature = (
-            self._compute_curvature(
-                center_line
-            )
-        )
-
-        center_x, center_y = (
-            self._compute_weighted_center(
-                center_line
-            )
-        )
-
-        # --------------------------------------------------------------------
-        # Extensão realmente observada.
-        # --------------------------------------------------------------------
-
-        y_values = np.asarray(
-            [
-                point[1]
-                for point in center_line
-            ],
-            dtype=np.float64,
-        )
-
-        observed_y_min = float(
-            np.min(y_values)
-        )
-
-        observed_y_max = float(
-            np.max(y_values)
+        observed_y_max = max(
+            point[1]
+            for point in center_line
         )
 
         observed_span = (
@@ -2445,124 +1739,268 @@ class LaneGeometry:
             - observed_y_min
         )
 
-        # --------------------------------------------------------------------
-        # Confiança.
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Curvatura observada
+        # ---------------------------------------------------------------------
+
+        curvature = 0.0
+
+        if len(center_line) >= 5:
+
+            center_array = np.asarray(
+                center_line,
+                dtype=np.float64,
+            )
+
+            try:
+
+                coefficients = np.polyfit(
+                    center_array[:, 1],
+                    center_array[:, 0],
+                    3,
+                )
+
+                y_eval = float(
+                    observed_y_max
+                )
+
+                first = float(
+                    np.polyval(
+                        np.polyder(
+                            coefficients,
+                            1,
+                        ),
+                        y_eval,
+                    )
+                )
+
+                second = float(
+                    np.polyval(
+                        np.polyder(
+                            coefficients,
+                            2,
+                        ),
+                        y_eval,
+                    )
+                )
+
+                denominator = (
+                    1.0
+                    + first * first
+                ) ** 1.5
+
+                if denominator > 1e-9:
+                    curvature = float(
+                        second
+                        / denominator
+                    )
+
+            except (
+                np.linalg.LinAlgError,
+                ValueError,
+                FloatingPointError,
+            ):
+                curvature = 0.0
+
+        # ---------------------------------------------------------------------
+        # Lateral error
+        # ---------------------------------------------------------------------
+
+        image_center_x = (
+            ROI.left
+            + ROI.width / 2.0
+        )
+
+        image_center_y = (
+            ROI.top
+            + ROI.height / 2.0
+        )
+
+        # Erro normalizado pela largura do ROI.
+        lateral_error = (
+            image_center_x
+            - lane_center_x
+        ) / max(
+            ROI.width,
+            1,
+        )
+
+        lateral_error = float(
+            np.clip(
+                lateral_error,
+                -1.0,
+                1.0,
+            )
+        )
 
         geometry_confidence = (
-            self._compute_geometry_confidence(
-                selected_left,
-                selected_right,
-                center_line,
+            self._geometry_confidence(
+                left_confidence,
+                right_confidence,
+                observed_span,
                 lane_width,
+                heading,
+                curvature,
             )
         )
 
-        # --------------------------------------------------------------------
-        # Pronto para projeção?
-        #
-        # Isto NÃO significa que a geometria foi projetada.
-        # Apenas significa que existe informação observada suficiente.
-        # --------------------------------------------------------------------
-
-        enough_for_projection = bool(
-            geometry_confidence >= 0.55
-            and observed_span
-            >= self.projection_min_span
-            and len(center_line)
-            >= self.min_points
+        # O score do par participa como limitador de confiança.
+        geometry_confidence = min(
+            geometry_confidence,
+            self._clip01(
+                pair_score
+            ),
         )
 
-        # --------------------------------------------------------------------
-        # Lanes restantes.
-        # --------------------------------------------------------------------
+        enough_for_projection = (
+            observed_span
+            >= LANE_GEOMETRY.min_observed_span
+        )
 
-        additional = [
-            lane
-            for index, lane in enumerate(
-                ordered_lanes
-            )
-            if index
-            not in (
+        additional = (
+            self._additional_lanes(
+                lanes,
                 left_index,
                 right_index,
             )
-        ]
-
-        # --------------------------------------------------------------------
-        # A geometria é considerada válida quando existe um par observado
-        # coerente. Não exigimos que projection já seja possível.
-        # --------------------------------------------------------------------
-
-        valid = bool(
-            geometry_confidence >= 0.35
-            and len(center_line)
-            >= self.min_points
-            and self.min_lane_width
-            <= lane_width
-            <= self.max_lane_width
         )
 
         return LaneGeometryResult(
-            lane_center_x=center_x,
-            lane_center_y=center_y,
-            image_center_x=self.image_center_x,
-            image_center_y=self.image_center_y,
-            lateral_error=lateral_error,
-            heading_error=heading_error,
-            lane_width=lane_width,
-            curvature=curvature,
+            lane_center_x=float(
+                lane_center_x
+            ),
+            lane_center_y=float(
+                lane_center_y
+            ),
+            image_center_x=float(
+                image_center_x
+            ),
+            image_center_y=float(
+                image_center_y
+            ),
+            lateral_error=float(
+                lateral_error
+            ),
+            heading_error=float(
+                np.clip(
+                    heading,
+                    -LANE_GEOMETRY.max_heading_error,
+                    LANE_GEOMETRY.max_heading_error,
+                )
+            ),
+            lane_width=float(
+                lane_width
+            ),
+            curvature=float(
+                curvature
+            ),
             center_line=center_line,
-            valid=valid,
-            left_lane_screen=selected_left,
-            right_lane_screen=selected_right,
+            valid=True,
+            left_lane_screen=list(
+                left_lane
+            ),
+            right_lane_screen=list(
+                right_lane
+            ),
             additional_lanes_screen=additional,
-            selected_left_index=left_index,
-            selected_right_index=right_index,
-            geometry_confidence=geometry_confidence,
-            observed_y_min=observed_y_min,
-            observed_y_max=observed_y_max,
-            observed_span=observed_span,
-            enough_for_projection=(
+            selected_left_index=int(
+                original_indices[
+                    left_index
+                ]
+            ),
+            selected_right_index=int(
+                original_indices[
+                    right_index
+                ]
+            ),
+            geometry_confidence=float(
+                geometry_confidence
+            ),
+            observed_y_min=float(
+                observed_y_min
+            ),
+            observed_y_max=float(
+                observed_y_max
+            ),
+            observed_span=float(
+                observed_span
+            ),
+            enough_for_projection=bool(
                 enough_for_projection
             ),
         )
 
-    # =========================================================================
-    # ALIASES DE COMPATIBILIDADE
-    # =========================================================================
 
-    def process(
-        self,
-        detection: LaneDetectionResult,
-    ) -> LaneGeometryResult:
-        """
-        Alias semântico para compute().
-        """
+# =============================================================================
+# HELPERS
+# =============================================================================
 
-        return self.compute(
-            detection
+
+def _weighted_confidence(
+    detection: float,
+    span: float,
+    width: float,
+    geometry: float,
+) -> float:
+    """
+    Combina os componentes usando os pesos oficiais
+    definidos em LANE_GEOMETRY.
+    """
+
+    weights = np.asarray(
+        [
+            LANE_GEOMETRY.confidence_weight_detection,
+            LANE_GEOMETRY.confidence_weight_span,
+            LANE_GEOMETRY.confidence_weight_width,
+            LANE_GEOMETRY.confidence_weight_geometry,
+        ],
+        dtype=np.float64,
+    )
+
+    values = np.asarray(
+        [
+            detection,
+            span,
+            width,
+            geometry,
+        ],
+        dtype=np.float64,
+    )
+
+    if not np.all(
+        np.isfinite(weights)
+    ):
+        return 0.0
+
+    if not np.all(
+        np.isfinite(values)
+    ):
+        return 0.0
+
+    weight_sum = float(
+        np.sum(weights)
+    )
+
+    if weight_sum <= 1e-9:
+        return 0.0
+
+    return float(
+        np.clip(
+            np.sum(
+                weights * values
+            ) / weight_sum,
+            0.0,
+            1.0,
         )
-
-    def calculate(
-        self,
-        detection: LaneDetectionResult,
-    ) -> LaneGeometryResult:
-        """
-        Alias de compatibilidade.
-        """
-
-        return self.compute(
-            detection
-        )
+    )
 
 
-# ============================================================================
+# =============================================================================
 # EXPORTS
-# ============================================================================
+# =============================================================================
+
 
 __all__ = [
-    "Point",
-    "LaneGeometryResult",
     "LaneGeometry",
+    "LaneGeometryResult",
 ]
