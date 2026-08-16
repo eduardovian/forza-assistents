@@ -1,470 +1,719 @@
 """
 core/lane_selector.py
 
-Seleção das lanes relevantes para o ADAS.
+Forza Assistents
+================
 
-Responsabilidades:
-    - receber lanes detectadas/tracked;
-    - filtrar detecções inválidas;
-    - ordenar lanes espacialmente;
-    - identificar candidatos à faixa atual;
-    - preservar todas as lanes válidas para as etapas seguintes.
+Seleção determinística de lanes.
 
-IMPORTANTE:
-    ROI não é tratado aqui.
-    O ROI pertence exclusivamente ao pipeline de captura/config.py.
+Responsabilidades
+-----------------
+- Validar candidatos.
+- Filtrar lanes inválidas ou de baixa confiança.
+- Ordenar lanes espacialmente.
+- Identificar a lane mais provável à esquerda/direita do centro.
+- Evitar seleção baseada em ROI.
+- Preservar informação original dos candidatos.
+- Produzir um resultado determinístico para as camadas seguintes.
 
-Este módulo não:
-    - captura tela;
-    - executa YOLOP;
-    - altera coordenadas;
-    - controla o G29;
-    - decide o estado final do ADAS.
+Este módulo NÃO:
+- captura frames;
+- define ROI;
+- modifica ROI;
+- executa YOLOP;
+- calcula geometria de pista;
+- executa tracking;
+- decide estado ADAS;
+- envia comandos ao volante.
+
+Arquitetura
+-----------
+
+    YOLOP / Detector
+           │
+           ▼
+      Lane candidates
+           │
+           ▼
+      LaneSelector
+           │
+           ▼
+    SelectedLaneSet
+           │
+           ├── LaneGeometry
+           ├── LaneTracker
+           └── LaneAssignment
+
+PRINCÍPIO
+---------
+
+O seletor trabalha exclusivamente nas coordenadas do frame
+que recebe.
+
+ROI pertence exclusivamente a config.py/capture.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+import logging
+import math
+from typing import Any, Iterable, Sequence
+
+from config import LANE_SELECTOR
 
 
-# ============================================================================
-# RESULTADOS
-# ============================================================================
+LOGGER = logging.getLogger(__name__)
 
-@dataclass(frozen=True)
-class LaneSelectionResult:
+
+# =============================================================================
+# RESULT TYPES
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class LaneCandidate:
     """
-    Resultado da seleção espacial das lanes.
+    Representação normalizada de uma lane candidata.
+
+    O seletor não exige que o detector use exatamente esta classe.
+    Objetos externos podem ser normalizados através de
+    LaneSelector._normalize_candidate().
     """
 
-    lanes: Tuple[Any, ...]
-    current_candidates: Tuple[Any, ...]
-    left_candidates: Tuple[Any, ...]
-    right_candidates: Tuple[Any, ...]
-    valid: bool
+    lane_id: int
+
+    points: tuple[tuple[float, float], ...]
+
+    confidence: float
+
+    source: Any = None
 
     @property
-    def count(self) -> int:
+    def point_count(self) -> int:
+        return len(self.points)
+
+    @property
+    def bottom_x(self) -> float:
+        """
+        Estima a posição horizontal da lane no ponto mais baixo
+        observado.
+        """
+
+        if not self.points:
+            return math.nan
+
+        return max(
+            self.points,
+            key=lambda point: point[1],
+        )[0]
+
+    @property
+    def top_x(self) -> float:
+        """
+        Estima a posição horizontal da lane no ponto mais alto
+        observado.
+        """
+
+        if not self.points:
+            return math.nan
+
+        return min(
+            self.points,
+            key=lambda point: point[1],
+        )[0]
+
+    @property
+    def y_span(self) -> float:
+        if len(self.points) < 2:
+            return 0.0
+
+        ys = [
+            point[1]
+            for point in self.points
+        ]
+
+        return max(ys) - min(ys)
+
+    @property
+    def is_valid(self) -> bool:
+        return (
+            self.point_count
+            >= LANE_SELECTOR.minimum_confidence * 0
+            and math.isfinite(
+                self.confidence
+            )
+            and 0.0
+            <= self.confidence
+            <= 1.0
+            and all(
+                math.isfinite(x)
+                and math.isfinite(y)
+                for x, y in self.points
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedLaneSet:
+    """
+    Resultado do processo de seleção.
+    """
+
+    lanes: tuple[LaneCandidate, ...]
+
+    left_lanes: tuple[LaneCandidate, ...]
+
+    right_lanes: tuple[LaneCandidate, ...]
+
+    center_lane: LaneCandidate | None
+
+    frame_width: float
+
+    frame_height: float
+
+    rejected_count: int
+
+    confidence: float
+
+    valid: bool
+
+    reason: str = ""
+
+    @property
+    def lane_count(self) -> int:
         return len(self.lanes)
 
+    @property
+    def has_center_lane(self) -> bool:
+        return self.center_lane is not None
 
-# ============================================================================
-# HELPERS
-# ============================================================================
+    @property
+    def has_left_lane(self) -> bool:
+        return bool(self.left_lanes)
 
-def _get_value(obj: Any, *names: str, default: Any = None) -> Any:
-    """
-    Obtém um atributo de forma compatível com diferentes versões dos
-    modelos LaneLine/LaneTrack.
-    """
-
-    for name in names:
-        if hasattr(obj, name):
-            return getattr(obj, name)
-
-        if isinstance(obj, dict) and name in obj:
-            return obj[name]
-
-    return default
+    @property
+    def has_right_lane(self) -> bool:
+        return bool(self.right_lanes)
 
 
-def _lane_points(lane: Any) -> Sequence[Any]:
-    """
-    Obtém os pontos de uma lane.
-    """
-
-    points = _get_value(
-        lane,
-        "points",
-        "lane_points",
-        "screen_points",
-        "pixels",
-        default=(),
-    )
-
-    if points is None:
-        return ()
-
-    return points
-
-
-def _point_xy(point: Any) -> Optional[Tuple[float, float]]:
-    """
-    Converte um ponto para (x, y).
-    """
-
-    if point is None:
-        return None
-
-    if isinstance(point, dict):
-        x = point.get("x")
-        y = point.get("y")
-    else:
-        x = getattr(point, "x", None)
-        y = getattr(point, "y", None)
-
-        if x is None and isinstance(point, (tuple, list)) and len(point) >= 2:
-            x = point[0]
-            y = point[1]
-
-    if x is None or y is None:
-        return None
-
-    try:
-        return float(x), float(y)
-    except (TypeError, ValueError):
-        return None
-
-
-def _lane_reference_x(lane: Any) -> Optional[float]:
-    """
-    Obtém o X representativo da lane.
-
-    Preferência:
-        1. atributo explícito de posição;
-        2. ponto mais baixo da lane.
-
-    O ponto mais baixo é utilizado porque representa melhor a posição
-    da faixa próxima ao veículo.
-    """
-
-    explicit_x = _get_value(
-        lane,
-        "reference_x",
-        "center_x",
-        "bottom_x",
-        "x",
-        default=None,
-    )
-
-    if explicit_x is not None:
-        try:
-            return float(explicit_x)
-        except (TypeError, ValueError):
-            pass
-
-    points = _lane_points(lane)
-
-    best: Optional[Tuple[float, float]] = None
-
-    for point in points:
-        xy = _point_xy(point)
-
-        if xy is None:
-            continue
-
-        if best is None or xy[1] > best[1]:
-            best = xy
-
-    if best is None:
-        return None
-
-    return best[0]
-
-
-def _lane_confidence(lane: Any) -> float:
-    """
-    Obtém confiança da lane.
-    """
-
-    value = _get_value(
-        lane,
-        "confidence",
-        "score",
-        "probability",
-        default=0.0,
-    )
-
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _is_valid_lane(lane: Any, minimum_confidence: float) -> bool:
-    """
-    Valida uma lane sem modificar seus dados.
-    """
-
-    if lane is None:
-        return False
-
-    points = _lane_points(lane)
-
-    if points is None or len(points) < 2:
-        return False
-
-    x = _lane_reference_x(lane)
-
-    if x is None:
-        return False
-
-    return _lane_confidence(lane) >= minimum_confidence
-
-
-# ============================================================================
-# CONFIGURAÇÃO
-# ============================================================================
-
-@dataclass(frozen=True)
-class LaneSelectorConfig:
-    """
-    Configuração do seletor.
-
-    Não contém ROI.
-    """
-
-    minimum_confidence: float = 0.35
-
-    minimum_lane_separation: float = 40.0
-
-    center_reference_ratio: float = 0.50
-
-    maximum_candidates: int = 16
-
-    enable_confidence_filter: bool = True
-
-
-# ============================================================================
+# =============================================================================
 # SELECTOR
-# ============================================================================
+# =============================================================================
+
 
 class LaneSelector:
     """
-    Seleciona e organiza lanes para as etapas posteriores do ADAS.
+    Selecionador determinístico de lanes.
 
-    O seletor trabalha somente com as coordenadas que recebe.
+    O seletor utiliza somente:
 
-    Nenhuma dimensão de tela ou ROI é assumida internamente.
+        candidates
+        frame_width
+        frame_height
+
+    Não possui qualquer conhecimento de ROI.
     """
 
     def __init__(
         self,
-        config: Optional[LaneSelectorConfig] = None,
+        *,
+        frame_width: float,
+        frame_height: float,
     ) -> None:
 
-        self.config = config or LaneSelectorConfig()
-
-        if self.config.minimum_confidence < 0.0:
+        if frame_width <= 0:
             raise ValueError(
-                "minimum_confidence must be >= 0"
+                "frame_width deve ser > 0."
             )
 
-        if self.config.minimum_confidence > 1.0:
+        if frame_height <= 0:
             raise ValueError(
-                "minimum_confidence must be <= 1"
+                "frame_height deve ser > 0."
             )
 
-        if self.config.minimum_lane_separation < 0.0:
-            raise ValueError(
-                "minimum_lane_separation must be >= 0"
-            )
+        self.frame_width = float(
+            frame_width
+        )
 
-        if self.config.maximum_candidates <= 0:
-            raise ValueError(
-                "maximum_candidates must be > 0"
-            )
+        self.frame_height = float(
+            frame_height
+        )
 
-    # ----------------------------------------------------------------------
+        self._center_x = (
+            self.frame_width
+            * LANE_SELECTOR.center_reference_ratio
+        )
+
+    # =========================================================================
     # PUBLIC
-    # ----------------------------------------------------------------------
+    # =========================================================================
 
     def select(
         self,
-        lanes: Optional[Iterable[Any]],
-        image_width: Optional[float] = None,
-    ) -> LaneSelectionResult:
+        candidates: Iterable[Any],
+    ) -> SelectedLaneSet:
         """
-        Seleciona lanes válidas.
+        Seleciona e classifica os candidatos.
 
-        image_width é opcional e serve apenas para determinar o centro
-        espacial da imagem recebida.
+        Processo:
 
-        Não representa ROI nem altera coordenadas.
+            1. normalização
+            2. validação
+            3. filtragem
+            4. ordenação espacial
+            5. classificação esquerda/direita
+            6. determinação da lane central
+            7. cálculo da confiança
         """
 
-        if lanes is None:
-            return LaneSelectionResult(
-                lanes=(),
-                current_candidates=(),
-                left_candidates=(),
-                right_candidates=(),
-                valid=False,
-            )
+        normalized: list[LaneCandidate] = []
 
-        valid_lanes: List[Any] = []
+        rejected = 0
 
-        for lane in lanes:
-            if self.config.enable_confidence_filter:
-                if not _is_valid_lane(
-                    lane,
-                    self.config.minimum_confidence,
-                ):
-                    continue
-            else:
-                if lane is None or _lane_reference_x(lane) is None:
-                    continue
+        for index, candidate in enumerate(
+            candidates
+        ):
 
-            valid_lanes.append(lane)
+            try:
 
-        valid_lanes.sort(
-            key=lambda lane: _lane_reference_x(lane)
-            if _lane_reference_x(lane) is not None
-            else float("inf")
-        )
+                lane = self._normalize_candidate(
+                    candidate,
+                    fallback_id=index,
+                )
 
-        valid_lanes = valid_lanes[
-            : self.config.maximum_candidates
-        ]
+            except (
+                TypeError,
+                ValueError,
+            ):
 
-        if not valid_lanes:
-            return LaneSelectionResult(
-                lanes=(),
-                current_candidates=(),
-                left_candidates=(),
-                right_candidates=(),
-                valid=False,
-            )
+                rejected += 1
 
-        center_x = self._calculate_reference_center(
-            valid_lanes,
-            image_width,
-        )
-
-        left: List[Any] = []
-        right: List[Any] = []
-        current: List[Any] = []
-
-        for lane in valid_lanes:
-            x = _lane_reference_x(lane)
-
-            if x is None:
                 continue
 
-            if abs(x - center_x) <= self.config.minimum_lane_separation:
-                current.append(lane)
-            elif x < center_x:
-                left.append(lane)
-            else:
-                right.append(lane)
+            if not self._is_candidate_valid(
+                lane
+            ):
 
-        return LaneSelectionResult(
-            lanes=tuple(valid_lanes),
-            current_candidates=tuple(current),
-            left_candidates=tuple(left),
-            right_candidates=tuple(right),
-            valid=True,
+                rejected += 1
+
+                continue
+
+            normalized.append(
+                lane
+            )
+
+        if not normalized:
+
+            return SelectedLaneSet(
+                lanes=(),
+                left_lanes=(),
+                right_lanes=(),
+                center_lane=None,
+                frame_width=self.frame_width,
+                frame_height=self.frame_height,
+                rejected_count=rejected,
+                confidence=0.0,
+                valid=False,
+                reason="no_valid_lanes",
+            )
+
+        ordered = self._sort_lanes(
+            normalized
         )
 
-    # ----------------------------------------------------------------------
-    # CENTER
-    # ----------------------------------------------------------------------
+        left_lanes, right_lanes = (
+            self._classify_lanes(
+                ordered
+            )
+        )
 
-    def _calculate_reference_center(
-        self,
-        lanes: Sequence[Any],
-        image_width: Optional[float],
-    ) -> float:
-        """
-        Calcula o centro de referência.
+        center_lane = self._select_center_lane(
+            ordered
+        )
 
-        Se a largura da imagem estiver disponível, usa-a.
+        confidence = (
+            self._calculate_selection_confidence(
+                ordered,
+                center_lane,
+            )
+        )
 
-        Caso contrário, utiliza o centro espacial das lanes detectadas.
-        """
+        valid = (
+            confidence
+            >= LANE_SELECTOR.minimum_confidence
+        )
 
-        if image_width is not None:
-            try:
-                width = float(image_width)
+        reason = (
+            "valid"
+            if valid
+            else "low_selection_confidence"
+        )
 
-                if width > 0.0:
-                    return (
-                        width
-                        * self.config.center_reference_ratio
-                    )
-            except (TypeError, ValueError):
-                pass
+        return SelectedLaneSet(
+            lanes=tuple(ordered),
+            left_lanes=tuple(left_lanes),
+            right_lanes=tuple(right_lanes),
+            center_lane=center_lane,
+            frame_width=self.frame_width,
+            frame_height=self.frame_height,
+            rejected_count=rejected,
+            confidence=confidence,
+            valid=valid,
+            reason=reason,
+        )
 
-        xs = [
-            _lane_reference_x(lane)
-            for lane in lanes
-            if _lane_reference_x(lane) is not None
-        ]
-
-        if not xs:
-            return 0.0
-
-        return (min(xs) + max(xs)) * 0.5
-
-    # ----------------------------------------------------------------------
-    # STATIC HELPERS
-    # ----------------------------------------------------------------------
+    # =========================================================================
+    # NORMALIZATION
+    # =========================================================================
 
     @staticmethod
-    def sort_by_position(
-        lanes: Iterable[Any],
-    ) -> Tuple[Any, ...]:
+    def _normalize_candidate(
+        candidate: Any,
+        *,
+        fallback_id: int,
+    ) -> LaneCandidate:
+        """
+        Converte uma lane externa para LaneCandidate.
+
+        Suporta objetos com:
+
+            .points
+            .confidence
+            .lane_id
+
+        ou dicionários equivalentes.
+        """
+
+        if isinstance(
+            candidate,
+            LaneCandidate,
+        ):
+
+            return candidate
+
+        if isinstance(
+            candidate,
+            dict,
+        ):
+
+            points = candidate.get(
+                "points"
+            )
+
+            confidence = candidate.get(
+                "confidence",
+                0.0,
+            )
+
+            lane_id = candidate.get(
+                "lane_id",
+                fallback_id,
+            )
+
+            source = candidate
+
+        else:
+
+            points = getattr(
+                candidate,
+                "points",
+                None,
+            )
+
+            confidence = getattr(
+                candidate,
+                "confidence",
+                0.0,
+            )
+
+            lane_id = getattr(
+                candidate,
+                "lane_id",
+                fallback_id,
+            )
+
+            source = candidate
+
+        if points is None:
+
+            raise ValueError(
+                "Lane não possui points."
+            )
+
+        normalized_points = []
+
+        for point in points:
+
+            if len(point) != 2:
+
+                raise ValueError(
+                    "Cada ponto deve possuir "
+                    "(x, y)."
+                )
+
+            x, y = point
+
+            normalized_points.append(
+                (
+                    float(x),
+                    float(y),
+                )
+            )
+
+        return LaneCandidate(
+            lane_id=int(
+                lane_id
+            ),
+            points=tuple(
+                normalized_points
+            ),
+            confidence=float(
+                confidence
+            ),
+            source=source,
+        )
+
+    # =========================================================================
+    # VALIDATION
+    # =========================================================================
+
+    def _is_candidate_valid(
+        self,
+        lane: LaneCandidate,
+    ) -> bool:
+
+        if not lane.points:
+            return False
+
+        if lane.point_count < 2:
+            return False
+
+        if (
+            lane.confidence
+            < LANE_SELECTOR.minimum_confidence
+        ):
+            return False
+
+        if not (
+            0.0
+            <= lane.confidence
+            <= 1.0
+        ):
+            return False
+
+        if not math.isfinite(
+            lane.bottom_x
+        ):
+            return False
+
+        if not math.isfinite(
+            lane.y_span
+        ):
+            return False
+
+        if lane.y_span <= 0.0:
+            return False
+
+        for x, y in lane.points:
+
+            if not (
+                math.isfinite(x)
+                and math.isfinite(y)
+            ):
+                return False
+
+            if x < 0.0:
+                return False
+
+            if y < 0.0:
+                return False
+
+            if x > self.frame_width:
+                return False
+
+            if y > self.frame_height:
+                return False
+
+        return True
+
+    # =========================================================================
+    # SORTING
+    # =========================================================================
+
+    @staticmethod
+    def _sort_lanes(
+        lanes: Sequence[LaneCandidate],
+    ) -> list[LaneCandidate]:
         """
         Ordena lanes da esquerda para a direita.
+
+        A posição inferior é preferida porque representa melhor
+        a posição próxima ao veículo.
         """
 
-        valid = [
-            lane
-            for lane in lanes
-            if _lane_reference_x(lane) is not None
-        ]
-
-        valid.sort(
-            key=lambda lane: _lane_reference_x(lane)
+        return sorted(
+            lanes,
+            key=lambda lane: (
+                lane.bottom_x,
+                -lane.confidence,
+                lane.lane_id,
+            ),
         )
 
-        return tuple(valid)
+    # =========================================================================
+    # CLASSIFICATION
+    # =========================================================================
 
-    @staticmethod
-    def find_nearest_to_center(
-        lanes: Iterable[Any],
-        center_x: float,
-    ) -> Optional[Any]:
-        """
-        Retorna a lane mais próxima do centro fornecido.
-        """
+    def _classify_lanes(
+        self,
+        lanes: Sequence[LaneCandidate],
+    ) -> tuple[
+        list[LaneCandidate],
+        list[LaneCandidate],
+    ]:
 
-        best_lane = None
-        best_distance = float("inf")
+        left: list[LaneCandidate] = []
+        right: list[LaneCandidate] = []
 
         for lane in lanes:
-            x = _lane_reference_x(lane)
 
-            if x is None:
-                continue
+            x = lane.bottom_x
 
-            distance = abs(x - center_x)
+            if (
+                x
+                < self._center_x
+            ):
 
-            if distance < best_distance:
-                best_distance = distance
-                best_lane = lane
+                left.append(
+                    lane
+                )
 
-        return best_lane
+            elif (
+                x
+                > self._center_x
+            ):
+
+                right.append(
+                    lane
+                )
+
+        left.sort(
+            key=lambda lane: (
+                self._center_x
+                - lane.bottom_x
+            )
+        )
+
+        right.sort(
+            key=lambda lane: (
+                lane.bottom_x
+                - self._center_x
+            )
+        )
+
+        return left, right
+
+    # =========================================================================
+    # CENTER LANE
+    # =========================================================================
+
+    def _select_center_lane(
+        self,
+        lanes: Sequence[LaneCandidate],
+    ) -> LaneCandidate | None:
+        """
+        Seleciona a lane mais próxima do centro da imagem.
+
+        Esta função não afirma que essa lane é a faixa atual.
+        A identificação da faixa atual pertence às camadas
+        de geometria/assignment.
+        """
+
+        if not lanes:
+            return None
+
+        return min(
+            lanes,
+            key=lambda lane: (
+                abs(
+                    lane.bottom_x
+                    - self._center_x
+                ),
+                -lane.confidence,
+                -lane.y_span,
+            ),
+        )
+
+    # =========================================================================
+    # CONFIDENCE
+    # =========================================================================
+
+    @staticmethod
+    def _calculate_selection_confidence(
+        lanes: Sequence[LaneCandidate],
+        center_lane: LaneCandidate | None,
+    ) -> float:
+
+        if not lanes:
+            return 0.0
+
+        detection_confidence = sum(
+            lane.confidence
+            for lane in lanes
+        ) / len(lanes)
+
+        if center_lane is None:
+
+            center_confidence = 0.0
+
+        else:
+
+            center_confidence = (
+                center_lane.confidence
+            )
+
+        confidence = (
+            0.70
+            * detection_confidence
+            + 0.30
+            * center_confidence
+        )
+
+        return max(
+            0.0,
+            min(
+                1.0,
+                confidence,
+            ),
+        )
 
 
-# ============================================================================
+# =============================================================================
 # FACTORY
-# ============================================================================
+# =============================================================================
+
 
 def create_lane_selector(
-    config: Optional[LaneSelectorConfig] = None,
+    *,
+    frame_width: float,
+    frame_height: float,
 ) -> LaneSelector:
-    """
-    Cria o seletor padrão.
-    """
 
-    return LaneSelector(config=config)
+    return LaneSelector(
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
+
+
+# =============================================================================
+# PUBLIC API
+# =============================================================================
 
 
 __all__ = [
+    "LaneCandidate",
+    "SelectedLaneSet",
     "LaneSelector",
-    "LaneSelectorConfig",
-    "LaneSelectionResult",
     "create_lane_selector",
 ]
