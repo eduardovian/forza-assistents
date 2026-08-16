@@ -1,4 +1,4 @@
-```python
+
 """
 vision/yolop_detector.py
 
@@ -3873,4 +3873,4 @@ __all__ = [
     "YOLOPLaneDetector",
     "create_default_detector",
 ]
-```
+
