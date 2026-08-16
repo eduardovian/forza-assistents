@@ -1,13 +1,15 @@
 """
 vision/lane_projection.py
 
-Projeção e extrapolação matemática das linhas de faixa.
+Forza Assistents
+================
+
+Projeção matemática das linhas de faixa.
 
 Responsabilidade
 ----------------
-
-Receber LaneModel/LanePolynomial já construídos pela etapa de
-modelagem e gerar uma LaneProjection consistente.
+Receber um LaneModel já construído e gerar uma LaneProjection
+matematicamente consistente.
 
 Pipeline:
 
@@ -21,42 +23,45 @@ Pipeline:
         ↓
     LaneAssignment
 
-Este módulo NÃO executa:
+Este módulo NÃO:
 
-    - captura de tela;
-    - definição de ROI;
-    - pré-processamento;
-    - inferência YOLOP;
-    - tracking;
-    - fitting;
-    - lane assignment;
-    - decisões ADAS;
-    - controle do veículo.
+    - captura imagens;
+    - define ROI;
+    - executa YOLOP;
+    - realiza fitting;
+    - executa tracking;
+    - determina a faixa atual;
+    - toma decisões ADAS;
+    - envia comandos ao veículo.
 
-IMPORTANTE
-----------
+COORDENADAS
+-----------
+Todo o cálculo ocorre no sistema de coordenadas do frame recebido.
 
-O sistema trabalha no sistema de coordenadas do frame recebido.
+ROI pertence exclusivamente a config.py/capture.
 
-O ROI pertence exclusivamente ao config.py/captura.
-
-Portanto, este módulo não possui qualquer configuração própria
-de ROI.
-
-Modelo matemático:
+MODELO
+------
+O contrato matemático oficial é:
 
     x(y) = a*y³ + b*y² + c*y + d
 
-A projeção é realizada avaliando o polinômio dentro do domínio
-observado e, quando permitido e seguro, extrapolando além dele.
+Segurança:
+- nunca altera o LanePolynomial original;
+- rejeita modelos inválidos;
+- rejeita valores não finitos;
+- limita extrapolação;
+- degrada confiança durante extrapolação;
+- respeita o frame recebido;
+- não cria parâmetros de ROI.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Any, Iterable, Optional, Sequence
-
+from typing import Any, Optional
 import math
+
+from config import LANE_PROJECTION
 
 from vision.lane_types import (
     LaneModel,
@@ -68,166 +73,88 @@ from vision.lane_types import (
 
 
 # =============================================================================
-# NUMERIC HELPERS
+# NUMERIC UTILITIES
 # =============================================================================
 
 
 def _finite_float(
     value: Any,
-    default: Optional[float] = None,
 ) -> Optional[float]:
     """
-    Converte um valor para float finito.
+    Retorna float somente quando o valor é finito.
     """
 
     try:
         result = float(value)
     except (TypeError, ValueError):
-        return default
+        return None
 
     if not math.isfinite(result):
-        return default
+        return None
 
     return result
 
 
-def _clip01(value: Any) -> float:
+def _clip01(
+    value: Any,
+) -> float:
     """
-    Limita um valor ao intervalo [0, 1].
+    Limita valor ao intervalo [0, 1].
     """
 
-    result = _finite_float(
-        value,
-        0.0,
-    )
+    result = _finite_float(value)
 
     if result is None:
         return 0.0
 
     return max(
         0.0,
-        min(
-            1.0,
-            result,
-        ),
+        min(1.0, result),
     )
 
 
 # =============================================================================
-# LANE PROJECTION ENGINE
+# ENGINE
 # =============================================================================
 
 
 class LaneProjectionEngine:
     """
-    Gera projeções matemáticas de LaneModel.
+    Engine oficial de projeção.
 
-    O engine não modifica o modelo original.
+    Todas as configurações operacionais são obtidas de:
 
-    Exemplo:
+        config.LANE_PROJECTION
 
-        engine = LaneProjectionEngine(
-            min_points=4,
-            min_confidence=0.40,
-            max_projection_distance=900.0,
-        )
-
-        projection = engine.project(
-            model,
-            frame_height=900,
-        )
+    Nenhuma configuração paralela é mantida nesta classe.
     """
 
-    def __init__(
+    def __init__(self) -> None:
+        self.config = LANE_PROJECTION
+
+    # =========================================================================
+    # VALIDATION
+    # =========================================================================
+
+    def _validate_model(
         self,
-        min_points: int = 4,
-        min_confidence: float = 0.40,
-        max_projection_distance: float = 900.0,
-        samples: int = 32,
-        lookahead_distance: float = 500.0,
-        near_distance: float = 100.0,
-        far_distance: float = 700.0,
-        enable_extrapolation: bool = True,
-        extrapolation_limit: float = 300.0,
-        **kwargs: Any,
-    ) -> None:
-
-        self.min_points = max(
-            2,
-            int(min_points),
-        )
-
-        self.min_confidence = _clip01(
-            min_confidence
-        )
-
-        self.max_projection_distance = max(
-            1.0,
-            float(max_projection_distance),
-        )
-
-        self.samples = max(
-            2,
-            int(samples),
-        )
-
-        self.lookahead_distance = max(
-            0.0,
-            float(lookahead_distance),
-        )
-
-        self.near_distance = max(
-            0.0,
-            float(near_distance),
-        )
-
-        self.far_distance = max(
-            self.near_distance,
-            float(far_distance),
-        )
-
-        self.enable_extrapolation = bool(
-            enable_extrapolation
-        )
-
-        self.extrapolation_limit = max(
-            0.0,
-            float(extrapolation_limit),
-        )
-
-    # =========================================================================
-    # MODEL VALIDATION
-    # =========================================================================
-
-    @staticmethod
-    def _model_is_valid(
         model: Any,
     ) -> bool:
         """
-        Valida um LaneModel.
+        Valida o contrato mínimo de LaneModel.
         """
 
-        if model is None:
+        if not isinstance(
+            model,
+            LaneModel,
+        ):
             return False
 
-        method = getattr(
-            model,
-            "is_valid",
-            None,
-        )
-
-        if callable(method):
-            try:
-                if not bool(method()):
-                    return False
-            except Exception:
+        try:
+            if not model.is_valid():
                 return False
-
-        line = getattr(
-            model,
-            "line",
-            None,
-        )
+        except Exception:
+            return False
 
         polynomial = getattr(
             model,
@@ -235,170 +162,77 @@ class LaneProjectionEngine:
             None,
         )
 
-        if line is None:
-            return False
-
-        if polynomial is None:
-            return False
-
-        if not bool(
-            getattr(
-                line,
-                "valid",
-                True,
-            )
+        if not isinstance(
+            polynomial,
+            LanePolynomial,
         ):
             return False
 
-        if not bool(
-            getattr(
-                polynomial,
-                "valid",
-                True,
-            )
+        if not polynomial.is_valid():
+            return False
+
+        if (
+            self.config.reject_non_finite_points
+            and not polynomial.is_finite()
         ):
             return False
 
         return True
 
     # =========================================================================
-    # MODEL CONFIDENCE
+    # CONFIDENCE
     # =========================================================================
 
     @staticmethod
     def _model_confidence(
-        model: Any,
+        model: LaneModel,
     ) -> float:
         """
-        Obtém a confiança do modelo.
-
-        Prioridade:
-
-            polynomial.confidence
-            line.confidence
-            model.confidence
+        Obtém a confiança do LanePolynomial.
         """
 
-        polynomial = getattr(
-            model,
-            "polynomial",
-            None,
-        )
-
-        if polynomial is not None:
-
-            value = _finite_float(
-                getattr(
-                    polynomial,
-                    "confidence",
-                    None,
-                )
-            )
-
-            if value is not None:
-                return _clip01(
-                    value
-                )
-
-        line = getattr(
-            model,
-            "line",
-            None,
-        )
-
-        if line is not None:
-
-            value = _finite_float(
-                getattr(
-                    line,
-                    "confidence",
-                    None,
-                )
-            )
-
-            if value is not None:
-                return _clip01(
-                    value
-                )
-
-        return _clip01(
-            getattr(
-                model,
-                "confidence",
-                1.0,
-            )
-        )
-
-    # =========================================================================
-    # POLYNOMIAL
-    # =========================================================================
-
-    @staticmethod
-    def _get_polynomial(
-        model: Any,
-    ) -> Optional[LanePolynomial]:
-        """
-        Retorna o LanePolynomial associado ao modelo.
-        """
-
-        polynomial = getattr(
-            model,
-            "polynomial",
-            None,
-        )
+        polynomial = model.polynomial
 
         if polynomial is None:
-            return None
+            return 0.0
 
-        if not isinstance(
-            polynomial,
-            LanePolynomial,
-        ):
-            return None
-
-        if not polynomial.is_valid():
-            return None
-
-        return polynomial
+        return _clip01(
+            polynomial.confidence
+        )
 
     # =========================================================================
-    # OBSERVED RANGE
+    # OBSERVED DOMAIN
     # =========================================================================
 
     @staticmethod
     def _observed_range(
-        model: Any,
+        model: LaneModel,
         polynomial: LanePolynomial,
     ) -> Optional[tuple[float, float]]:
         """
-        Determina o intervalo vertical observado.
+        Obtém o domínio vertical observado.
 
         Prioridade:
 
-            polynomial.y_min / y_max
+            LanePolynomial.y_min/y_max
+
+        Fallback:
+
             LaneLine.points
         """
 
         y_min = _finite_float(
-            getattr(
-                polynomial,
-                "y_min",
-                None,
-            )
+            polynomial.y_min
         )
 
         y_max = _finite_float(
-            getattr(
-                polynomial,
-                "y_max",
-                None,
-            )
+            polynomial.y_max
         )
 
         if (
             y_min is not None
             and y_max is not None
-            and y_max >= y_min
+            and y_max > y_min
         ):
             return (
                 y_min,
@@ -411,11 +245,17 @@ class LaneProjectionEngine:
             None,
         )
 
+        if line is None:
+            return None
+
         points = getattr(
             line,
             "points",
-            [],
-        ) or []
+            None,
+        )
+
+        if not points:
+            return None
 
         ys: list[float] = []
 
@@ -429,21 +269,25 @@ class LaneProjectionEngine:
                 )
             )
 
-            if y is None:
-                continue
-
-            ys.append(y)
+            if y is not None:
+                ys.append(y)
 
         if len(ys) < 2:
             return None
 
+        minimum = min(ys)
+        maximum = max(ys)
+
+        if maximum <= minimum:
+            return None
+
         return (
-            min(ys),
-            max(ys),
+            minimum,
+            maximum,
         )
 
     # =========================================================================
-    # POLYNOMIAL EVALUATION
+    # EVALUATION
     # =========================================================================
 
     @staticmethod
@@ -452,53 +296,72 @@ class LaneProjectionEngine:
         y: float,
     ) -> Optional[float]:
         """
-        Avalia x(y).
+        Avalia x(y) utilizando exclusivamente o LanePolynomial real.
         """
 
         try:
-            x = polynomial.evaluate(
-                float(y)
-            )
-        except Exception:
+            x = polynomial.evaluate(y)
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
             return None
 
-        return _finite_float(
-            x
-        )
+        return _finite_float(x)
 
     # =========================================================================
-    # POINT CREATION
+    # CURVATURE
     # =========================================================================
 
-    @staticmethod
-    def _make_point(
+    def _curvature(
+        self,
         polynomial: LanePolynomial,
         y: float,
-        confidence: float,
-    ) -> Optional[LanePoint]:
+    ) -> Optional[float]:
         """
-        Cria um LanePoint a partir do polinômio.
+        Calcula a curvatura aproximada da função x(y):
+
+                     |x''|
+        k = -------------------------
+            (1 + x'^2)^(3/2)
         """
 
-        x = LaneProjectionEngine._evaluate(
-            polynomial,
-            y,
-        )
+        try:
+            first = polynomial.derivative(y)
+            second = polynomial.second_derivative(y)
 
-        if x is None:
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
             return None
 
-        return LanePoint(
-            x=x,
-            y=float(y),
-            confidence=_clip01(
-                confidence
-            ),
-            valid=True,
+        first = _finite_float(first)
+        second = _finite_float(second)
+
+        if first is None or second is None:
+            return None
+
+        denominator = (
+            1.0 + first * first
+        ) ** 1.5
+
+        if denominator <= 1e-12:
+            return None
+
+        curvature = (
+            abs(second)
+            / denominator
+        )
+
+        return _finite_float(
+            curvature
         )
 
     # =========================================================================
-    # SAMPLE RANGE
+    # SAMPLE GENERATION
     # =========================================================================
 
     @staticmethod
@@ -508,7 +371,7 @@ class LaneProjectionEngine:
         count: int,
     ) -> list[float]:
         """
-        Gera pontos uniformemente espaçados.
+        Gera amostras uniformemente distribuídas.
         """
 
         count = max(
@@ -518,20 +381,19 @@ class LaneProjectionEngine:
 
         if stop <= start:
             return [
-                float(start),
-                float(stop),
+                start,
+                stop,
             ]
 
         step = (
             stop - start
-        ) / float(
+        ) / (
             count - 1
         )
 
         return [
-            float(
-                start
-                + step * index
+            start + (
+                step * index
             )
             for index in range(count)
         ]
@@ -542,25 +404,22 @@ class LaneProjectionEngine:
 
     def _projection_end(
         self,
-        y_min: float,
         y_max: float,
         frame_height: Optional[float],
     ) -> float:
         """
-        Determina o limite vertical da projeção.
-
-        Nunca ultrapassa:
-
-            y_max + max_projection_distance
-
-        e, quando frame_height é conhecido:
-
-            frame_height
+        Determina até onde a projeção pode avançar.
         """
+
+        if not self.config.enable_extrapolation:
+            return y_max
 
         end = (
             y_max
-            + self.max_projection_distance
+            + min(
+                self.config.max_projection_distance,
+                self.config.extrapolation_limit,
+            )
         )
 
         if frame_height is not None:
@@ -581,6 +440,91 @@ class LaneProjectionEngine:
         )
 
     # =========================================================================
+    # POINT CONFIDENCE
+    # =========================================================================
+
+    def _point_confidence(
+        self,
+        base_confidence: float,
+        y: float,
+        y_max: float,
+    ) -> float:
+        """
+        Reduz progressivamente a confiança fora do domínio observado.
+        """
+
+        if y <= y_max:
+            return base_confidence
+
+        distance = (
+            y - y_max
+        )
+
+        decay_distance = max(
+            self.config.confidence_decay_distance,
+            1e-6,
+        )
+
+        decay = max(
+            0.0,
+            min(
+                1.0,
+                1.0
+                - (
+                    distance
+                    / decay_distance
+                ),
+            ),
+        )
+
+        return _clip01(
+            base_confidence
+            * decay
+        )
+
+    # =========================================================================
+    # QUALITY
+    # =========================================================================
+
+    @staticmethod
+    def _quality(
+        confidence: float,
+        extrapolation_distance: float,
+    ) -> ProjectionQuality:
+        """
+        Determina qualidade da projeção.
+        """
+
+        confidence = _clip01(
+            confidence
+        )
+
+        if extrapolation_distance > 0.0:
+
+            confidence *= max(
+                0.0,
+                min(
+                    1.0,
+                    1.0
+                    - (
+                        extrapolation_distance
+                        / 300.0
+                    ),
+                ),
+            )
+
+        if confidence >= 0.85:
+            return ProjectionQuality.HIGH
+
+        if confidence >= 0.65:
+            return ProjectionQuality.MEDIUM
+
+        if confidence >= 0.40:
+            return ProjectionQuality.LOW
+
+        return ProjectionQuality.NONE
+
+    # =========================================================================
     # PROJECT
     # =========================================================================
 
@@ -592,49 +536,47 @@ class LaneProjectionEngine:
         horizon_y: Optional[float] = None,
     ) -> LaneProjection:
         """
-        Projeta uma única faixa.
-
-        O trecho observado é sempre preservado.
-
-        A extrapolação só ocorre quando:
-
-            - o modelo é válido;
-            - o polinômio é válido;
-            - a confiança é suficiente;
-            - existem pontos suficientes;
-            - enable_extrapolation está ativo.
+        Projeta uma única LaneModel.
         """
 
-        if not self._model_is_valid(
-            model
-        ):
+        if not self.config.enabled:
+
             return LaneProjection(
-                quality=ProjectionQuality.NONE,
-                extrapolated=False,
                 valid=False,
+                quality=ProjectionQuality.NONE,
             )
 
-        polynomial = self._get_polynomial(
-            model
-        )
+        if not self._validate_model(model):
+
+            return LaneProjection(
+                valid=False,
+                quality=ProjectionQuality.NONE,
+            )
+
+        polynomial = model.polynomial
 
         if polynomial is None:
+
             return LaneProjection(
-                quality=ProjectionQuality.NONE,
-                extrapolated=False,
                 valid=False,
+                quality=ProjectionQuality.NONE,
             )
 
-        confidence = self._model_confidence(
-            model
+        confidence = (
+            self._model_confidence(
+                model
+            )
         )
 
-        if confidence < self.min_confidence:
+        if (
+            confidence
+            < self.config.minimum_confidence
+        ):
+
             return LaneProjection(
                 polynomial=polynomial,
-                quality=ProjectionQuality.LOW,
-                extrapolated=False,
                 valid=False,
+                quality=ProjectionQuality.NONE,
             )
 
         line = getattr(
@@ -643,112 +585,102 @@ class LaneProjectionEngine:
             None,
         )
 
-        point_count = 0
-
-        if line is not None:
-
-            try:
-                point_count = int(
-                    line.point_count()
-                )
-            except Exception:
-
-                point_count = len(
-                    getattr(
-                        line,
-                        "points",
-                        [],
-                    ) or []
-                )
-
-        if point_count < self.min_points:
+        if line is None:
 
             return LaneProjection(
                 polynomial=polynomial,
-                quality=ProjectionQuality.LOW,
-                extrapolated=False,
                 valid=False,
+                quality=ProjectionQuality.NONE,
             )
 
-        observed = self._observed_range(
-            model,
-            polynomial,
+        point_count = (
+            line.valid_point_count()
+        )
+
+        if (
+            point_count
+            < self.config.minimum_points
+        ):
+
+            return LaneProjection(
+                polynomial=polynomial,
+                valid=False,
+                quality=ProjectionQuality.NONE,
+            )
+
+        observed = (
+            self._observed_range(
+                model,
+                polynomial,
+            )
         )
 
         if observed is None:
 
             return LaneProjection(
                 polynomial=polynomial,
-                quality=ProjectionQuality.LOW,
-                extrapolated=False,
                 valid=False,
+                quality=ProjectionQuality.NONE,
             )
 
         y_min, y_max = observed
 
-        if y_max <= y_min:
-
-            return LaneProjection(
-                polynomial=polynomial,
-                quality=ProjectionQuality.LOW,
-                extrapolated=False,
-                valid=False,
-            )
-
-        # ---------------------------------------------------------------------
-        # Determine projection range.
-        # ---------------------------------------------------------------------
-
-        projection_end = y_max
-
-        extrapolated = False
-
-        if self.enable_extrapolation:
-
-            projection_end = self._projection_end(
-                y_min,
+        projection_end = (
+            self._projection_end(
                 y_max,
                 frame_height,
             )
+        )
 
-            allowed_end = (
-                y_max
-                + self.extrapolation_limit
-            )
-
-            projection_end = min(
-                projection_end,
-                allowed_end,
-            )
-
-            if projection_end > y_max:
-                extrapolated = True
-
-        # ---------------------------------------------------------------------
-        # Generate points.
-        # ---------------------------------------------------------------------
-
-        ys = self._linspace(
+        y_values = self._linspace(
             y_min,
             projection_end,
-            self.samples,
+            self.config.samples,
         )
 
         points: list[LanePoint] = []
 
-        for y in ys:
+        for y in y_values:
 
-            point = self._make_point(
+            x = self._evaluate(
                 polynomial,
                 y,
-                confidence,
             )
 
-            if point is None:
+            if x is None:
                 continue
 
+            curvature = (
+                self._curvature(
+                    polynomial,
+                    y,
+                )
+            )
+
+            if curvature is None:
+                continue
+
+            if (
+                curvature
+                > self.config.maximum_curvature
+            ):
+                continue
+
+            point_confidence = (
+                self._point_confidence(
+                    confidence,
+                    y,
+                    y_max,
+                )
+            )
+
             points.append(
-                point
+                LanePoint(
+                    x=x,
+                    y=y,
+                    confidence=point_confidence,
+                    valid=True,
+                )
             )
 
         if len(points) < 2:
@@ -756,114 +688,58 @@ class LaneProjectionEngine:
             return LaneProjection(
                 polynomial=polynomial,
                 points=points,
-                quality=ProjectionQuality.LOW,
-                extrapolated=extrapolated,
                 valid=False,
+                quality=ProjectionQuality.NONE,
+                extrapolated=(
+                    projection_end > y_max
+                ),
                 horizon_y=horizon_y,
             )
 
-        # ---------------------------------------------------------------------
-        # Projection quality.
-        # ---------------------------------------------------------------------
+        extrapolation_distance = max(
+            0.0,
+            projection_end - y_max,
+        )
 
-        if confidence >= 0.85:
-            quality = ProjectionQuality.HIGH
-
-        elif confidence >= 0.65:
-            quality = ProjectionQuality.MEDIUM
-
-        else:
-            quality = ProjectionQuality.LOW
+        quality = self._quality(
+            confidence,
+            extrapolation_distance,
+        )
 
         return LaneProjection(
             polynomial=polynomial,
             points=points,
             quality=quality,
-            extrapolated=extrapolated,
-            valid=True,
-            horizon_y=(
-                float(horizon_y)
-                if horizon_y is not None
-                else None
+            extrapolated=(
+                extrapolation_distance > 0.0
             ),
+            valid=(
+                quality
+                != ProjectionQuality.NONE
+            ),
+            horizon_y=horizon_y,
         )
 
     # =========================================================================
-    # PROJECT MANY
+    # BATCH
     # =========================================================================
 
     def project_many(
         self,
-        models: Iterable[LaneModel],
-        frame_height: Optional[float] = None,
-    ) -> list[LaneProjection]:
-        """
-        Projeta múltiplos LaneModel.
-        """
-
-        projections: list[
-            LaneProjection
-        ] = []
-
-        for model in models:
-
-            projection = self.project(
-                model,
-                frame_height=frame_height,
-            )
-
-            projections.append(
-                projection
-            )
-
-        return projections
-
-    # =========================================================================
-    # APPLY TO MODEL
-    # =========================================================================
-
-    def apply(
-        self,
-        model: LaneModel,
+        models: list[LaneModel],
         frame_height: Optional[float] = None,
         *,
         horizon_y: Optional[float] = None,
-    ) -> LaneModel:
+    ) -> list[LaneProjection]:
         """
-        Gera a projeção e retorna uma cópia do LaneModel
-        contendo o resultado.
-
-        O modelo original não é modificado.
-        """
-
-        projection = self.project(
-            model,
-            frame_height=frame_height,
-            horizon_y=horizon_y,
-        )
-
-        return replace(
-            model,
-            projection=projection,
-        )
-
-    # =========================================================================
-    # APPLY MANY
-    # =========================================================================
-
-    def apply_many(
-        self,
-        models: Sequence[LaneModel],
-        frame_height: Optional[float] = None,
-    ) -> list[LaneModel]:
-        """
-        Aplica projeção a uma sequência de LaneModel.
+        Projeta múltiplas lanes preservando a ordem.
         """
 
         return [
-            self.apply(
+            self.project(
                 model,
-                frame_height=frame_height,
+                frame_height,
+                horizon_y=horizon_y,
             )
             for model in models
         ]
@@ -874,27 +750,22 @@ class LaneProjectionEngine:
 # =============================================================================
 
 
-def create_default_projection_engine(
-    **kwargs: Any,
-) -> LaneProjectionEngine:
+def create_lane_projection_engine() -> (
+    LaneProjectionEngine
+):
     """
-    Cria um LaneProjectionEngine.
-
-    Os valores podem ser fornecidos diretamente pelo chamador,
-    normalmente a partir de config.LANE_PROJECTION.
+    Factory oficial.
     """
 
-    return LaneProjectionEngine(
-        **kwargs
-    )
+    return LaneProjectionEngine()
 
 
 # =============================================================================
-# EXPORTS
+# PUBLIC API
 # =============================================================================
 
 
 __all__ = [
     "LaneProjectionEngine",
-    "create_default_projection_engine",
+    "create_lane_projection_engine",
 ]
