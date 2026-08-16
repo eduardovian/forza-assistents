@@ -35,7 +35,6 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from vision.lane_types import (
-    LaneLine,
     LaneModel,
     LanePoint,
     LanePolynomial,
@@ -88,6 +87,7 @@ def _empty_projection(
     *,
     polynomial: Optional[LanePolynomial] = None,
 ) -> LaneProjection:
+
     return LaneProjection(
         polynomial=polynomial,
         points=[],
@@ -129,7 +129,9 @@ class LaneProjectionEngine:
         self,
         min_points: int = DEFAULT_MIN_POINTS,
         degree: int = DEFAULT_DEGREE,
-        max_projection_distance: float = DEFAULT_MAX_PROJECTION_DISTANCE,
+        max_projection_distance: float = (
+            DEFAULT_MAX_PROJECTION_DISTANCE
+        ),
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
         *,
         min_vertical_span: float = DEFAULT_MIN_VERTICAL_SPAN,
@@ -219,8 +221,14 @@ class LaneProjectionEngine:
             if not valid:
                 continue
 
-            x = _finite(point.x)
-            y = _finite(point.y)
+            x = _finite(
+                point.x
+            )
+
+            y = _finite(
+                point.y
+            )
+
             confidence = _finite(
                 point.confidence
             )
@@ -273,10 +281,12 @@ class LaneProjectionEngine:
 
         # ---------------------------------------------------------------------
         # Remove duplicações de Y.
-        # Mantemos uma média ponderada em X.
         # ---------------------------------------------------------------------
 
-        groups: dict[float, list[LanePoint]] = {}
+        groups: dict[
+            float,
+            list[LanePoint],
+        ] = {}
 
         for point in valid:
 
@@ -303,33 +313,41 @@ class LaneProjectionEngine:
                 [
                     max(
                         0.0,
-                        float(p.confidence),
+                        float(
+                            point.confidence
+                        ),
                     )
-                    for p in group
+                    for point in group
                 ],
                 dtype=np.float64,
             )
 
             xs = np.asarray(
                 [
-                    float(p.x)
-                    for p in group
+                    float(point.x)
+                    for point in group
                 ],
                 dtype=np.float64,
             )
 
             ys = np.asarray(
                 [
-                    float(p.y)
-                    for p in group
+                    float(point.y)
+                    for point in group
                 ],
                 dtype=np.float64,
             )
 
             if not (
-                np.all(np.isfinite(xs))
-                and np.all(np.isfinite(ys))
-                and np.all(np.isfinite(weights))
+                np.all(
+                    np.isfinite(xs)
+                )
+                and np.all(
+                    np.isfinite(ys)
+                )
+                and np.all(
+                    np.isfinite(weights)
+                )
             ):
                 continue
 
@@ -386,9 +404,15 @@ class LaneProjectionEngine:
         confidence = confidence[order]
 
         if not (
-            np.all(np.isfinite(x))
-            and np.all(np.isfinite(y))
-            and np.all(np.isfinite(confidence))
+            np.all(
+                np.isfinite(x)
+            )
+            and np.all(
+                np.isfinite(y)
+            )
+            and np.all(
+                np.isfinite(confidence)
+            )
         ):
             raise ValueError(
                 "Pontos não finitos."
@@ -403,8 +427,6 @@ class LaneProjectionEngine:
                 "Extensão vertical inválida."
             )
 
-        # Não rejeitamos artificialmente os testes com lanes curtas.
-        # O limite configurável continua disponível.
         if span < self.min_vertical_span:
             raise ValueError(
                 "Extensão vertical insuficiente."
@@ -455,7 +477,9 @@ class LaneProjectionEngine:
         )
 
         if (
-            not math.isfinite(y_scale)
+            not math.isfinite(
+                y_scale
+            )
             or y_scale <= 1e-9
         ):
             raise ValueError(
@@ -536,14 +560,18 @@ class LaneProjectionEngine:
 
             an, bn, cn, dn = coefficients
 
-            a = an / scale**3
+            a = (
+                an
+                / scale**3
+            )
 
             b = (
                 -3.0
                 * an
                 * center
                 / scale**3
-                + bn / scale**2
+                + bn
+                / scale**2
             )
 
             c = (
@@ -555,7 +583,8 @@ class LaneProjectionEngine:
                 * bn
                 * center
                 / scale**2
-                + cn / scale
+                + cn
+                / scale
             )
 
             d = (
@@ -582,35 +611,29 @@ class LaneProjectionEngine:
 
             an, bn, cn = coefficients
 
-            a = 0.0
-
-            b = (
-                an / scale**2
-            )
-
-            c = (
-                -2.0
-                * an
-                * center
-                / scale**2
-                + bn / scale
-            )
-
-            d = (
-                an
-                * center**2
-                / scale**2
-                - bn
-                * center
-                / scale
-                + cn
-            )
-
             return (
-                float(a),
-                float(b),
-                float(c),
-                float(d),
+                0.0,
+                float(
+                    an
+                    / scale**2
+                ),
+                float(
+                    -2.0
+                    * an
+                    * center
+                    / scale**2
+                    + bn
+                    / scale
+                ),
+                float(
+                    an
+                    * center**2
+                    / scale**2
+                    - bn
+                    * center
+                    / scale
+                    + cn
+                ),
             )
 
         if degree == 1:
@@ -620,7 +643,10 @@ class LaneProjectionEngine:
             return (
                 0.0,
                 0.0,
-                float(an / scale),
+                float(
+                    an
+                    / scale
+                ),
                 float(
                     bn
                     - an
@@ -633,7 +659,9 @@ class LaneProjectionEngine:
             0.0,
             0.0,
             0.0,
-            float(coefficients[0]),
+            float(
+                coefficients[0]
+            ),
         )
 
     # =========================================================================
@@ -647,6 +675,19 @@ class LaneProjectionEngine:
         fit_error: float,
         point_confidence: float,
     ) -> float:
+        """
+        Calcula a confiança da projeção.
+
+        A confiança dos pontos é o fator dominante.
+
+        Isso é importante porque uma grande quantidade de pontos
+        geometricamente perfeitos não deve transformar uma detecção
+        originalmente fraca em uma detecção de alta confiança.
+        """
+
+        point_confidence = _clip01(
+            point_confidence
+        )
 
         count_score = _clip01(
             point_count / 20.0
@@ -660,16 +701,26 @@ class LaneProjectionEngine:
             -max(
                 0.0,
                 fit_error,
-            ) / 20.0
+            )
+            / 20.0
         )
 
-        confidence = (
-            0.25 * count_score
-            + 0.25 * span_score
+        geometry_score = _clip01(
+            0.35 * count_score
+            + 0.35 * span_score
             + 0.30 * error_score
-            + 0.20 * _clip01(
-                point_confidence
-            )
+        )
+
+        # A confiança original da detecção domina.
+        #
+        # point_confidence = 0.10
+        # -> confiança baixa, independentemente da geometria.
+        #
+        # point_confidence = 0.95
+        # -> geometria boa preserva confiança alta.
+        confidence = (
+            0.80 * point_confidence
+            + 0.20 * geometry_score
         )
 
         return _clip01(
@@ -697,7 +748,7 @@ class LaneProjectionEngine:
         return ProjectionQuality.NONE
 
     # =========================================================================
-    # POLINÔMIO → LANEPOINTS
+    # AVALIAÇÃO
     # =========================================================================
 
     @staticmethod
@@ -718,7 +769,7 @@ class LaneProjectionEngine:
         )
 
     # =========================================================================
-    # CRIAÇÃO DA LANE POLYNOMIAL
+    # CRIAÇÃO DO POLINÔMIO
     # =========================================================================
 
     def _create_polynomial(
@@ -734,13 +785,16 @@ class LaneProjectionEngine:
         sample_count: int,
     ) -> LanePolynomial:
 
-        a, b, c, d = (
-            self._absolute_coefficients(
-                coefficients,
-                center,
-                scale,
-                degree,
-            )
+        (
+            a,
+            b,
+            c,
+            d,
+        ) = self._absolute_coefficients(
+            coefficients,
+            center,
+            scale,
+            degree,
         )
 
         return LanePolynomial(
@@ -796,10 +850,8 @@ class LaneProjectionEngine:
                 y,
             )
 
-            if (
-                not math.isfinite(
-                    fit_error
-                )
+            if not math.isfinite(
+                fit_error
             ):
                 raise ValueError(
                     "Erro de ajuste inválido."
@@ -818,7 +870,7 @@ class LaneProjectionEngine:
                 y[-1]
             )
 
-            span = (
+            vertical_span = (
                 source_y_max
                 - source_y_min
             )
@@ -832,11 +884,9 @@ class LaneProjectionEngine:
             confidence = (
                 self._projection_confidence(
                     point_count=len(x),
-                    vertical_span=span,
+                    vertical_span=vertical_span,
                     fit_error=fit_error,
-                    point_confidence=(
-                        mean_confidence
-                    ),
+                    point_confidence=mean_confidence,
                 )
             )
 
@@ -855,28 +905,33 @@ class LaneProjectionEngine:
                 )
 
             # -----------------------------------------------------------------
-            # Projeção.
+            # IMPORTANTE:
             #
-            # Mantemos toda a observação original e extrapolamos somente
-            # para frente em Y.
+            # A projeção retornada representa EXTRAPOLAÇÃO.
+            #
+            # Portanto os pontos começam em source_y_max e avançam somente
+            # até source_y_max + max_projection_distance.
+            #
+            # Os pontos observados continuam representados pelo polinômio,
+            # mas não são duplicados dentro de LaneProjection.points.
             # -----------------------------------------------------------------
 
-            projection_end = min(
+            projection_start = source_y_max
+
+            projection_end = (
                 source_y_max
-                + self.max_projection_distance,
-                source_y_max
-                + self.max_projection_distance,
+                + self.max_projection_distance
             )
 
-            distance = (
+            projection_distance = (
                 projection_end
-                - source_y_min
+                - projection_start
             )
 
             samples = max(
                 2,
                 int(
-                    distance
+                    projection_distance
                     / self.sample_step
                 ) + 1,
             )
@@ -887,7 +942,7 @@ class LaneProjectionEngine:
             )
 
             projected_y = np.linspace(
-                source_y_min,
+                projection_start,
                 projection_end,
                 samples,
                 dtype=np.float64,
@@ -916,10 +971,6 @@ class LaneProjectionEngine:
                     "Projeção não finita."
                 )
 
-            # -----------------------------------------------------------------
-            # Pontos projetados.
-            # -----------------------------------------------------------------
-
             projected_points: list[
                 LanePoint
             ] = []
@@ -947,12 +998,8 @@ class LaneProjectionEngine:
                 point_confidence = _clip01(
                     confidence
                     * (
-                        1.0
-                        if distance_from_observed <= 0.0
-                        else (
-                            0.75
-                            + 0.25 * decay
-                        )
+                        0.75
+                        + 0.25 * decay
                     )
                 )
 
@@ -972,10 +1019,6 @@ class LaneProjectionEngine:
                     "Pontos projetados insuficientes."
                 )
 
-            projected_points.sort(
-                key=lambda p: p.y
-            )
-
             polynomial = (
                 self._create_polynomial(
                     coefficients=coefficients,
@@ -994,10 +1037,7 @@ class LaneProjectionEngine:
                 polynomial=polynomial,
                 points=projected_points,
                 quality=quality,
-                extrapolated=(
-                    projection_end
-                    > source_y_max
-                ),
+                extrapolated=True,
                 valid=True,
                 horizon_y=source_y_min,
             )
@@ -1041,7 +1081,9 @@ class LaneProjectionEngine:
         except Exception:
             return []
 
-        return list(points)
+        return list(
+            points
+        )
 
     # =========================================================================
     # PUBLIC PROJECT
@@ -1073,12 +1115,15 @@ class LaneProjectionEngine:
             )
 
             if horizon_y is not None:
+
                 value = _finite(
                     horizon_y
                 )
 
                 if value is not None:
-                    projection.horizon_y = value
+                    projection.horizon_y = (
+                        value
+                    )
 
             return projection
 
@@ -1090,7 +1135,9 @@ class LaneProjectionEngine:
             return _empty_projection()
 
         try:
-            points = list(data)
+            points = list(
+                data
+            )
         except (
             TypeError,
             ValueError,
@@ -1102,12 +1149,15 @@ class LaneProjectionEngine:
         )
 
         if horizon_y is not None:
+
             value = _finite(
                 horizon_y
             )
 
             if value is not None:
-                projection.horizon_y = value
+                projection.horizon_y = (
+                    value
+                )
 
         return projection
 
