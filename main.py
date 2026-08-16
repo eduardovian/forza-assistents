@@ -4,36 +4,60 @@ main.py
 Forza Assistents
 ================
 
-Orquestrador principal do pipeline ADAS.
+Orquestrador principal do pipeline ADAS/LKA.
 
-Pipeline:
+Arquitetura:
 
-    config
-       ↓
     ScreenCapture
-       ↓
-      YOLOP
-       ↓
-   LaneTracker
-       ↓
+        ↓
+    YOLOPv2
+        ↓
+    LaneTracker
+        ↓
+    LaneGeometry
+        ↓
     LaneModel
-       ↓
- LaneProjection
-       ↓
-   LaneGeometry
-       ↓
- LaneAssignment
-       ↓
-   ADASState
-       ↓
-  ADASDisplay
+        ↓
+    LaneProjection
+        ↓
+    LaneAssignment
+        ↓
+    ADASState
+        ↓
+    Safety Gate
+        ↓
+    Visualization
 
-Controle físico permanece desabilitado nesta etapa.
+Princípios:
+
+    - uma única fonte de configuração;
+    - coordenadas preservadas pelo pipeline;
+    - YOLOP não possui estado temporal;
+    - tracking separado da inferência;
+    - geometria observada separada de projeção;
+    - nenhuma previsão autoriza controle;
+    - qualquer falha bloqueia atuação;
+    - controle físico permanece desabilitado por padrão.
+
+IMPORTANTE
+==========
+
+O YOLOPDetector atual retorna LanePoint em coordenadas do
+FRAME ORIGINAL recebido por detect().
+
+O main.py NÃO deve:
+
+    - redimensionar LanePoint;
+    - aplicar ROI novamente;
+    - converter coordenadas do detector;
+    - fazer segundo mapeamento geométrico.
+
 """
 
 from __future__ import annotations
 
 import logging
+import signal
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -41,25 +65,14 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-from config import (
-    ROI,
-    CAPTURE,
-    YOLOP,
-    LANE_TRACKER,
-    LANE_GEOMETRY,
-    LANE_MODEL,
-    LANE_PROJECTION,
-    LANE_ASSIGNMENT,
-    ADAS,
-    SAFETY,
-    VISUALIZATION,
-    validate_config,
-)
+import config
 
 from capture.screen_capture import ScreenCapture
 
 from vision.yolop_detector import (
+    YOLOPDetector,
     YOLOPLaneDetector,
+    LaneDetectionResult,
     create_default_detector,
 )
 
@@ -74,6 +87,7 @@ from vision.lane_geometry import (
 )
 
 from vision.lane_model import (
+    LaneModel,
     build_lane_model,
     validate_lane_model,
 )
@@ -88,14 +102,19 @@ from vision.lane_assignment import (
 )
 
 from vision.adas_state import (
+    ADASState,
     ADASStateEstimator,
     ADASStateResult,
 )
 
-from visualization.adas_display import (
-    ADASDisplay,
-    ADASDisplayConfig,
-)
+try:
+    from visualization.adas_display import (
+        ADASDisplay,
+        ADASDisplayConfig,
+    )
+except ImportError:
+    ADASDisplay = None
+    ADASDisplayConfig = None
 
 
 # =============================================================================
@@ -106,37 +125,77 @@ LOGGER = logging.getLogger("forza_assistents")
 
 
 def setup_logging() -> None:
-    """Inicializa o logging."""
-
-    
+    """Inicializa logging uma única vez."""
 
     if LOGGER.handlers:
         return
 
     LOGGER.setLevel(logging.INFO)
 
-    formatter = logging.Formatter(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
+    handler = logging.StreamHandler()
+
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(name)s | "
+            "%(message)s"
+        )
     )
 
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-
-    LOGGER.addHandler(console)
+    LOGGER.addHandler(handler)
 
     LOGGER.propagate = False
+
+
+# =============================================================================
+# UTILITÁRIOS
+# =============================================================================
+
+def finite(value: Any) -> bool:
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+
+    try:
+        value = float(value)
+
+        if not np.isfinite(value):
+            return default
+
+        return value
+
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp01(value: Any) -> float:
+
+    value = safe_float(value)
+
+    return float(
+        np.clip(
+            value,
+            0.0,
+            1.0,
+        )
+    )
 
 
 # =============================================================================
 # ESTATÍSTICAS
 # =============================================================================
 
-
 @dataclass
 class RuntimeStatistics:
+
     frame_index: int = 0
 
     fps: float = 0.0
@@ -144,61 +203,267 @@ class RuntimeStatistics:
     capture_ms: float = 0.0
     detection_ms: float = 0.0
     tracking_ms: float = 0.0
+    geometry_ms: float = 0.0
     model_ms: float = 0.0
     projection_ms: float = 0.0
-    geometry_ms: float = 0.0
     assignment_ms: float = 0.0
     adas_ms: float = 0.0
 
     total_ms: float = 0.0
 
-    _last_time: float = 0.0
+    dropped_frames: int = 0
+
+    _last_timestamp: float = 0.0
 
     def update_fps(self) -> None:
 
         now = time.perf_counter()
 
-        if self._last_time > 0.0:
+        if self._last_timestamp > 0.0:
 
-            dt = now - self._last_time
+            dt = (
+                now
+                - self._last_timestamp
+            )
 
-            if dt > 0.0:
+            if dt > 1e-6:
 
-                instant_fps = 1.0 / dt
+                instantaneous = (
+                    1.0 / dt
+                )
 
                 if self.fps <= 0.0:
 
-                    self.fps = instant_fps
+                    self.fps = instantaneous
 
                 else:
 
                     self.fps = (
-                        self.fps * 0.9
-                        + instant_fps * 0.1
+                        self.fps * 0.90
+                        + instantaneous * 0.10
                     )
 
-        self._last_time = now
+        self._last_timestamp = now
+
+
+# =============================================================================
+# RESULTADO DO PIPELINE
+# =============================================================================
+
+@dataclass
+class PipelineResult:
+
+    frame_index: int
+
+    timestamp: float
+
+    detection: Optional[
+        LaneDetectionResult
+    ]
+
+    tracking: Optional[
+        LaneTrackingResult
+    ]
+
+    geometry: Optional[
+        LaneGeometryResult
+    ]
+
+    models: tuple[Any, ...]
+
+    projections: tuple[Any, ...]
+
+    assignment: Optional[
+        LaneAssignmentResult
+    ]
+
+    adas: Optional[
+        ADASStateResult
+    ]
+
+    actuation_allowed: bool
+
+    valid: bool
+
+    processing_ms: float
+
+    error: Optional[str] = None
+
+
+# =============================================================================
+# SAFETY GATE
+# =============================================================================
+
+class SafetyGate:
+    """
+    Gate central de segurança.
+
+    Nenhuma camada acima pode simplesmente decidir atuar.
+
+    Para permitir atuação é necessário:
+
+        - controle explicitamente habilitado;
+        - geometria real válida;
+        - tracking seguro;
+        - ADAS válido;
+        - confiança suficiente;
+        - estado ADAS não crítico;
+        - ausência de erro no pipeline.
+
+    """
+
+    def __init__(
+        self,
+        minimum_confidence: float = 0.55,
+        minimum_stable_frames: int = 4,
+    ) -> None:
+
+        self.minimum_confidence = (
+            clamp01(
+                minimum_confidence
+            )
+        )
+
+        self.minimum_stable_frames = max(
+            1,
+            int(
+                minimum_stable_frames
+            ),
+        )
+
+        self._stable_frames = 0
+
+    def reset(self) -> None:
+
+        self._stable_frames = 0
+
+    def evaluate(
+        self,
+        *,
+        tracking: Optional[
+            LaneTrackingResult
+        ],
+        geometry: Optional[
+            LaneGeometryResult
+        ],
+        adas: Optional[
+            ADASStateResult
+        ],
+    ) -> bool:
+
+        # Controle precisa estar explicitamente habilitado.
+        if not bool(
+            getattr(
+                config.SAFETY,
+                "enable_control",
+                False,
+            )
+        ):
+            self._stable_frames = 0
+            return False
+
+        # Tracking.
+        if tracking is None:
+            self._stable_frames = 0
+            return False
+
+        if not tracking.safe_for_control:
+            self._stable_frames = 0
+            return False
+
+        # Geometria real.
+        if geometry is None:
+            self._stable_frames = 0
+            return False
+
+        if not geometry.valid:
+            self._stable_frames = 0
+            return False
+
+        # ADAS.
+        if adas is None:
+            self._stable_frames = 0
+            return False
+
+        if not bool(
+            getattr(
+                adas,
+                "valid",
+                False,
+            )
+        ):
+            self._stable_frames = 0
+            return False
+
+        confidence = safe_float(
+            getattr(
+                adas,
+                "confidence",
+                0.0,
+            )
+        )
+
+        if (
+            confidence
+            < self.minimum_confidence
+        ):
+            self._stable_frames = 0
+            return False
+
+        # Estado ADAS.
+        state = getattr(
+            adas,
+            "state",
+            None,
+        )
+
+        blocked_states = {
+            getattr(
+                ADASState,
+                "UNKNOWN",
+                None,
+            ),
+            getattr(
+                ADASState,
+                "LANE_LOST",
+                None,
+            ),
+        }
+
+        if state in blocked_states:
+            self._stable_frames = 0
+            return False
+
+        self._stable_frames += 1
+
+        return (
+            self._stable_frames
+            >= self.minimum_stable_frames
+        )
 
 
 # =============================================================================
 # APLICAÇÃO
 # =============================================================================
 
-
 class ForzaAssistents:
 
     def __init__(self) -> None:
 
-        validate_config()
+        config.validate_config()
 
         self.running = False
         self.initialized = False
 
         self.frame_index = 0
 
-        self.stats = RuntimeStatistics()
+        self.stats = (
+            RuntimeStatistics()
+        )
 
-        self.capture: Optional[ScreenCapture] = None
+        self.capture: Optional[
+            ScreenCapture
+        ] = None
 
         self.detector: Optional[
             YOLOPLaneDetector
@@ -225,11 +490,26 @@ class ForzaAssistents:
         ] = None
 
         self.display: Optional[
-            ADASDisplay
+            Any
         ] = None
 
-        self.geometry_size: Optional[
+        self.safety = SafetyGate(
+            minimum_confidence=float(
+                getattr(
+                    config.ADAS,
+                    "minimum_confidence",
+                    0.55,
+                )
+            ),
+            minimum_stable_frames=4,
+        )
+
+        self._last_frame_shape: Optional[
             tuple[int, int]
+        ] = None
+
+        self._last_result: Optional[
+            PipelineResult
         ] = None
 
     # =========================================================================
@@ -241,88 +521,119 @@ class ForzaAssistents:
         if self.initialized:
             return
 
-        LOGGER.info("=" * 60)
-        LOGGER.info("FORZA ASSISTENTS")
-        LOGGER.info("Inicializando pipeline ADAS...")
-        LOGGER.info("Runtime mode: MONITOR")
+        LOGGER.info("=" * 72)
         LOGGER.info(
-            "Controle físico: %s",
-            "ENABLED"
-            if SAFETY.enable_control
-            else "DISABLED",
+            "FORZA ASSISTENTS"
+        )
+        LOGGER.info(
+            "Inicializando pipeline ADAS..."
         )
 
         # ---------------------------------------------------------------------
-        # ROI
+        # CONFIGURAÇÃO
         # ---------------------------------------------------------------------
 
-        if not ROI.enabled:
+        roi = config.ROI
+
+        if not roi.enabled:
 
             raise RuntimeError(
-                "ROI não calibrado. "
-                "Execute calibration/camera_calibration.py "
-                "antes de iniciar o sistema."
+                "ROI não está calibrado."
             )
 
         LOGGER.info(
-            "ROI: (%d, %d, %d, %d) | %dx%d",
-            ROI.left,
-            ROI.top,
-            ROI.right,
-            ROI.bottom,
-            ROI.width,
-            ROI.height,
+            "ROI: "
+            "(%d, %d) -> (%d, %d) | "
+            "%dx%d",
+            roi.left,
+            roi.top,
+            roi.right,
+            roi.bottom,
+            roi.width,
+            roi.height,
         )
 
         # ---------------------------------------------------------------------
-        # SCREEN CAPTURE
-        #
-        # O ScreenCapture atual NÃO recebe ROI no construtor.
-        # Ele lê config.ROI diretamente.
+        # CAPTURE
         # ---------------------------------------------------------------------
 
         self.capture = ScreenCapture(
-            monitor_index=CAPTURE.monitor_index,
+            region=roi.rectangle,
+            target_fps=(
+                config.CAPTURE.target_fps
+            ),
+            backend=(
+                config.CAPTURE.backend
+            ),
+            output_color=(
+                config.CAPTURE
+                .output_color_format
+            ),
+            max_buffer_size=(
+                config.CAPTURE
+                .max_buffer_size
+            ),
         )
+
+        if not self.capture.initialize():
+
+            raise RuntimeError(
+                "Falha ao inicializar "
+                "ScreenCapture."
+            )
 
         self.capture.start()
 
         LOGGER.info(
-            "ScreenCapture: READY | %d FPS",
-            CAPTURE.target_fps,
+            "ScreenCapture: READY"
         )
 
         # ---------------------------------------------------------------------
-        # YOLOP
+        # YOLOPv2
         # ---------------------------------------------------------------------
 
-        self.detector = create_default_detector(
-            model_path=YOLOP.model_path,
-            input_width=YOLOP.input_width,
-            input_height=YOLOP.input_height,
-            lane_threshold=(
-                YOLOP.lane_confidence_threshold
-            ),
-            min_points_per_lane=(
-                YOLOP.minimum_lane_points
-            ),
-            max_lanes=YOLOP.max_lanes,
-            providers=[
-                "CUDAExecutionProvider",
-                "CPUExecutionProvider",
-            ],
+        self.detector = (
+            create_default_detector(
+                model_path=(
+                    config.YOLOP.model_path
+                ),
+                input_width=(
+                    config.YOLOP.input_width
+                ),
+                input_height=(
+                    config.YOLOP.input_height
+                ),
+                lane_threshold=(
+                    config.YOLOP
+                    .lane_confidence_threshold
+                ),
+                min_points_per_lane=(
+                    config.YOLOP
+                    .minimum_lane_points
+                ),
+                max_lanes=(
+                    config.YOLOP.max_lanes
+                ),
+                use_fp16=True,
+            )
         )
 
         if not self.detector.load_model():
 
             raise RuntimeError(
-                "Falha ao carregar YOLOP: "
+                "Falha ao carregar YOLOPv2: "
                 f"{self.detector.last_error}"
             )
 
         LOGGER.info(
-            "YOLOP: READY | device=%s",
+            "YOLOPv2: READY | device=%s | "
+            "FP16=%s",
             self.detector.get_device_name(),
+            getattr(
+                self.detector,
+                "fp16_active",
+                False,
+            ),
         )
 
         # ---------------------------------------------------------------------
@@ -330,20 +641,26 @@ class ForzaAssistents:
         # ---------------------------------------------------------------------
 
         self.tracker = LaneTracker(
-            max_lanes=LANE_TRACKER.max_tracks,
-            history_size=LANE_TRACKER.history_size,
-            min_points=YOLOP.minimum_lane_points,
-            match_distance=(
-                LANE_TRACKER.association_distance
+            max_lanes=(
+                config.LANE_TRACKER
+                .max_tracks
+            ),
+            history_size=(
+                config.LANE_TRACKER
+                .history_size
+            ),
+            min_fit_points=max(
+                4,
+                config.YOLOP
+                .minimum_lane_points,
             ),
             max_missed_frames=(
-                LANE_TRACKER.max_lost_frames
-            ),
-            min_stable_frames=(
-                LANE_TRACKER.min_stable_frames
+                config.LANE_TRACKER
+                .max_lost_frames
             ),
             confidence_decay=(
-                LANE_TRACKER.confidence_decay
+                config.LANE_TRACKER
+                .confidence_decay
             ),
         )
 
@@ -352,19 +669,69 @@ class ForzaAssistents:
         )
 
         # ---------------------------------------------------------------------
+        # GEOMETRY
+        # ---------------------------------------------------------------------
+
+        self.geometry = LaneGeometry(
+            screen_width=(
+                roi.width
+            ),
+            screen_height=(
+                roi.height
+            ),
+            roi=(
+                0,
+                0,
+                roi.width,
+                roi.height,
+            ),
+            detector_width=(
+                roi.width
+            ),
+            detector_height=(
+                roi.height
+            ),
+            min_points=(
+                config.LANE_GEOMETRY
+                .min_points
+            ),
+            min_lane_width=(
+                config.LANE_GEOMETRY
+                .min_lane_width
+            ),
+            max_lane_width=(
+                config.LANE_GEOMETRY
+                .max_lane_width
+            ),
+            min_observed_span=(
+                config.LANE_GEOMETRY
+                .min_observed_span
+            ),
+        )
+
+        LOGGER.info(
+            "LaneGeometry: READY"
+        )
+
+        # ---------------------------------------------------------------------
         # PROJECTION
         # ---------------------------------------------------------------------
 
-        self.projection = LaneProjectionEngine(
-            min_points=(
-                LANE_PROJECTION.minimum_points
-            ),
-            min_confidence=(
-                LANE_PROJECTION.minimum_confidence
-            ),
-            max_projection_distance=(
-                LANE_PROJECTION.max_projection_distance
-            ),
+        self.projection = (
+            LaneProjectionEngine(
+                min_points=(
+                    config.LANE_PROJECTION
+                    .minimum_points
+                ),
+                min_confidence=(
+                    config.LANE_PROJECTION
+                    .minimum_confidence
+                ),
+                max_projection_distance=(
+                    config.LANE_PROJECTION
+                    .max_projection_distance
+                ),
+            )
         )
 
         LOGGER.info(
@@ -376,36 +743,49 @@ class ForzaAssistents:
         # ---------------------------------------------------------------------
 
         self.assignment = LaneAssignment(
-            max_lanes=LANE_TRACKER.max_tracks,
+            max_lanes=(
+                config.LANE_TRACKER
+                .max_tracks
+            ),
             min_lane_width_px=(
-                LANE_GEOMETRY.min_lane_width
+                config.LANE_GEOMETRY
+                .min_lane_width
             ),
             max_lane_width_px=(
-                LANE_GEOMETRY.max_lane_width
+                config.LANE_GEOMETRY
+                .max_lane_width
             ),
             vehicle_x_ratio=(
-                LANE_ASSIGNMENT.center_reference_ratio
+                config.LANE_ASSIGNMENT
+                .center_reference_ratio
             ),
             expected_lane_width=(
-                LANE_ASSIGNMENT.expected_lane_width
+                config.LANE_ASSIGNMENT
+                .expected_lane_width
             ),
             lane_width_tolerance=(
-                LANE_ASSIGNMENT.lane_width_tolerance
+                config.LANE_ASSIGNMENT
+                .lane_width_tolerance
             ),
             minimum_confidence=(
-                LANE_ASSIGNMENT.minimum_confidence
+                config.LANE_ASSIGNMENT
+                .minimum_confidence
             ),
             maximum_lateral_offset_ratio=(
-                LANE_ASSIGNMENT.maximum_lateral_offset_ratio
+                config.LANE_ASSIGNMENT
+                .maximum_lateral_offset_ratio
             ),
             enable_multi_lane_assignment=(
-                LANE_ASSIGNMENT.enable_multi_lane_assignment
+                config.LANE_ASSIGNMENT
+                .enable_multi_lane_assignment
             ),
             max_left_lanes=(
-                LANE_ASSIGNMENT.max_left_lanes
+                config.LANE_ASSIGNMENT
+                .max_left_lanes
             ),
             max_right_lanes=(
-                LANE_ASSIGNMENT.max_right_lanes
+                config.LANE_ASSIGNMENT
+                .max_right_lanes
             ),
         )
 
@@ -417,19 +797,25 @@ class ForzaAssistents:
         # ADAS
         # ---------------------------------------------------------------------
 
-        self.adas = ADASStateEstimator(
-            warning_threshold=(
-                ADAS.warning_threshold
-            ),
-            departure_threshold=(
-                ADAS.critical_threshold
-            ),
-            heading_warning_threshold=(
-                ADAS.heading_warning_threshold
-            ),
-            min_confidence=(
-                ADAS.minimum_confidence
-            ),
+        self.adas = (
+            ADASStateEstimator(
+                min_confidence=(
+                    config.ADAS
+                    .minimum_confidence
+                ),
+                warning_threshold=(
+                    config.ADAS
+                    .warning_threshold
+                ),
+                departure_threshold=(
+                    config.ADAS
+                    .critical_threshold
+                ),
+                heading_warning_threshold=(
+                    config.ADAS
+                    .heading_warning_threshold
+                ),
+            )
         )
 
         LOGGER.info(
@@ -440,30 +826,48 @@ class ForzaAssistents:
         # DISPLAY
         # ---------------------------------------------------------------------
 
-        if VISUALIZATION.enabled:
-
-            self.display = ADASDisplay(
-                config=ADASDisplayConfig(
-                    source_width=ROI.width,
-                    source_height=ROI.height,
-                    refresh_hz=30.0,
+        if (
+            bool(
+                getattr(
+                    config.VISUALIZATION,
+                    "enabled",
+                    False,
                 )
             )
+            and ADASDisplay is not None
+        ):
 
             try:
+
+                self.display = (
+                    ADASDisplay(
+                        config=(
+                            ADASDisplayConfig(
+                                source_width=(
+                                    roi.width
+                                ),
+                                source_height=(
+                                    roi.height
+                                ),
+                                refresh_hz=30.0,
+                            )
+                        )
+                    )
+                )
 
                 self.display.start(
                     blocking=False
                 )
 
                 LOGGER.info(
-                    "ADASDisplay: STARTED"
+                    "ADASDisplay: READY"
                 )
 
             except Exception as exc:
 
                 LOGGER.warning(
-                    "ADASDisplay indisponível: %s",
+                    "ADASDisplay "
+                    "indisponível: %s",
                     exc,
                 )
 
@@ -472,55 +876,11 @@ class ForzaAssistents:
         self.initialized = True
 
         LOGGER.info(
-            "Forza Assistents: INITIALIZED"
+            "Pipeline inicializado."
         )
 
     # =========================================================================
-    # GEOMETRY
-    # =========================================================================
-
-    def _get_geometry(
-        self,
-        frame: np.ndarray,
-    ) -> LaneGeometry:
-
-        height, width = frame.shape[:2]
-
-        current_size = (
-            width,
-            height,
-        )
-
-        if (
-            self.geometry is not None
-            and self.geometry_size == current_size
-        ):
-
-            return self.geometry
-
-        LOGGER.info(
-            "LaneGeometry: %dx%d",
-            width,
-            height,
-        )
-
-        self.geometry = LaneGeometry(
-            screen_width=width,
-            screen_height=height,
-            roi=(
-                0,
-                0,
-                width,
-                height,
-            ),
-        )
-
-        self.geometry_size = current_size
-
-        return self.geometry
-
-    # =========================================================================
-    # CAPTURE
+    # FRAME
     # =========================================================================
 
     def get_frame(
@@ -530,574 +890,931 @@ class ForzaAssistents:
         if self.capture is None:
             return None
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
-        packet = self.capture.read()
+        frame = (
+            self.capture
+            .get_latest_frame()
+        )
 
         self.stats.capture_ms = (
-            time.perf_counter() - start
+            time.perf_counter()
+            - start
         ) * 1000.0
 
-        if packet is None:
+        if frame is None:
             return None
 
-        return packet.frame
+        if not isinstance(
+            frame,
+            np.ndarray,
+        ):
+            return None
+
+        if frame.ndim != 3:
+            return None
+
+        if frame.shape[2] != 3:
+            return None
+
+        return frame
 
     # =========================================================================
-    # YOLOP
+    # PROCESSAMENTO
     # =========================================================================
 
-    def detect(
+    def process_frame(
         self,
         frame: np.ndarray,
-    ) -> Any:
+    ) -> PipelineResult:
 
-        if self.detector is None:
-            return None
-
-        start = time.perf_counter()
-
-        result = self.detector.detect(
-            frame
+        started = (
+            time.perf_counter()
         )
 
-        self.stats.detection_ms = (
-            time.perf_counter() - start
-        ) * 1000.0
+        timestamp = time.perf_counter()
 
-        return result
+        self.frame_index += 1
 
-    # =========================================================================
-    # TRACKING
-    # =========================================================================
+        frame_height, frame_width = (
+            frame.shape[:2]
+        )
 
-    def track(
-        self,
-        detection: Any,
-        timestamp: float,
-    ) -> Optional[LaneTrackingResult]:
+        self.stats.frame_index = (
+            self.frame_index
+        )
 
-        if self.tracker is None:
-            return None
+        # ---------------------------------------------------------------------
+        # 1. YOLOP
+        # ---------------------------------------------------------------------
 
-        start = time.perf_counter()
+        detection: Optional[
+            LaneDetectionResult
+        ] = None
 
-        result = self.tracker.update(
+        try:
+
+            if self.detector is None:
+                raise RuntimeError(
+                    "Detector não inicializado."
+                )
+
+            detection = (
+                self.detector.detect(
+                    frame
+                )
+            )
+
+            self.stats.detection_ms = (
+                safe_float(
+                    self.detector
+                    .last_diagnostics
+                    .get(
+                        "inference_ms",
+                        0.0,
+                    )
+                )
+            )
+
+        except Exception as exc:
+
+            LOGGER.exception(
+                "Falha no YOLOPv2."
+            )
+
+            self._reset_temporal_state()
+
+            return self._failure_result(
+                timestamp,
+                started,
+                (
+                    "YOLOP: "
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+            )
+
+        # ---------------------------------------------------------------------
+        # CONTRATO DE COORDENADAS
+        # ---------------------------------------------------------------------
+
+        if not self._validate_detection_coordinates(
             detection,
-            timestamp=timestamp,
+            frame_width,
+            frame_height,
+        ):
+
+            error = (
+                "YOLOP retornou coordenadas "
+                "fora do frame original."
+            )
+
+            LOGGER.error(
+                error
+            )
+
+            self._reset_temporal_state()
+
+            return self._failure_result(
+                timestamp,
+                started,
+                error,
+            )
+
+        # ---------------------------------------------------------------------
+        # 2. TRACKER
+        # ---------------------------------------------------------------------
+
+        tracking: Optional[
+            LaneTrackingResult
+        ] = None
+
+        tracking_started = (
+            time.perf_counter()
         )
+
+        try:
+
+            if self.tracker is None:
+                raise RuntimeError(
+                    "LaneTracker não inicializado."
+                )
+
+            tracking = (
+                self.tracker.update(
+                    detection,
+                    frame_width=(
+                        frame_width
+                    ),
+                    frame_height=(
+                        frame_height
+                    ),
+                )
+            )
+
+        except Exception as exc:
+
+            LOGGER.exception(
+                "Falha no LaneTracker."
+            )
 
         self.stats.tracking_ms = (
-            time.perf_counter() - start
+            time.perf_counter()
+            - tracking_started
         ) * 1000.0
+
+        # ---------------------------------------------------------------------
+        # 3. GEOMETRIA
+        # ---------------------------------------------------------------------
+
+        geometry: Optional[
+            LaneGeometryResult
+        ] = None
+
+        geometry_started = (
+            time.perf_counter()
+        )
+
+        try:
+
+            if (
+                self.geometry is not None
+                and detection is not None
+            ):
+
+                geometry = (
+                    self.geometry.compute(
+                        detection
+                    )
+                )
+
+        except Exception as exc:
+
+            LOGGER.exception(
+                "Falha no LaneGeometry."
+            )
+
+        self.stats.geometry_ms = (
+            time.perf_counter()
+            - geometry_started
+        ) * 1000.0
+
+        # ---------------------------------------------------------------------
+        # 4. LANE MODEL
+        # ---------------------------------------------------------------------
+
+        models = []
+
+        model_started = (
+            time.perf_counter()
+        )
+
+        if tracking is not None:
+
+            models = (
+                self._build_lane_models(
+                    tracking
+                )
+            )
+
+        self.stats.model_ms = (
+            time.perf_counter()
+            - model_started
+        ) * 1000.0
+
+        # ---------------------------------------------------------------------
+        # 5. PROJECTION
+        # ---------------------------------------------------------------------
+
+        projections = []
+
+        projection_started = (
+            time.perf_counter()
+        )
+
+        if (
+            self.projection is not None
+            and models
+        ):
+
+            projections = (
+                self._project_models(
+                    models
+                )
+            )
+
+        self.stats.projection_ms = (
+            time.perf_counter()
+            - projection_started
+        ) * 1000.0
+
+        # ---------------------------------------------------------------------
+        # 6. ASSIGNMENT
+        # ---------------------------------------------------------------------
+
+        assignment: Optional[
+            LaneAssignmentResult
+        ] = None
+
+        assignment_started = (
+            time.perf_counter()
+        )
+
+        try:
+
+            if (
+                self.assignment is not None
+                and models
+            ):
+
+                assignment = (
+                    self.assignment.assign(
+                        models,
+                        frame_width=(
+                            frame_width
+                        ),
+                        frame_height=(
+                            frame_height
+                        ),
+                    )
+                )
+
+        except Exception:
+
+            LOGGER.exception(
+                "Falha no LaneAssignment."
+            )
+
+        self.stats.assignment_ms = (
+            time.perf_counter()
+            - assignment_started
+        ) * 1000.0
+
+        # ---------------------------------------------------------------------
+        # 7. ADAS
+        # ---------------------------------------------------------------------
+
+        adas_result: Optional[
+            ADASStateResult
+        ] = None
+
+        adas_started = (
+            time.perf_counter()
+        )
+
+        try:
+
+            if self.adas is not None:
+
+                # Segurança:
+                # geometria inválida não pode alimentar
+                # o estado como se fosse uma geometria real.
+
+                geometry_for_adas = (
+                    geometry
+                    if (
+                        geometry is not None
+                        and geometry.valid
+                    )
+                    else None
+                )
+
+                adas_result = (
+                    self.adas.update(
+                        geometry_for_adas,
+                        timestamp,
+                    )
+                )
+
+        except Exception:
+
+            LOGGER.exception(
+                "Falha no ADAS."
+            )
+
+        self.stats.adas_ms = (
+            time.perf_counter()
+            - adas_started
+        ) * 1000.0
+
+        # ---------------------------------------------------------------------
+        # 8. SAFETY GATE
+        # ---------------------------------------------------------------------
+
+        actuation_allowed = (
+            self.safety.evaluate(
+                tracking=tracking,
+                geometry=geometry,
+                adas=adas_result,
+            )
+        )
+
+        # ---------------------------------------------------------------------
+        # RESULTADO
+        # ---------------------------------------------------------------------
+
+        processing_ms = (
+            time.perf_counter()
+            - started
+        ) * 1000.0
+
+        self.stats.total_ms = (
+            processing_ms
+        )
+
+        self.stats.update_fps()
+
+        result = PipelineResult(
+            frame_index=(
+                self.frame_index
+            ),
+            timestamp=timestamp,
+            detection=detection,
+            tracking=tracking,
+            geometry=geometry,
+            models=tuple(models),
+            projections=tuple(
+                projections
+            ),
+            assignment=assignment,
+            adas=adas_result,
+            actuation_allowed=(
+                actuation_allowed
+            ),
+            valid=bool(
+                detection is not None
+            ),
+            processing_ms=(
+                processing_ms
+            ),
+        )
+
+        self._last_result = result
 
         return result
 
     # =========================================================================
-    # LANE MODEL
+    # MODELOS
     # =========================================================================
 
-    def build_models(
-        self,
+    @staticmethod
+    def _build_lane_models(
         tracking: LaneTrackingResult,
-    ) -> list:
-
-        start = time.perf_counter()
+    ) -> list[Any]:
 
         models = []
 
         for track in tracking.lanes:
 
-            if not track.detected_this_frame:
+            # Não utilizar uma lane perdida
+            # como geometria observada.
+
+            if not track.points:
                 continue
 
-            if track.missed_frames > 0:
+            try:
+
+                model = (
+                    build_lane_model(
+                        lane_id=(
+                            track.lane_id
+                        ),
+                        points=(
+                            track.points
+                        ),
+                        min_points=max(
+                            4,
+                            int(
+                                getattr(
+                                    config.LANE_MODEL,
+                                    "minimum_points",
+                                    6,
+                                )
+                            ),
+                        ),
+                    )
+                )
+
+            except Exception:
+
                 continue
-
-            if not track.line.valid:
-                continue
-
-            points = track.line.points
-
-            if not points:
-                continue
-
-            model = build_lane_model(
-                lane_id=track.track_id,
-                points=points,
-                min_points=LANE_MODEL.minimum_points,
-            )
 
             if model is None:
                 continue
 
-            model.tracked = True
+            try:
 
-            model.stable = track.is_stable(
-                LANE_TRACKER.min_stable_frames
-            )
+                if not validate_lane_model(
+                    model
+                ):
+                    continue
 
-            if not validate_lane_model(model):
+            except Exception:
+
                 continue
 
             models.append(model)
 
-        self.stats.model_ms = (
-            time.perf_counter() - start
-        ) * 1000.0
-
         return models
 
     # =========================================================================
-    # PROJECTION
+    # PROJEÇÃO
     # =========================================================================
 
-    def project_models(
+    def _project_models(
         self,
-        models: list,
-    ) -> list:
-
-        if self.projection is None:
-            return []
-
-        start = time.perf_counter()
+        models: list[Any],
+    ) -> list[Any]:
 
         projections = []
-
-        if not LANE_PROJECTION.enabled:
-            return projections
 
         for model in models:
 
             try:
 
                 projection = (
-                    self.projection.project(
-                        model
-                    )
+                    self.projection
+                    .project(model)
                 )
 
-            except Exception as exc:
-
-                LOGGER.debug(
-                    "Projection failed: %s",
-                    exc,
-                )
+            except Exception:
 
                 continue
 
-            if projection.valid:
+            if projection is None:
+                continue
 
-                projections.append(
-                    projection
-                )
+            if not getattr(
+                projection,
+                "valid",
+                False,
+            ):
+                continue
 
-        self.stats.projection_ms = (
-            time.perf_counter() - start
-        ) * 1000.0
+            projections.append(
+                projection
+            )
 
         return projections
 
     # =========================================================================
-    # GEOMETRY
+    # VALIDAÇÃO DE COORDENADAS
     # =========================================================================
 
-    def calculate_geometry(
-        self,
-        models: list,
-        frame: np.ndarray,
-    ) -> LaneGeometryResult:
+    @staticmethod
+    def _validate_detection_coordinates(
+        detection: LaneDetectionResult,
+        frame_width: int,
+        frame_height: int,
+    ) -> bool:
 
-        geometry = self._get_geometry(
-            frame
-        )
+        if detection is None:
+            return False
 
-        height, width = frame.shape[:2]
+        if (
+            frame_width <= 0
+            or frame_height <= 0
+        ):
+            return False
 
-        start = time.perf_counter()
+        # O novo detector declara explicitamente
+        # seu sistema de coordenadas.
 
-        lane_points = [
-            model.line.points
-            for model in models
-            if (
-                model is not None
-                and model.line is not None
-                and model.line.valid
+        coordinate_system = (
+            detection.metadata.get(
+                "coordinate_system"
             )
-        ]
-
-        result = geometry.process(
-            lane_points,
-            image_width=width,
-            image_height=height,
+            if isinstance(
+                detection.metadata,
+                dict,
+            )
+            else None
         )
 
-        self.stats.geometry_ms = (
-            time.perf_counter() - start
-        ) * 1000.0
+        if (
+            coordinate_system is not None
+            and coordinate_system
+            != "original_frame"
+        ):
+            return False
 
-        return result
+        for lane in detection.lanes:
+
+            for point in lane:
+
+                if point is None:
+                    return False
+
+                if not point.valid:
+                    continue
+
+                if not (
+                    finite(point.x)
+                    and finite(point.y)
+                ):
+                    return False
+
+                if (
+                    point.x < 0.0
+                    or point.x
+                    > float(
+                        frame_width - 1
+                    )
+                ):
+                    return False
+
+                if (
+                    point.y < 0.0
+                    or point.y
+                    > float(
+                        frame_height - 1
+                    )
+                ):
+                    return False
+
+        return True
 
     # =========================================================================
-    # ASSIGNMENT
+    # FAILURE
     # =========================================================================
 
-    def assign(
+    def _failure_result(
         self,
-        models: list,
-        frame: np.ndarray,
-    ) -> Optional[LaneAssignmentResult]:
-
-        if self.assignment is None:
-            return None
-
-        height, width = frame.shape[:2]
-
-        start = time.perf_counter()
-
-        result = self.assignment.assign(
-            models,
-            frame_width=width,
-            frame_height=height,
-        )
-
-        self.stats.assignment_ms = (
-            time.perf_counter() - start
-        ) * 1000.0
-
-        return result
-
-    # =========================================================================
-    # ADAS
-    # =========================================================================
-
-    def update_adas(
-        self,
-        geometry: LaneGeometryResult,
-        assignment: Optional[
-            LaneAssignmentResult
-        ],
         timestamp: float,
-    ) -> Optional[ADASStateResult]:
+        started: float,
+        error: str,
+    ) -> PipelineResult:
 
-        if self.adas is None:
-            return None
-
-        start = time.perf_counter()
-
-        result = self.adas.update(
-            geometry=geometry,
-            assignment=assignment,
-            timestamp=timestamp,
-        )
-
-        self.stats.adas_ms = (
-            time.perf_counter() - start
+        processing_ms = (
+            time.perf_counter()
+            - started
         ) * 1000.0
 
-        return result
+        self.safety.reset()
+
+        return PipelineResult(
+            frame_index=(
+                self.frame_index
+            ),
+            timestamp=timestamp,
+            detection=None,
+            tracking=None,
+            geometry=None,
+            models=(),
+            projections=(),
+            assignment=None,
+            adas=None,
+            actuation_allowed=False,
+            valid=False,
+            processing_ms=(
+                processing_ms
+            ),
+            error=error,
+        )
 
     # =========================================================================
-    # DISPLAY
+    # RESET
     # =========================================================================
 
-    def update_display(
+    def _reset_temporal_state(
         self,
-        geometry: LaneGeometryResult,
-        adas_state: Optional[
-            ADASStateResult
-        ],
     ) -> None:
 
-        if self.display is None:
-            return
+        self.safety.reset()
+
+        if self.tracker is not None:
+
+            try:
+                self.tracker.reset()
+            except Exception:
+                pass
+
+        if self.adas is not None:
+
+            try:
+                self.adas.reset()
+            except Exception:
+                pass
+
+    # =========================================================================
+    # LOOP
+    # =========================================================================
+
+    def run(self) -> None:
+
+        if not self.initialized:
+
+            self.initialize()
+
+        if self.capture is None:
+
+            raise RuntimeError(
+                "Capture não inicializado."
+            )
+
+        self.running = True
+
+        LOGGER.info(
+            "Runtime iniciado."
+        )
 
         try:
 
-            self.display.update_from_pipeline(
-                geometry=geometry,
-                adas_state=adas_state,
-                active=bool(
-                    adas_state is not None
-                    and adas_state.valid
-                ),
-            )
+            while self.running:
 
-        except Exception as exc:
-
-            LOGGER.debug(
-                "Display update failed: %s",
-                exc,
-            )
-
-    # =========================================================================
-    # FRAME COMPLETO
-    # =========================================================================
-
-    def process_frame(
-        self,
-        frame: np.ndarray,
-    ) -> Optional[ADASStateResult]:
-
-        frame_start = time.perf_counter()
-
-        timestamp = time.monotonic()
-
-        # ---------------------------------------------------------------------
-        # YOLOP
-        # ---------------------------------------------------------------------
-
-        detection = self.detect(
-            frame
-        )
-
-        if detection is None:
-            return None
-
-        # ---------------------------------------------------------------------
-        # TRACKER
-        # ---------------------------------------------------------------------
-
-        tracking = self.track(
-            detection,
-            timestamp,
-        )
-
-        if tracking is None:
-            return None
-
-        # ---------------------------------------------------------------------
-        # MODEL
-        # ---------------------------------------------------------------------
-
-        models = self.build_models(
-            tracking
-        )
-
-        # ---------------------------------------------------------------------
-        # PROJECTION
-        # ---------------------------------------------------------------------
-
-        self.project_models(
-            models
-        )
-
-        # ---------------------------------------------------------------------
-        # GEOMETRY
-        # ---------------------------------------------------------------------
-
-        geometry = self.calculate_geometry(
-            models,
-            frame,
-        )
-
-        # ---------------------------------------------------------------------
-        # ASSIGNMENT
-        # ---------------------------------------------------------------------
-
-        assignment = self.assign(
-            models,
-            frame,
-        )
-
-        # ---------------------------------------------------------------------
-        # ADAS
-        # ---------------------------------------------------------------------
-
-        adas_state = self.update_adas(
-            geometry,
-            assignment,
-            timestamp,
-        )
-
-        # ---------------------------------------------------------------------
-        # DISPLAY
-        # ---------------------------------------------------------------------
-
-        self.update_display(
-            geometry,
-            adas_state,
-        )
-
-        # ---------------------------------------------------------------------
-        # METRICS
-        # ---------------------------------------------------------------------
-
-        self.stats.total_ms = (
-            time.perf_counter()
-            - frame_start
-        ) * 1000.0
-
-        return adas_state
-
-    # =========================================================================
-    # DIAGNÓSTICO
-    # =========================================================================
-
-    def log_frame(
-        self,
-        frame: np.ndarray,
-        adas_state: Optional[
-            ADASStateResult
-        ],
-    ) -> None:
-
-        # Mantemos o diagnóstico simples e independente
-        # de um objeto CONFIG inexistente.
-
-        if self.frame_index % 60 != 0:
-            return
-
-        state = (
-            adas_state.state.value
-            if adas_state is not None
-            else "none"
-        )
-
-        confidence = (
-            adas_state.confidence
-            if adas_state is not None
-            else 0.0
-        )
-
-        LOGGER.info(
-            (
-                "FRAME %d | "
-                "FPS=%.1f | "
-                "SIZE=%dx%d | "
-                "CAP=%.2fms | "
-                "DET=%.2fms | "
-                "TRK=%.2fms | "
-                "MODEL=%.2fms | "
-                "PROJ=%.2fms | "
-                "GEO=%.2fms | "
-                "ASSIGN=%.2fms | "
-                "ADAS=%.2fms | "
-                "TOTAL=%.2fms | "
-                "STATE=%s | "
-                "CONF=%.2f"
-            ),
-            self.frame_index,
-            self.stats.fps,
-            frame.shape[1],
-            frame.shape[0],
-            self.stats.capture_ms,
-            self.stats.detection_ms,
-            self.stats.tracking_ms,
-            self.stats.model_ms,
-            self.stats.projection_ms,
-            self.stats.geometry_ms,
-            self.stats.assignment_ms,
-            self.stats.adas_ms,
-            self.stats.total_ms,
-            state,
-            confidence,
-        )
-
-    # =========================================================================
-    # STOP
-    # =========================================================================
-
-    def stop(self) -> None:
-
-        self.running = False
-
-        if self.capture is not None:
-
-            try:
-                self.capture.stop()
-            except Exception:
-                LOGGER.exception(
-                    "Erro ao parar captura."
+                frame = (
+                    self.get_frame()
                 )
+
+                if frame is None:
+
+                    time.sleep(
+                        0.001
+                    )
+
+                    continue
+
+                result = (
+                    self.process_frame(
+                        frame
+                    )
+                )
+
+                self._publish_result(
+                    frame,
+                    result,
+                )
+
+                if self._handle_keyboard():
+
+                    break
+
+        except KeyboardInterrupt:
+
+            LOGGER.info(
+                "Interrupção solicitada."
+            )
+
+        finally:
+
+            self.shutdown()
+
+    # =========================================================================
+    # VISUALIZAÇÃO
+    # =========================================================================
+
+    def _publish_result(
+        self,
+        frame: np.ndarray,
+        result: PipelineResult,
+    ) -> None:
 
         if self.display is not None:
 
             try:
-                self.display.stop()
+
+                # Mantém a responsabilidade visual
+                # no módulo de visualização.
+
+                if hasattr(
+                    self.display,
+                    "update",
+                ):
+
+                    self.display.update(
+                        frame,
+                        result,
+                    )
+
             except Exception:
-                LOGGER.exception(
-                    "Erro ao parar display."
+
+                LOGGER.debug(
+                    "Falha ao atualizar display.",
+                    exc_info=True,
                 )
 
+    # =========================================================================
+    # TECLADO
+    # =========================================================================
+
+    @staticmethod
+    def _handle_keyboard() -> bool:
+
+        try:
+
+            key = cv2.waitKey(
+                1
+            ) & 0xFF
+
+        except Exception:
+
+            return False
+
+        if key == 27:  # ESC
+
+            return True
+
+        return False
+
+    # =========================================================================
+    # SHUTDOWN
+    # =========================================================================
+
+    def shutdown(self) -> None:
+
+        if not self.running and (
+            self.capture is None
+        ):
+            return
+
         LOGGER.info(
-            "Forza Assistents: STOPPED"
+            "Encerrando pipeline..."
         )
+
+        self.running = False
+
+        # Segurança primeiro.
+
+        self.safety.reset()
+
+        # Display.
+
+        if self.display is not None:
+
+            try:
+
+                if hasattr(
+                    self.display,
+                    "stop",
+                ):
+
+                    self.display.stop()
+
+            except Exception:
+
+                LOGGER.debug(
+                    "Erro ao parar display.",
+                    exc_info=True,
+                )
+
+            self.display = None
+
+        # Capture.
+
+        if self.capture is not None:
+
+            try:
+
+                self.capture.stop()
+
+            except Exception:
+
+                LOGGER.debug(
+                    "Erro ao parar capture.",
+                    exc_info=True,
+                )
+
+            self.capture = None
+
+        # OpenCV.
+
+        try:
+
+            cv2.destroyAllWindows()
+
+        except Exception:
+
+            pass
+
+        self.initialized = False
+
+        LOGGER.info(
+            "Pipeline encerrado."
+        )
+
+
+# =============================================================================
+# SIGNALS
+# =============================================================================
+
+_APP: Optional[
+    ForzaAssistents
+] = None
+
+
+def _signal_handler(
+    signum: int,
+    frame: Any,
+) -> None:
+
+    del signum
+    del frame
+
+    global _APP
+
+    if _APP is not None:
+
+        _APP.running = False
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
+def main() -> int:
 
-def main() -> None:
+    global _APP
 
     setup_logging()
 
-    app = ForzaAssistents()
+    signal.signal(
+        signal.SIGINT,
+        _signal_handler,
+    )
+
+    if hasattr(
+        signal,
+        "SIGTERM",
+    ):
+
+        signal.signal(
+            signal.SIGTERM,
+            _signal_handler,
+        )
 
     try:
 
-        app.initialize()
+        _APP = ForzaAssistents()
 
-        app.running = True
+        _APP.initialize()
 
-        LOGGER.info(
-            "Runtime started."
-        )
+        _APP.run()
 
-        while app.running:
-
-            frame = app.get_frame()
-
-            if frame is None:
-
-                time.sleep(0.001)
-
-                continue
-
-            app.frame_index += 1
-
-            app.stats.frame_index = (
-                app.frame_index
-            )
-
-            app.stats.update_fps()
-
-            app.process_frame(
-                frame
-            )
-
-            app.log_frame(
-                frame,
-                None,
-            )
-
-            # ESC encerra.
-            if (
-                cv2.waitKey(1) & 0xFF
-            ) == 27:
-
-                break
-
-    except KeyboardInterrupt:
-
-        LOGGER.info(
-            "Interrupted by user."
-        )
+        return 0
 
     except Exception:
 
         LOGGER.exception(
-            "Fatal runtime error."
+            "Falha fatal no Forza Assistents."
         )
 
-        raise
+        if _APP is not None:
+
+            try:
+                _APP.shutdown()
+            except Exception:
+                pass
+
+        return 1
 
     finally:
 
-        app.stop()
+        _APP = None
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        main()
+    )
