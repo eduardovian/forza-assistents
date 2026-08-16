@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vision.ufld_detector import LanePoint, LaneDetectionResult
+from vision.detection_types import LanePoint, LaneDetectionResult
 from vision.lane_geometry import LaneGeometryResult
 from vision.temporal_filter import EMATemporalFilter
 
@@ -20,7 +20,7 @@ class TestEMATemporalFilter(unittest.TestCase):
 
     def _create_detection(self, x_offset, num_points=18):
         """Cria detecção simulada com 18 pontos por lane."""
-        from vision.ufld_detector import CULANE_ROW_ANCHORS
+        from vision.detection_types import CULANE_ROW_ANCHORS
         points = []
         for i in range(num_points):
             y = CULANE_ROW_ANCHORS[i]
