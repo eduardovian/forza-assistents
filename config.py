@@ -1,130 +1,151 @@
 """
 config.py
 
-Configuração central do Forza Assistents.
+Forza Assistents
+================
 
-PRINCÍPIO FUNDAMENTAL
----------------------
+Configuração central e única do sistema.
 
-Este arquivo é a única fonte de verdade para configurações
-do sistema.
+PRINCÍPIOS
+----------
 
-Especialmente:
+1. Este módulo é a única fonte de verdade para configuração.
+2. ROI é produzido pelo calibrador e persistido em:
+       calibration/camera_calibration.json
+3. Todos os módulos consomem o mesmo ROI através de:
+       config.ROI
+4. Nenhum módulo downstream deve declarar ROI próprio.
+5. Configurações são imutáveis em runtime.
+6. Valores inválidos são rejeitados cedo.
+7. O pipeline trabalha em coordenadas do frame recebido.
+8. Segurança possui prioridade sobre disponibilidade.
+9. Monitoramento é o modo padrão.
+10. Controle físico permanece desabilitado por padrão.
 
-    ROI
-    ↓
-    ScreenCapture
-    ↓
-    YOLOP
-    ↓
-    Lane Tracker
-    ↓
-    Geometry
-    ↓
-    Projection
-    ↓
-    Assignment
-    ↓
-    ADAS
+Arquitetura:
 
-Nenhum outro módulo deve definir um ROI próprio.
+    Camera Calibration
+            │
+            ▼
+    camera_calibration.json
+            │
+            ▼
+        config.py
+            │
+            ├── ScreenCapture
+            ├── YOLOP
+            ├── LaneSelector
+            ├── LaneGeometry
+            ├── LaneTracker
+            ├── LaneProjection
+            ├── LaneAssignment
+            ├── ADAS
+            ├── LKA
+            └── Visualization
 
-O ROI é definido em coordenadas da tela:
+IMPORTANTE
+----------
 
-    (left, top, right, bottom)
-
-Exemplo:
-
-    ROI = (0, 700, 2560, 1600)
-
+Este projeto não é um sistema automotivo certificado.
+As estruturas abaixo buscam aplicar princípios de engenharia
+robusta, determinística, fail-safe e testável.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
+import json
 from pathlib import Path
-from typing import Tuple
+from typing import Final
 
 
-# ============================================================================
-# PROJECT PATHS
-# ============================================================================
+# =============================================================================
+# PROJECT
+# =============================================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent
 
-WEIGHTS_DIR = PROJECT_ROOT / "weights"
-
-YOLOP_MODEL_PATH = (
-    WEIGHTS_DIR / "yolop-640-640.onnx"
+CALIBRATION_DIR: Final[Path] = (
+    PROJECT_ROOT / "calibration"
 )
 
-CALIBRATION_DIR = PROJECT_ROOT / "calibration"
-
-CALIBRATION_FILE = (
+CALIBRATION_FILE: Final[Path] = (
     CALIBRATION_DIR / "camera_calibration.json"
 )
 
-LOG_DIR = PROJECT_ROOT / "logs"
+WEIGHTS_DIR: Final[Path] = (
+    PROJECT_ROOT / "weights"
+)
 
-SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
+YOLOP_MODEL_PATH: Final[Path] = (
+    WEIGHTS_DIR / "yolop-640-640.onnx"
+)
+
+LOG_DIR: Final[Path] = (
+    PROJECT_ROOT / "logs"
+)
+
+SCREENSHOT_DIR: Final[Path] = (
+    PROJECT_ROOT / "screenshots"
+)
 
 
-# ============================================================================
-# RUNTIME MODE
-# ============================================================================
+# =============================================================================
+# RUNTIME
+# =============================================================================
+
 
 class RuntimeMode(str, Enum):
+    """
+    Estado operacional global do sistema.
+    """
+
     DISABLED = "disabled"
     MONITOR = "monitor"
     ASSIST = "assist"
 
 
-DEFAULT_RUNTIME_MODE = RuntimeMode.MONITOR
+DEFAULT_RUNTIME_MODE: Final[RuntimeMode] = (
+    RuntimeMode.MONITOR
+)
 
 
-# ============================================================================
-# SCREEN / ROI
-# ============================================================================
+# =============================================================================
+# ROI
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class ROIConfig:
     """
-    Configuração central da região de interesse.
+    Região de interesse produzida pelo calibrador.
 
-    Coordenadas referentes à tela inteira:
+    Coordenadas em relação à tela inteira:
 
         left
         top
         right
         bottom
 
-    Exemplo para uma tela 2560x1600:
+    Depois do recorte, o frame resultante possui seu próprio
+    sistema de coordenadas:
 
-        (0, 700, 2560, 1600)
+        x = 0 ... width
+        y = 0 ... height
 
+    Os módulos de visão trabalham nesse sistema local.
     """
 
-    enabled: bool = True
+    enabled: bool
 
-    # ROI da tela.
-    left: int = 0
-    top: int = 700
-    right: int = 2560
-    bottom: int = 1600
-
-    # Permite validar automaticamente o ROI
-    # contra a resolução capturada.
-    clamp_to_frame: bool = True
+    left: int
+    top: int
+    right: int
+    bottom: int
 
     @property
-    def rectangle(self) -> Tuple[int, int, int, int]:
-        """
-        Retorna o ROI no formato:
-
-            (left, top, right, bottom)
-        """
-
+    def rectangle(self) -> tuple[int, int, int, int]:
         return (
             self.left,
             self.top,
@@ -134,46 +155,179 @@ class ROIConfig:
 
     @property
     def width(self) -> int:
-        return max(
-            0,
-            self.right - self.left,
-        )
+        return self.right - self.left
 
     @property
     def height(self) -> int:
-        return max(
-            0,
-            self.bottom - self.top,
-        )
+        return self.bottom - self.top
 
     @property
-    def size(self) -> Tuple[int, int]:
+    def size(self) -> tuple[int, int]:
         return (
             self.width,
             self.height,
         )
 
+    def validate(
+        self,
+        *,
+        screen_width: int | None = None,
+        screen_height: int | None = None,
+    ) -> None:
+        """
+        Valida a geometria do ROI.
 
-ROI = ROIConfig()
+        Raises
+        ------
+        ValueError
+            Caso o ROI seja inválido.
+        """
+
+        if not self.enabled:
+            return
+
+        if self.left < 0:
+            raise ValueError(
+                "ROI.left não pode ser negativo."
+            )
+
+        if self.top < 0:
+            raise ValueError(
+                "ROI.top não pode ser negativo."
+            )
+
+        if self.right <= self.left:
+            raise ValueError(
+                "ROI.right deve ser maior que ROI.left."
+            )
+
+        if self.bottom <= self.top:
+            raise ValueError(
+                "ROI.bottom deve ser maior que ROI.top."
+            )
+
+        if screen_width is not None:
+            if self.right > screen_width:
+                raise ValueError(
+                    "ROI excede a largura da tela."
+                )
+
+        if screen_height is not None:
+            if self.bottom > screen_height:
+                raise ValueError(
+                    "ROI excede a altura da tela."
+                )
 
 
-# ============================================================================
+def _load_roi() -> ROIConfig:
+    """
+    Carrega o ROI produzido pelo calibrador.
+
+    Não existe ROI alternativo espalhado pelo sistema.
+
+    Se a calibração não existir, o sistema permanece sem ROI
+    válido e deve ser tratado pelo runtime como condição de
+    configuração incompleta.
+    """
+
+    if not CALIBRATION_FILE.exists():
+        return ROIConfig(
+            enabled=False,
+            left=0,
+            top=0,
+            right=0,
+            bottom=0,
+        )
+
+    try:
+        with CALIBRATION_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+    except (
+        OSError,
+        json.JSONDecodeError,
+    ) as exc:
+
+        raise RuntimeError(
+            "Não foi possível carregar "
+            f"a calibração: {CALIBRATION_FILE}"
+        ) from exc
+
+    roi_data = data.get("roi")
+
+    if not isinstance(
+        roi_data,
+        dict,
+    ):
+        raise RuntimeError(
+            "Arquivo de calibração não contém "
+            "um objeto 'roi' válido."
+        )
+
+    required = (
+        "left",
+        "top",
+        "right",
+        "bottom",
+    )
+
+    missing = [
+        key
+        for key in required
+        if key not in roi_data
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "ROI incompleto no arquivo de calibração. "
+            f"Campos ausentes: {missing}"
+        )
+
+    try:
+        roi = ROIConfig(
+            enabled=True,
+            left=int(roi_data["left"]),
+            top=int(roi_data["top"]),
+            right=int(roi_data["right"]),
+            bottom=int(roi_data["bottom"]),
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+
+        raise RuntimeError(
+            "Valores inválidos no ROI calibrado."
+        ) from exc
+
+    roi.validate()
+
+    return roi
+
+
+# ÚNICO ROI DO SISTEMA.
+ROI: Final[ROIConfig] = _load_roi()
+
+
+# =============================================================================
 # SCREEN CAPTURE
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class CaptureConfig:
     """
-    Configuração da captura da tela.
+    Configuração da captura.
 
-    IMPORTANTE:
+    O ROI NÃO é definido aqui.
 
-    O ROI utilizado pelo sistema vem exclusivamente de:
+    O capturador deve importar:
 
-        ROI
-
-    Não deve existir outro ROI definido em main.py,
-    ScreenCapture ou qualquer outro módulo.
+        from config import ROI
     """
 
     backend: str = "dxgi"
@@ -186,27 +340,51 @@ class CaptureConfig:
 
     capture_full_screen: bool = True
 
-    # ROI centralizado.
-    use_roi: bool = ROI.enabled
-
-    roi: Tuple[int, int, int, int] = ROI.rectangle
-
     copy_frame: bool = False
 
     output_color_format: str = "BGR"
 
     max_buffer_size: int = 2
 
+    def validate(self) -> None:
 
-CAPTURE = CaptureConfig()
+        if self.target_fps <= 0:
+            raise ValueError(
+                "target_fps deve ser > 0."
+            )
+
+        if self.max_fps < self.target_fps:
+            raise ValueError(
+                "max_fps deve ser >= target_fps."
+            )
+
+        if self.monitor_index < 0:
+            raise ValueError(
+                "monitor_index deve ser >= 0."
+            )
+
+        if self.output_color_format not in {
+            "BGR",
+            "RGB",
+        }:
+            raise ValueError(
+                "Formato de cor inválido."
+            )
 
 
-# ============================================================================
+CAPTURE: Final[CaptureConfig] = CaptureConfig()
+
+
+# =============================================================================
 # YOLOP
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class YOLOPConfig:
+    """
+    Configuração do detector YOLOP.
+    """
 
     model_path: Path = YOLOP_MODEL_PATH
 
@@ -236,82 +414,99 @@ class YOLOPConfig:
 
     input_scale: float = 1.0 / 255.0
 
-    mean: Tuple[float, float, float] = (
+    mean: tuple[float, float, float] = (
         0.0,
         0.0,
         0.0,
     )
 
-    std: Tuple[float, float, float] = (
+    std: tuple[float, float, float] = (
         1.0,
         1.0,
         1.0,
     )
 
+    def validate(self) -> None:
 
-YOLOP = YOLOPConfig()
+        if self.input_width <= 0:
+            raise ValueError(
+                "YOLOP input_width inválido."
+            )
 
+        if self.input_height <= 0:
+            raise ValueError(
+                "YOLOP input_height inválido."
+            )
 
-# ============================================================================
-# LANE TRACKER
-# ============================================================================
+        for name, value in (
+            (
+                "confidence_threshold",
+                self.confidence_threshold,
+            ),
+            (
+                "lane_confidence_threshold",
+                self.lane_confidence_threshold,
+            ),
+            (
+                "segmentation_threshold",
+                self.segmentation_threshold,
+            ),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"{name} deve estar entre 0 e 1."
+                )
 
-@dataclass(frozen=True)
-class LaneTrackerConfig:
-
-    max_lost_frames: int = 12
-
-    min_stable_frames: int = 3
-
-    history_size: int = 12
-
-    max_tracks: int = 16
-
-    min_confidence: float = 0.35
-
-    association_distance: float = 120.0
-
-    max_lane_width_change_ratio: float = 0.35
-
-    confidence_decay: float = 0.92
-
-    velocity_smoothing: float = 0.70
-
-    enable_prediction: bool = True
-
-    enable_identity_preservation: bool = True
-
-    enable_lane_swap_protection: bool = True
-
-
-LANE_TRACKER = LaneTrackerConfig()
+        if self.max_lanes <= 0:
+            raise ValueError(
+                "max_lanes deve ser > 0."
+            )
 
 
-# ============================================================================
+YOLOP: Final[YOLOPConfig] = YOLOPConfig()
+
+
+# =============================================================================
+# LANE SELECTOR
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class LaneSelectorConfig:
+
+    enabled: bool = True
+
+    minimum_confidence: float = 0.35
+
+    maximum_lanes: int = 16
+
+    center_reference_ratio: float = 0.50
+
+    minimum_lane_separation: float = 80.0
+
+    enable_multi_lane_selection: bool = True
+
+
+LANE_SELECTOR: Final[LaneSelectorConfig] = (
+    LaneSelectorConfig()
+)
+
+
+# =============================================================================
 # LANE GEOMETRY
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class LaneGeometryConfig:
     """
-    Geometria trabalha sobre o FRAME JÁ RECORTADO pelo ROI.
+    Geometria trabalha exclusivamente sobre o frame recebido.
 
-    Portanto:
+    Não possui ROI.
 
-        image_width
-        image_height
-
-    representam as dimensões do ROI.
-
-    Não representam a tela inteira.
+    image_width / image_height são parâmetros derivados do ROI
+    somente para validações e referências geométricas.
     """
-
-    # Dimensões esperadas do ROI.
-    #
-    # São derivadas automaticamente da configuração central.
-    image_width: int = ROI.width
-
-    image_height: int = ROI.height
 
     min_lane_confidence: float = 0.35
 
@@ -352,14 +547,17 @@ class LaneGeometryConfig:
     confidence_weight_geometry: float = 0.25
 
 
-LANE_GEOMETRY = LaneGeometryConfig()
+LANE_GEOMETRY: Final[LaneGeometryConfig] = (
+    LaneGeometryConfig()
+)
 
 
-# ============================================================================
+# =============================================================================
 # LANE MODEL
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class LaneModelConfig:
 
     polynomial_degree: int = 2
@@ -381,14 +579,55 @@ class LaneModelConfig:
     enable_outlier_rejection: bool = True
 
 
-LANE_MODEL = LaneModelConfig()
+LANE_MODEL: Final[LaneModelConfig] = (
+    LaneModelConfig()
+)
 
 
-# ============================================================================
+# =============================================================================
+# LANE TRACKER
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class LaneTrackerConfig:
+
+    max_lost_frames: int = 12
+
+    min_stable_frames: int = 3
+
+    history_size: int = 12
+
+    max_tracks: int = 16
+
+    min_confidence: float = 0.35
+
+    association_distance: float = 120.0
+
+    max_lane_width_change_ratio: float = 0.35
+
+    confidence_decay: float = 0.92
+
+    velocity_smoothing: float = 0.70
+
+    enable_prediction: bool = True
+
+    enable_identity_preservation: bool = True
+
+    enable_lane_swap_protection: bool = True
+
+
+LANE_TRACKER: Final[LaneTrackerConfig] = (
+    LaneTrackerConfig()
+)
+
+
+# =============================================================================
 # LANE PROJECTION
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class LaneProjectionConfig:
 
     enabled: bool = True
@@ -411,15 +650,24 @@ class LaneProjectionConfig:
 
     extrapolation_limit: float = 300.0
 
+    confidence_decay_distance: float = 400.0
 
-LANE_PROJECTION = LaneProjectionConfig()
+    maximum_curvature: float = 0.02
+
+    reject_non_finite_points: bool = True
 
 
-# ============================================================================
+LANE_PROJECTION: Final[
+    LaneProjectionConfig
+] = LaneProjectionConfig()
+
+
+# =============================================================================
 # LANE ASSIGNMENT
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class LaneAssignmentConfig:
 
     enabled: bool = True
@@ -445,14 +693,17 @@ class LaneAssignmentConfig:
     max_right_lanes: int = 8
 
 
-LANE_ASSIGNMENT = LaneAssignmentConfig()
+LANE_ASSIGNMENT: Final[
+    LaneAssignmentConfig
+] = LaneAssignmentConfig()
 
 
-# ============================================================================
-# ADAS
-# ============================================================================
+# =============================================================================
+# ADAS STATE
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class ADASConfig:
 
     enabled: bool = True
@@ -486,14 +737,15 @@ class ADASConfig:
     enable_critical_right_state: bool = True
 
 
-ADAS = ADASConfig()
+ADAS: Final[ADASConfig] = ADASConfig()
 
 
-# ============================================================================
+# =============================================================================
 # TEMPORAL FILTER
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class TemporalFilterConfig:
 
     enabled: bool = True
@@ -515,15 +767,24 @@ class TemporalFilterConfig:
     filter_confidence: bool = True
 
 
-TEMPORAL_FILTER = TemporalFilterConfig()
+TEMPORAL_FILTER: Final[
+    TemporalFilterConfig
+] = TemporalFilterConfig()
 
 
-# ============================================================================
+# =============================================================================
 # SAFETY
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class SafetyConfig:
+    """
+    Safety gate central.
+
+    Nenhum controlador deve produzir comando físico se as
+    condições mínimas não forem satisfeitas.
+    """
 
     enable_control: bool = False
 
@@ -544,14 +805,15 @@ class SafetyConfig:
     zero_command_on_invalid_state: bool = True
 
 
-SAFETY = SafetyConfig()
+SAFETY: Final[SafetyConfig] = SafetyConfig()
 
 
-# ============================================================================
+# =============================================================================
 # LKA
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class LKAConfig:
 
     enabled: bool = False
@@ -579,14 +841,15 @@ class LKAConfig:
     disable_on_assignment_invalid: bool = True
 
 
-LKA = LKAConfig()
+LKA: Final[LKAConfig] = LKAConfig()
 
 
-# ============================================================================
+# =============================================================================
 # G29
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class G29Config:
 
     enabled: bool = False
@@ -608,14 +871,15 @@ class G29Config:
     fail_safe_enabled: bool = True
 
 
-G29 = G29Config()
+G29: Final[G29Config] = G29Config()
 
 
-# ============================================================================
+# =============================================================================
 # VISUALIZATION
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class VisualizationConfig:
 
     enabled: bool = True
@@ -646,19 +910,24 @@ class VisualizationConfig:
 
     show_lane_ids: bool = True
 
-    window_name: str = "Forza Assistents ADAS"
+    window_name: str = (
+        "Forza Assistents ADAS"
+    )
 
     wait_key_ms: int = 1
 
 
-VISUALIZATION = VisualizationConfig()
+VISUALIZATION: Final[
+    VisualizationConfig
+] = VisualizationConfig()
 
 
-# ============================================================================
+# =============================================================================
 # PERFORMANCE
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class PerformanceConfig:
 
     target_capture_fps: int = 60
@@ -684,14 +953,17 @@ class PerformanceConfig:
     max_frame_queue: int = 2
 
 
-PERFORMANCE = PerformanceConfig()
+PERFORMANCE: Final[
+    PerformanceConfig
+] = PerformanceConfig()
 
 
-# ============================================================================
+# =============================================================================
 # LOGGING
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class LoggingConfig:
 
     enabled: bool = True
@@ -704,7 +976,9 @@ class LoggingConfig:
 
     directory: Path = LOG_DIR
 
-    filename: str = "forza_assistents.log"
+    filename: str = (
+        "forza_assistents.log"
+    )
 
     max_file_size_mb: int = 20
 
@@ -719,14 +993,15 @@ class LoggingConfig:
     log_safety_events: bool = True
 
 
-LOGGING = LoggingConfig()
+LOGGING: Final[LoggingConfig] = LoggingConfig()
 
 
-# ============================================================================
+# =============================================================================
 # HOTKEYS
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class HotkeyConfig:
 
     toggle_monitor: str = "m"
@@ -738,14 +1013,15 @@ class HotkeyConfig:
     exit: str = "ESC"
 
 
-HOTKEYS = HotkeyConfig()
+HOTKEYS: Final[HotkeyConfig] = HotkeyConfig()
 
 
-# ============================================================================
+# =============================================================================
 # DEBUG
-# ============================================================================
+# =============================================================================
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class DebugConfig:
 
     enabled: bool = True
@@ -771,335 +1047,118 @@ class DebugConfig:
     debug_frame_interval: int = 30
 
 
-DEBUG = DebugConfig()
+DEBUG: Final[DebugConfig] = DebugConfig()
 
 
-# ============================================================================
-# LEGACY UFLD
-# ============================================================================
+# =============================================================================
+# GLOBAL VALIDATION
+# =============================================================================
 
-UFLD_INPUT_WIDTH = 800
-UFLD_INPUT_HEIGHT = 288
-UFLD_GRIDING_NUM = 200
-UFLD_ROW_ANCHORS = 18
-
-
-# ============================================================================
-# GLOBAL SYSTEM CONFIG
-# ============================================================================
-
-@dataclass(frozen=True)
-class SystemConfig:
-
-    project_root: Path = PROJECT_ROOT
-
-    runtime_mode: RuntimeMode = DEFAULT_RUNTIME_MODE
-
-    roi: ROIConfig = field(
-        default=ROI
-    )
-
-    safety: SafetyConfig = field(
-        default=SAFETY
-    )
-
-    capture: CaptureConfig = field(
-        default=CAPTURE
-    )
-
-    yolop: YOLOPConfig = field(
-        default=YOLOP
-    )
-
-    lane_tracker: LaneTrackerConfig = field(
-        default=LANE_TRACKER
-    )
-
-    lane_geometry: LaneGeometryConfig = field(
-        default=LANE_GEOMETRY
-    )
-
-    lane_model: LaneModelConfig = field(
-        default=LANE_MODEL
-    )
-
-    lane_projection: LaneProjectionConfig = field(
-        default=LANE_PROJECTION
-    )
-
-    lane_assignment: LaneAssignmentConfig = field(
-        default=LANE_ASSIGNMENT
-    )
-
-    adas: ADASConfig = field(
-        default=ADAS
-    )
-
-    temporal_filter: TemporalFilterConfig = field(
-        default=TEMPORAL_FILTER
-    )
-
-    lka: LKAConfig = field(
-        default=LKA
-    )
-
-    g29: G29Config = field(
-        default=G29
-    )
-
-    visualization: VisualizationConfig = field(
-        default=VISUALIZATION
-    )
-
-    performance: PerformanceConfig = field(
-        default=PERFORMANCE
-    )
-
-    logging: LoggingConfig = field(
-        default=LOGGING
-    )
-
-    hotkeys: HotkeyConfig = field(
-        default=HOTKEYS
-    )
-
-    debug: DebugConfig = field(
-        default=DEBUG
-    )
-
-
-CONFIG = SystemConfig()
-
-
-# ============================================================================
-# VALIDATION
-# ============================================================================
 
 def validate_config() -> None:
     """
-    Validação central da configuração.
+    Valida toda a configuração estática.
+
+    Deve ser chamado no início do main.py.
     """
 
-    # ------------------------------------------------------------------------
-    # ROI
-    # ------------------------------------------------------------------------
+    CAPTURE.validate()
+    YOLOP.validate()
 
     if ROI.enabled:
+        ROI.validate()
 
-        if ROI.left < 0:
-            raise ValueError(
-                "ROI.left must be >= 0"
-            )
-
-        if ROI.top < 0:
-            raise ValueError(
-                "ROI.top must be >= 0"
-            )
-
-        if ROI.right <= ROI.left:
-            raise ValueError(
-                "ROI.right must be greater than ROI.left"
-            )
-
-        if ROI.bottom <= ROI.top:
-            raise ValueError(
-                "ROI.bottom must be greater than ROI.top"
-            )
-
-        if ROI.width <= 0:
-            raise ValueError(
-                "ROI width must be > 0"
-            )
-
-        if ROI.height <= 0:
-            raise ValueError(
-                "ROI height must be > 0"
-            )
-
-    # ------------------------------------------------------------------------
-    # Capture
-    # ------------------------------------------------------------------------
-
-    if CAPTURE.target_fps <= 0:
+    if LANE_GEOMETRY.polynomial_degree != (
+        LANE_MODEL.polynomial_degree
+    ):
         raise ValueError(
-            "CAPTURE.target_fps must be > 0"
+            "Grau polinomial inconsistente entre "
+            "LANE_GEOMETRY e LANE_MODEL."
         )
 
-    if CAPTURE.max_buffer_size <= 0:
+    if LANE_PROJECTION.samples < 2:
         raise ValueError(
-            "CAPTURE.max_buffer_size must be > 0"
+            "LANE_PROJECTION.samples deve ser >= 2."
         )
 
-    # ------------------------------------------------------------------------
-    # YOLOP
-    # ------------------------------------------------------------------------
-
-    if YOLOP.input_width <= 0:
+    if LANE_PROJECTION.extrapolation_limit < 0:
         raise ValueError(
-            "YOLOP.input_width must be > 0"
+            "extrapolation_limit não pode ser negativo."
         )
 
-    if YOLOP.input_height <= 0:
+    if SAFETY.minimum_adas_confidence < 0.0:
         raise ValueError(
-            "YOLOP.input_height must be > 0"
+            "minimum_adas_confidence inválido."
         )
 
-    if not 0.0 <= YOLOP.confidence_threshold <= 1.0:
+    if SAFETY.minimum_adas_confidence > 1.0:
         raise ValueError(
-            "YOLOP.confidence_threshold must be between 0 and 1"
+            "minimum_adas_confidence inválido."
         )
 
-    if not 0.0 <= YOLOP.lane_confidence_threshold <= 1.0:
+    if PERFORMANCE.target_pipeline_fps <= 0:
         raise ValueError(
-            "YOLOP.lane_confidence_threshold must be between 0 and 1"
+            "target_pipeline_fps deve ser > 0."
         )
 
-    # ------------------------------------------------------------------------
-    # Tracker
-    # ------------------------------------------------------------------------
-
-    if LANE_TRACKER.max_lost_frames < 0:
+    if PERFORMANCE.target_control_hz <= 0:
         raise ValueError(
-            "LANE_TRACKER.max_lost_frames must be >= 0"
+            "target_control_hz deve ser > 0."
         )
 
-    if LANE_TRACKER.history_size <= 0:
-        raise ValueError(
-            "LANE_TRACKER.history_size must be > 0"
-        )
 
-    # ------------------------------------------------------------------------
-    # Geometry
-    # ------------------------------------------------------------------------
-
-    if LANE_GEOMETRY.min_points < 2:
-        raise ValueError(
-            "LANE_GEOMETRY.min_points must be >= 2"
-        )
-
-    if LANE_GEOMETRY.image_width <= 0:
-        raise ValueError(
-            "LANE_GEOMETRY.image_width must be > 0"
-        )
-
-    if LANE_GEOMETRY.image_height <= 0:
-        raise ValueError(
-            "LANE_GEOMETRY.image_height must be > 0"
-        )
-
-    # ------------------------------------------------------------------------
-    # Model
-    # ------------------------------------------------------------------------
-
-    if LANE_MODEL.polynomial_degree < 1:
-        raise ValueError(
-            "LANE_MODEL.polynomial_degree must be >= 1"
-        )
-
-    # ------------------------------------------------------------------------
-    # Projection
-    # ------------------------------------------------------------------------
-
-    if LANE_PROJECTION.samples <= 0:
-        raise ValueError(
-            "LANE_PROJECTION.samples must be > 0"
-        )
-
-    # ------------------------------------------------------------------------
-    # Safety
-    # ------------------------------------------------------------------------
-
-    if not 0.0 <= SAFETY.minimum_adas_confidence <= 1.0:
-        raise ValueError(
-            "SAFETY.minimum_adas_confidence must be between 0 and 1"
-        )
-
-    # ------------------------------------------------------------------------
-    # LKA
-    # ------------------------------------------------------------------------
-
-    if not 0.0 <= LKA.max_steering <= 1.0:
-        raise ValueError(
-            "LKA.max_steering must be between 0 and 1"
-        )
-
-    # ------------------------------------------------------------------------
-    # Physical control safety
-    # ------------------------------------------------------------------------
-
-    if DEFAULT_RUNTIME_MODE != RuntimeMode.ASSIST:
-
-        if G29.enabled:
-            raise ValueError(
-                "G29 cannot be enabled outside ASSIST mode"
-            )
-
-        if LKA.enabled:
-            raise ValueError(
-                "LKA cannot be enabled outside ASSIST mode"
-            )
+# =============================================================================
+# PUBLIC API
+# =============================================================================
 
 
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-def get_project_root() -> Path:
-    return PROJECT_ROOT
-
-
-def get_yolop_model_path() -> Path:
-    return YOLOP_MODEL_PATH
-
-
-def get_calibration_path() -> Path:
-    return CALIBRATION_FILE
-
-
-def get_log_directory() -> Path:
-    return LOG_DIR
-
-
-def get_roi() -> Tuple[int, int, int, int]:
-    """
-    Retorna o ROI oficial do sistema.
-
-    Este é o método recomendado pelos módulos.
-    """
-
-    return ROI.rectangle
-
-
-def get_roi_size() -> Tuple[int, int]:
-    """
-    Retorna:
-
-        (width, height)
-    """
-
-    return ROI.size
-
-
-def ensure_directories() -> None:
-
-    LOG_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    SCREENSHOT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    CALIBRATION_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-# ============================================================================
-# INITIAL VALIDATION
-# ============================================================================
-
-validate_config()
+__all__ = [
+    "PROJECT_ROOT",
+    "CALIBRATION_DIR",
+    "CALIBRATION_FILE",
+    "WEIGHTS_DIR",
+    "YOLOP_MODEL_PATH",
+    "LOG_DIR",
+    "SCREENSHOT_DIR",
+    "RuntimeMode",
+    "DEFAULT_RUNTIME_MODE",
+    "ROIConfig",
+    "ROI",
+    "CaptureConfig",
+    "CAPTURE",
+    "YOLOPConfig",
+    "YOLOP",
+    "LaneSelectorConfig",
+    "LANE_SELECTOR",
+    "LaneGeometryConfig",
+    "LANE_GEOMETRY",
+    "LaneModelConfig",
+    "LANE_MODEL",
+    "LaneTrackerConfig",
+    "LANE_TRACKER",
+    "LaneProjectionConfig",
+    "LANE_PROJECTION",
+    "LaneAssignmentConfig",
+    "LANE_ASSIGNMENT",
+    "ADASConfig",
+    "ADAS",
+    "TemporalFilterConfig",
+    "TEMPORAL_FILTER",
+    "SafetyConfig",
+    "SAFETY",
+    "LKAConfig",
+    "LKA",
+    "G29Config",
+    "G29",
+    "VisualizationConfig",
+    "VISUALIZATION",
+    "PerformanceConfig",
+    "PERFORMANCE",
+    "LoggingConfig",
+    "LOGGING",
+    "HotkeyConfig",
+    "HOTKEYS",
+    "DebugConfig",
+    "DEBUG",
+    "validate_config",
+]

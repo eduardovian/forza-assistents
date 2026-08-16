@@ -1,496 +1,782 @@
 """
+calibration/camera_calibration.py
+
 Forza Assistents
-Ferramenta de calibração visual da ROI.
+================
 
-A calibração:
-    - captura a tela inteira;
-    - permite selecionar/mover/redimensionar o ROI;
-    - utiliza exclusivamente o config.py como fonte de configuração;
-    - salva o ROI através do config.py;
-    - não contém parâmetros fixos de resolução.
+Ferramenta de calibração da câmera/tela.
 
-Execução:
+Responsabilidades
+-----------------
 
-    python -m calibration.camera_calibration
+Este módulo é responsável por:
 
-Controles:
+    1. Detectar a resolução da tela.
+    2. Permitir a seleção visual do ROI.
+    3. Validar o ROI selecionado.
+    4. Persistir a calibração em:
+           calibration/camera_calibration.json
+    5. Permitir que config.py carregue essa calibração.
 
-    W / ↑       mover para cima
-    S / ↓       mover para baixo
-    A / ←       mover para esquerda
-    D / →       mover para direita
+Arquitetura
+-----------
 
-    Q           diminuir largura
-    E           aumentar largura
+    Camera / Screen
+          │
+          ▼
+    CameraCalibration
+          │
+          ▼
+    camera_calibration.json
+          │
+          ▼
+       config.py
+          │
+          ▼
+        ROI
 
-    R           aumentar altura
-    F           diminuir altura
+PRINCÍPIO FUNDAMENTAL
+---------------------
 
-    + / =       movimento fino
-    -           movimento normal
+Este módulo é o DONO DA CALIBRAÇÃO.
 
-    ENTER       salvar ROI
-    ESC         sair sem salvar
+Ele não deve:
+
+    - definir ROI para outros módulos;
+    - importar ROI para uso operacional;
+    - alterar config.py;
+    - executar YOLOP;
+    - executar LaneGeometry;
+    - executar tracking;
+    - executar ADAS.
+
+Depois da calibração, todos os outros módulos utilizam:
+
+    from config import ROI
+
+O arquivo JSON é a fonte persistente da calibração.
+O config.py é a fonte de verdade em runtime.
+
+Segurança
+---------
+
+Uma calibração inválida nunca deve ser salva.
+
+A gravação é atômica para evitar corrupção do arquivo.
 """
 
 from __future__ import annotations
 
-import logging
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import time
+from typing import Final
 
 import cv2
+import numpy as np
 
-from config import (
-    CALIBRATION_FILE,
-    SCREEN_HEIGHT,
-    SCREEN_WIDTH,
-    ROI_LEFT,
-    ROI_TOP,
-    ROI_RIGHT,
-    ROI_BOTTOM,
-    save_calibration,
+
+# =============================================================================
+# PATHS
+# =============================================================================
+
+PROJECT_ROOT: Final[Path] = (
+    Path(__file__).resolve().parents[1]
 )
 
-from capture.screen_capture import ScreenCapture
-
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+CALIBRATION_DIR: Final[Path] = (
+    PROJECT_ROOT / "calibration"
 )
 
-logger = logging.getLogger("forza_assistents.calibration")
+CALIBRATION_FILE: Final[Path] = (
+    CALIBRATION_DIR / "camera_calibration.json"
+)
 
 
-# ============================================================================
-# CONSTANTS
-# ============================================================================
-
-WINDOW_NAME = "Forza Assistents - ROI Calibration"
-
-MIN_ROI_WIDTH = 160
-MIN_ROI_HEIGHT = 100
-
-NORMAL_STEP = 10
-FINE_STEP = 1
-
-CAPTURE_FPS = 30
+# =============================================================================
+# TYPES
+# =============================================================================
 
 
-# ============================================================================
-# HELPERS
-# ============================================================================
+@dataclass(frozen=True, slots=True)
+class ScreenGeometry:
+    """
+    Geometria da tela utilizada durante a calibração.
+    """
 
-def clamp_roi(
-    left: int,
-    top: int,
-    right: int,
-    bottom: int,
-) -> tuple[int, int, int, int]:
+    width: int
+    height: int
 
-    width = max(MIN_ROI_WIDTH, right - left)
-    height = max(MIN_ROI_HEIGHT, bottom - top)
+    def validate(self) -> None:
 
-    width = min(width, SCREEN_WIDTH)
-    height = min(height, SCREEN_HEIGHT)
+        if self.width <= 0:
+            raise ValueError(
+                "Largura da tela deve ser > 0."
+            )
 
-    left = max(0, min(left, SCREEN_WIDTH - width))
-    top = max(0, min(top, SCREEN_HEIGHT - height))
-
-    right = left + width
-    bottom = top + height
-
-    return left, top, right, bottom
+        if self.height <= 0:
+            raise ValueError(
+                "Altura da tela deve ser > 0."
+            )
 
 
-def draw_text(
-    image,
-    text: str,
-    position: tuple[int, int],
-    scale: float = 0.6,
-    thickness: int = 2,
-) -> None:
+@dataclass(frozen=True, slots=True)
+class CalibrationROI:
+    """
+    ROI produzido pelo processo de calibração.
 
-    cv2.putText(
-        image,
-        text,
-        position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        (0, 255, 0),
-        thickness,
-        cv2.LINE_AA,
+    Coordenadas absolutas da tela:
+
+        left
+        top
+        right
+        bottom
+    """
+
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
+
+    @property
+    def rectangle(
+        self,
+    ) -> tuple[int, int, int, int]:
+        return (
+            self.left,
+            self.top,
+            self.right,
+            self.bottom,
+        )
+
+    def validate(
+        self,
+        screen: ScreenGeometry,
+    ) -> None:
+        """
+        Valida o ROI contra a resolução da tela.
+        """
+
+        if self.left < 0:
+            raise ValueError(
+                "ROI.left não pode ser negativo."
+            )
+
+        if self.top < 0:
+            raise ValueError(
+                "ROI.top não pode ser negativo."
+            )
+
+        if self.right <= self.left:
+            raise ValueError(
+                "ROI.right deve ser maior que ROI.left."
+            )
+
+        if self.bottom <= self.top:
+            raise ValueError(
+                "ROI.bottom deve ser maior que ROI.top."
+            )
+
+        if self.right > screen.width:
+            raise ValueError(
+                "ROI excede a largura da tela."
+            )
+
+        if self.bottom > screen.height:
+            raise ValueError(
+                "ROI excede a altura da tela."
+            )
+
+        if self.width < 32:
+            raise ValueError(
+                "ROI muito estreito."
+            )
+
+        if self.height < 32:
+            raise ValueError(
+                "ROI muito baixo."
+            )
+
+
+# =============================================================================
+# CALIBRATION RESULT
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationResult:
+    """
+    Resultado completo de uma calibração.
+    """
+
+    screen: ScreenGeometry
+
+    roi: CalibrationROI
+
+    timestamp_utc: float
+
+    version: int = 1
+
+    coordinate_system: str = "screen_absolute"
+
+    source: str = "manual_gui"
+
+    def validate(self) -> None:
+
+        self.screen.validate()
+
+        self.roi.validate(
+            self.screen
+        )
+
+        if self.version <= 0:
+            raise ValueError(
+                "Versão de calibração inválida."
+            )
+
+        if not self.coordinate_system:
+            raise ValueError(
+                "Sistema de coordenadas ausente."
+            )
+
+
+# =============================================================================
+# CALIBRATION STORAGE
+# =============================================================================
+
+
+class CalibrationStorage:
+    """
+    Persistência da calibração.
+
+    A escrita é atômica:
+
+        temporary file
+              ↓
+        os.replace()
+              ↓
+        calibration.json
+    """
+
+    def __init__(
+        self,
+        path: Path = CALIBRATION_FILE,
+    ) -> None:
+
+        self.path = Path(path)
+
+    def save(
+        self,
+        result: CalibrationResult,
+    ) -> None:
+
+        result.validate()
+
+        self.path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        payload = {
+            "version": result.version,
+            "timestamp_utc": result.timestamp_utc,
+            "coordinate_system": (
+                result.coordinate_system
+            ),
+            "source": result.source,
+            "screen": {
+                "width": result.screen.width,
+                "height": result.screen.height,
+            },
+            "roi": {
+                "left": result.roi.left,
+                "top": result.roi.top,
+                "right": result.roi.right,
+                "bottom": result.roi.bottom,
+            },
+        }
+
+        temporary_path = self.path.with_suffix(
+            ".tmp"
+        )
+
+        with temporary_path.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                payload,
+                file,
+                indent=4,
+            )
+
+            file.write("\n")
+
+            file.flush()
+
+        temporary_path.replace(
+            self.path
+        )
+
+    def load(
+        self,
+    ) -> CalibrationResult:
+
+        if not self.path.exists():
+            raise FileNotFoundError(
+                "Calibração não encontrada: "
+                f"{self.path}"
+            )
+
+        try:
+
+            with self.path.open(
+                "r",
+                encoding="utf-8",
+            ) as file:
+
+                data = json.load(file)
+
+        except json.JSONDecodeError as exc:
+
+            raise RuntimeError(
+                "Arquivo de calibração corrompido."
+            ) from exc
+
+        try:
+
+            screen_data = data["screen"]
+            roi_data = data["roi"]
+
+            result = CalibrationResult(
+                version=int(
+                    data.get(
+                        "version",
+                        1,
+                    )
+                ),
+                timestamp_utc=float(
+                    data.get(
+                        "timestamp_utc",
+                        0.0,
+                    )
+                ),
+                coordinate_system=str(
+                    data.get(
+                        "coordinate_system",
+                        "screen_absolute",
+                    )
+                ),
+                source=str(
+                    data.get(
+                        "source",
+                        "unknown",
+                    )
+                ),
+                screen=ScreenGeometry(
+                    width=int(
+                        screen_data["width"]
+                    ),
+                    height=int(
+                        screen_data["height"]
+                    ),
+                ),
+                roi=CalibrationROI(
+                    left=int(
+                        roi_data["left"]
+                    ),
+                    top=int(
+                        roi_data["top"]
+                    ),
+                    right=int(
+                        roi_data["right"]
+                    ),
+                    bottom=int(
+                        roi_data["bottom"]
+                    ),
+                ),
+            )
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+
+            raise RuntimeError(
+                "Estrutura de calibração inválida."
+            ) from exc
+
+        result.validate()
+
+        return result
+
+
+# =============================================================================
+# CAMERA CALIBRATION
+# =============================================================================
+
+
+class CameraCalibration:
+    """
+    Interface de calibração visual.
+
+    Permite selecionar o ROI diretamente sobre um frame
+    da tela.
+    """
+
+    WINDOW_NAME: Final[str] = (
+        "Forza Assistents - Calibration"
     )
 
+    def __init__(
+        self,
+        storage: CalibrationStorage | None = None,
+    ) -> None:
 
-def draw_overlay(
-    frame,
-    left: int,
-    top: int,
-    right: int,
-    bottom: int,
-    step: int,
-):
-    display = frame.copy()
+        self.storage = (
+            storage
+            if storage is not None
+            else CalibrationStorage()
+        )
 
-    # ------------------------------------------------------------------
-    # ROI
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # SCREEN CAPTURE
+    # =========================================================================
 
-    cv2.rectangle(
-        display,
-        (left, top),
-        (right, bottom),
-        (0, 255, 0),
-        3,
-    )
+    @staticmethod
+    def capture_screen() -> np.ndarray:
+        """
+        Captura a tela atual.
 
-    # ------------------------------------------------------------------
-    # Centro do ROI
-    # ------------------------------------------------------------------
+        Usa DXCam quando disponível, com fallback para
+        ImageGrab.
 
-    center_x = (left + right) // 2
-    center_y = (top + bottom) // 2
+        Esta captura é utilizada SOMENTE durante a
+        calibração.
 
-    cv2.line(
-        display,
-        (center_x, top),
-        (center_x, bottom),
-        (0, 255, 255),
-        1,
-    )
+        O runtime do sistema utiliza screen_capture.py.
+        """
 
-    cv2.line(
-        display,
-        (left, center_y),
-        (right, center_y),
-        (0, 255, 255),
-        1,
-    )
+        try:
 
-    # ------------------------------------------------------------------
-    # Informações
-    # ------------------------------------------------------------------
+            import dxcam
 
-    roi_width = right - left
-    roi_height = bottom - top
+            camera = dxcam.create(
+                output_color="BGR"
+            )
 
-    texts = [
-        "FORZA ASSISTENTS - ROI CALIBRATION",
-        (
-            f"ROI: "
-            f"({left}, {top}) -> ({right}, {bottom})"
-        ),
-        f"SIZE: {roi_width} x {roi_height}",
-        f"SCREEN: {SCREEN_WIDTH} x {SCREEN_HEIGHT}",
-        f"STEP: {step}px",
-        "",
-        "W/S/A/D or ARROWS : MOVE",
-        "Q/E               : WIDTH",
-        "R/F               : HEIGHT",
-        "+/-               : FINE/NORMAL",
-        "ENTER             : SAVE",
-        "ESC               : EXIT",
-    ]
+            frame = camera.grab()
 
-    y = 30
+            camera.stop()
 
-    for index, text in enumerate(texts):
+            if frame is not None:
 
-        if not text:
-            y += 10
-            continue
+                return frame
 
-        scale = 0.65 if index == 0 else 0.55
+        except Exception:
+            pass
 
-        draw_text(
+        try:
+
+            from PIL import ImageGrab
+
+            image = ImageGrab.grab()
+
+            frame = np.asarray(
+                image
+            )
+
+            return cv2.cvtColor(
+                frame,
+                cv2.COLOR_RGB2BGR,
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Não foi possível capturar a tela "
+                "para calibração."
+            ) from exc
+
+    # =========================================================================
+    # SCREEN GEOMETRY
+    # =========================================================================
+
+    @staticmethod
+    def detect_screen_geometry(
+        frame: np.ndarray,
+    ) -> ScreenGeometry:
+
+        if frame is None:
+            raise ValueError(
+                "Frame de calibração é None."
+            )
+
+        if frame.ndim < 2:
+            raise ValueError(
+                "Frame de calibração inválido."
+            )
+
+        height, width = frame.shape[:2]
+
+        geometry = ScreenGeometry(
+            width=int(width),
+            height=int(height),
+        )
+
+        geometry.validate()
+
+        return geometry
+
+    # =========================================================================
+    # ROI SELECTION
+    # =========================================================================
+
+    def select_roi(
+        self,
+        frame: np.ndarray,
+    ) -> CalibrationROI:
+        """
+        Abre uma interface OpenCV para seleção manual do ROI.
+
+        O usuário deve selecionar:
+
+            canto superior esquerdo
+            →
+            canto inferior direito
+        """
+
+        if frame is None:
+            raise ValueError(
+                "Frame de calibração é None."
+            )
+
+        screen = self.detect_screen_geometry(
+            frame
+        )
+
+        display = frame.copy()
+
+        cv2.namedWindow(
+            self.WINDOW_NAME,
+            cv2.WINDOW_NORMAL,
+        )
+
+        cv2.resizeWindow(
+            self.WINDOW_NAME,
+            min(screen.width, 1600),
+            min(screen.height, 900),
+        )
+
+        cv2.imshow(
+            self.WINDOW_NAME,
             display,
-            text,
-            (15, y),
-            scale=scale,
-            thickness=2,
         )
 
-        y += 27
+        cv2.waitKey(1)
 
-    return display
-
-
-# ============================================================================
-# CALIBRATION
-# ============================================================================
-
-def main() -> None:
-
-    logger.info("=" * 60)
-    logger.info("FORZA ASSISTENTS - ROI CALIBRATION")
-    logger.info("=" * 60)
-
-    logger.info(
-        "Screen: %dx%d",
-        SCREEN_WIDTH,
-        SCREEN_HEIGHT,
-    )
-
-    logger.info(
-        "Initial ROI: (%d, %d) -> (%d, %d)",
-        ROI_LEFT,
-        ROI_TOP,
-        ROI_RIGHT,
-        ROI_BOTTOM,
-    )
-
-    # ------------------------------------------------------------------
-    # ROI inicial vindo EXCLUSIVAMENTE do config.py
-    # ------------------------------------------------------------------
-
-    left = ROI_LEFT
-    top = ROI_TOP
-    right = ROI_RIGHT
-    bottom = ROI_BOTTOM
-
-    left, top, right, bottom = clamp_roi(
-        left,
-        top,
-        right,
-        bottom,
-    )
-
-    # ------------------------------------------------------------------
-    # Captura da tela inteira
-    # ------------------------------------------------------------------
-
-    capture = ScreenCapture(
-        region=None,
-        target_fps=CAPTURE_FPS,
-        backend="dxgi",
-        output_color="BGR",
-    )
-
-    if not capture.initialize():
-
-        logger.error(
-            "Failed to initialize screen capture."
+        x, y, width, height = cv2.selectROI(
+            self.WINDOW_NAME,
+            display,
+            showCrosshair=True,
+            fromCenter=False,
         )
 
-        return
+        cv2.destroyWindow(
+            self.WINDOW_NAME
+        )
 
-    capture.start()
+        if width <= 0 or height <= 0:
+            raise RuntimeError(
+                "Nenhum ROI válido foi selecionado."
+            )
 
-    logger.info(
-        "Screen capture started."
+        roi = CalibrationROI(
+            left=int(x),
+            top=int(y),
+            right=int(
+                x + width
+            ),
+            bottom=int(
+                y + height
+            ),
+        )
+
+        roi.validate(
+            screen
+        )
+
+        return roi
+
+    # =========================================================================
+    # SAVE
+    # =========================================================================
+
+    def save(
+        self,
+        roi: CalibrationROI,
+        screen: ScreenGeometry,
+    ) -> CalibrationResult:
+
+        roi.validate(
+            screen
+        )
+
+        result = CalibrationResult(
+            screen=screen,
+            roi=roi,
+            timestamp_utc=time.time(),
+            version=1,
+            coordinate_system=(
+                "screen_absolute"
+            ),
+            source="manual_gui",
+        )
+
+        self.storage.save(
+            result
+        )
+
+        return result
+
+    # =========================================================================
+    # RUN
+    # =========================================================================
+
+    def run(
+        self,
+        frame: np.ndarray | None = None,
+    ) -> CalibrationResult:
+        """
+        Executa uma sessão completa de calibração.
+        """
+
+        if frame is None:
+            frame = self.capture_screen()
+
+        screen = self.detect_screen_geometry(
+            frame
+        )
+
+        roi = self.select_roi(
+            frame
+        )
+
+        result = self.save(
+            roi,
+            screen,
+        )
+
+        return result
+
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
+
+
+def validate_calibration(
+    path: Path = CALIBRATION_FILE,
+) -> CalibrationResult:
+    """
+    Valida uma calibração existente.
+    """
+
+    storage = CalibrationStorage(
+        path
     )
 
-    cv2.namedWindow(
-        WINDOW_NAME,
-        cv2.WINDOW_NORMAL,
+    return storage.load()
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+
+def main() -> int:
+    """
+    Executa o calibrador pela linha de comando.
+    """
+
+    print(
+        "Forza Assistents"
     )
 
-    cv2.resizeWindow(
-        WINDOW_NAME,
-        min(SCREEN_WIDTH, 1600),
-        min(SCREEN_HEIGHT, 900),
+    print(
+        "Camera Calibration"
     )
 
-    step = NORMAL_STEP
-
-    saved = False
+    print()
 
     try:
 
-        while True:
+        calibration = CameraCalibration()
 
-            frame = capture.get_latest_frame()
-
-            if frame is None:
-
-                cv2.waitKey(1)
-                continue
-
-            # ----------------------------------------------------------
-            # Garante que o ROI nunca saia da tela
-            # ----------------------------------------------------------
-
-            left, top, right, bottom = clamp_roi(
-                left,
-                top,
-                right,
-                bottom,
-            )
-
-            # ----------------------------------------------------------
-            # Desenha interface
-            # ----------------------------------------------------------
-
-            display = draw_overlay(
-                frame,
-                left,
-                top,
-                right,
-                bottom,
-                step,
-            )
-
-            cv2.imshow(
-                WINDOW_NAME,
-                display,
-            )
-
-            key = cv2.waitKey(1) & 0xFF
-
-            # ==========================================================
-            # EXIT
-            # ==========================================================
-
-            if key == 27:
-                logger.info(
-                    "Calibration cancelled."
-                )
-                break
-
-            # ==========================================================
-            # SAVE
-            # ==========================================================
-
-            if key in (13, 10):
-
-                data = {
-                    "left": int(left),
-                    "top": int(top),
-                    "right": int(right),
-                    "bottom": int(bottom),
-                }
-
-                save_calibration(data)
-
-                saved = True
-
-                logger.info(
-                    "ROI saved: %s",
-                    data,
-                )
-
-                logger.info(
-                    "Calibration file: %s",
-                    CALIBRATION_FILE,
-                )
-
-                break
-
-            # ==========================================================
-            # STEP
-            # ==========================================================
-
-            if key in (ord("+"), ord("=")):
-
-                step = FINE_STEP
-
-            elif key in (ord("-"), ord("_")):
-
-                step = NORMAL_STEP
-
-            # ==========================================================
-            # MOVE UP
-            # ==========================================================
-
-            elif key in (ord("w"), ord("W"), 82):
-
-                top -= step
-                bottom -= step
-
-            # ==========================================================
-            # MOVE DOWN
-            # ==========================================================
-
-            elif key in (ord("s"), ord("S"), 84):
-
-                top += step
-                bottom += step
-
-            # ==========================================================
-            # MOVE LEFT
-            # ==========================================================
-
-            elif key in (ord("a"), ord("A"), 81):
-
-                left -= step
-                right -= step
-
-            # ==========================================================
-            # MOVE RIGHT
-            # ==========================================================
-
-            elif key in (ord("d"), ord("D"), 83):
-
-                left += step
-                right += step
-
-            # ==========================================================
-            # WIDTH
-            # ==========================================================
-
-            elif key in (ord("q"), ord("Q")):
-
-                right -= step
-
-            elif key in (ord("e"), ord("E")):
-
-                right += step
-
-            # ==========================================================
-            # HEIGHT
-            # ==========================================================
-
-            elif key in (ord("r"), ord("R")):
-
-                bottom += step
-
-            elif key in (ord("f"), ord("F")):
-
-                bottom -= step
+        result = calibration.run()
 
     except KeyboardInterrupt:
 
-        logger.info(
-            "Calibration interrupted."
+        print(
+            "\nCalibração cancelada."
         )
 
-    finally:
+        return 130
 
-        capture.stop()
+    except Exception as exc:
 
-        cv2.destroyAllWindows()
-
-    # ------------------------------------------------------------------
-    # Result
-    # ------------------------------------------------------------------
-
-    if saved:
-
-        logger.info("=" * 60)
-        logger.info("ROI CALIBRATION SAVED")
-        logger.info(
-            "ROI = (%d, %d, %d, %d)",
-            left,
-            top,
-            right,
-            bottom,
-        )
-        logger.info("=" * 60)
-
-    else:
-
-        logger.info(
-            "ROI calibration finished without changes."
+        print(
+            f"\nERRO: {exc}"
         )
 
+        return 1
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
+    print()
+
+    print(
+        "Calibração concluída."
+    )
+
+    print(
+        f"Tela: "
+        f"{result.screen.width}x"
+        f"{result.screen.height}"
+    )
+
+    print(
+        "ROI:"
+        f" ({result.roi.left}, "
+        f"{result.roi.top}, "
+        f"{result.roi.right}, "
+        f"{result.roi.bottom})"
+    )
+
+    print(
+        f"Tamanho do ROI: "
+        f"{result.roi.width}x"
+        f"{result.roi.height}"
+    )
+
+    print(
+        f"Arquivo: "
+        f"{CALIBRATION_FILE}"
+    )
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        main()
+    )
