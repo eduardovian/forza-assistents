@@ -1043,7 +1043,7 @@ class ForzaAssistents:
             ):
 
                 geometry = self.geometry.compute(
-                    detection
+                    tracking
                 )
 
         except Exception:
