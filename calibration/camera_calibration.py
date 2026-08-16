@@ -1,174 +1,496 @@
 """
-Forza Horizon 6 ADAS/LKA - Ferramenta de Calibração da ROI
+Forza Assistents
+Ferramenta de calibração visual da ROI.
 
-Permite ajustar visualmente a região de interesse (ROI) usando
-a captura de tela em tempo real.
+A calibração:
+    - captura a tela inteira;
+    - permite selecionar/mover/redimensionar o ROI;
+    - utiliza exclusivamente o config.py como fonte de configuração;
+    - salva o ROI através do config.py;
+    - não contém parâmetros fixos de resolução.
 
-Uso:
+Execução:
+
     python -m calibration.camera_calibration
 
 Controles:
-    WASD / Setas: mover ROI
-    Q/E: ajustar largura
-    R/F: ajustar altura
-    +/-: ajustar fine
-    S: salvar
-    ESC: sair
+
+    W / ↑       mover para cima
+    S / ↓       mover para baixo
+    A / ←       mover para esquerda
+    D / →       mover para direita
+
+    Q           diminuir largura
+    E           aumentar largura
+
+    R           aumentar altura
+    F           diminuir altura
+
+    + / =       movimento fino
+    -           movimento normal
+
+    ENTER       salvar ROI
+    ESC         sair sem salvar
 """
-import sys
-import os
+
+from __future__ import annotations
+
 import logging
 
-# Adiciona o diretório pai ao path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import cv2
-import numpy as np
 
 from config import (
-    SCREEN_WIDTH, SCREEN_HEIGHT,
-    ROI_LEFT, ROI_TOP, ROI_RIGHT, ROI_BOTTOM,
-    save_calibration, CALIBRATION_FILE
+    CALIBRATION_FILE,
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
+    ROI_LEFT,
+    ROI_TOP,
+    ROI_RIGHT,
+    ROI_BOTTOM,
+    save_calibration,
 )
+
 from capture.screen_capture import ScreenCapture
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger("forza_assistents.calibration")
 
 
-def main():
-    logger.info("[CALIBRATION] Iniciando ferramenta de calibração da ROI")
-    logger.info("[CALIBRATION] Controles:")
-    logger.info("  WASD / Setas: mover ROI")
-    logger.info("  Q/E: ajustar largura")
-    logger.info("  R/F: ajustar altura")
-    logger.info("  +/-: ajuste fino")
-    logger.info("  S: salvar calibração")
-    logger.info("  ESC: sair sem salvar")
+# ============================================================================
+# CONSTANTS
+# ============================================================================
 
-    # Carrega calibração atual
+WINDOW_NAME = "Forza Assistents - ROI Calibration"
+
+MIN_ROI_WIDTH = 160
+MIN_ROI_HEIGHT = 100
+
+NORMAL_STEP = 10
+FINE_STEP = 1
+
+CAPTURE_FPS = 30
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def clamp_roi(
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+) -> tuple[int, int, int, int]:
+
+    width = max(MIN_ROI_WIDTH, right - left)
+    height = max(MIN_ROI_HEIGHT, bottom - top)
+
+    width = min(width, SCREEN_WIDTH)
+    height = min(height, SCREEN_HEIGHT)
+
+    left = max(0, min(left, SCREEN_WIDTH - width))
+    top = max(0, min(top, SCREEN_HEIGHT - height))
+
+    right = left + width
+    bottom = top + height
+
+    return left, top, right, bottom
+
+
+def draw_text(
+    image,
+    text: str,
+    position: tuple[int, int],
+    scale: float = 0.6,
+    thickness: int = 2,
+) -> None:
+
+    cv2.putText(
+        image,
+        text,
+        position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (0, 255, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def draw_overlay(
+    frame,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    step: int,
+):
+    display = frame.copy()
+
+    # ------------------------------------------------------------------
+    # ROI
+    # ------------------------------------------------------------------
+
+    cv2.rectangle(
+        display,
+        (left, top),
+        (right, bottom),
+        (0, 255, 0),
+        3,
+    )
+
+    # ------------------------------------------------------------------
+    # Centro do ROI
+    # ------------------------------------------------------------------
+
+    center_x = (left + right) // 2
+    center_y = (top + bottom) // 2
+
+    cv2.line(
+        display,
+        (center_x, top),
+        (center_x, bottom),
+        (0, 255, 255),
+        1,
+    )
+
+    cv2.line(
+        display,
+        (left, center_y),
+        (right, center_y),
+        (0, 255, 255),
+        1,
+    )
+
+    # ------------------------------------------------------------------
+    # Informações
+    # ------------------------------------------------------------------
+
+    roi_width = right - left
+    roi_height = bottom - top
+
+    texts = [
+        "FORZA ASSISTENTS - ROI CALIBRATION",
+        (
+            f"ROI: "
+            f"({left}, {top}) -> ({right}, {bottom})"
+        ),
+        f"SIZE: {roi_width} x {roi_height}",
+        f"SCREEN: {SCREEN_WIDTH} x {SCREEN_HEIGHT}",
+        f"STEP: {step}px",
+        "",
+        "W/S/A/D or ARROWS : MOVE",
+        "Q/E               : WIDTH",
+        "R/F               : HEIGHT",
+        "+/-               : FINE/NORMAL",
+        "ENTER             : SAVE",
+        "ESC               : EXIT",
+    ]
+
+    y = 30
+
+    for index, text in enumerate(texts):
+
+        if not text:
+            y += 10
+            continue
+
+        scale = 0.65 if index == 0 else 0.55
+
+        draw_text(
+            display,
+            text,
+            (15, y),
+            scale=scale,
+            thickness=2,
+        )
+
+        y += 27
+
+    return display
+
+
+# ============================================================================
+# CALIBRATION
+# ============================================================================
+
+def main() -> None:
+
+    logger.info("=" * 60)
+    logger.info("FORZA ASSISTENTS - ROI CALIBRATION")
+    logger.info("=" * 60)
+
+    logger.info(
+        "Screen: %dx%d",
+        SCREEN_WIDTH,
+        SCREEN_HEIGHT,
+    )
+
+    logger.info(
+        "Initial ROI: (%d, %d) -> (%d, %d)",
+        ROI_LEFT,
+        ROI_TOP,
+        ROI_RIGHT,
+        ROI_BOTTOM,
+    )
+
+    # ------------------------------------------------------------------
+    # ROI inicial vindo EXCLUSIVAMENTE do config.py
+    # ------------------------------------------------------------------
+
     left = ROI_LEFT
     top = ROI_TOP
     right = ROI_RIGHT
     bottom = ROI_BOTTOM
 
-    step = 10
-    fine_step = 1
+    left, top, right, bottom = clamp_roi(
+        left,
+        top,
+        right,
+        bottom,
+    )
 
-    # Inicializa captura
+    # ------------------------------------------------------------------
+    # Captura da tela inteira
+    # ------------------------------------------------------------------
+
     capture = ScreenCapture(
-        region=None,  # captura tela inteira
-        target_fps=30,
+        region=None,
+        target_fps=CAPTURE_FPS,
         backend="dxgi",
-        output_color="BGR"
+        output_color="BGR",
     )
 
     if not capture.initialize():
-        logger.error("[CALIBRATION] Falha ao inicializar captura")
+
+        logger.error(
+            "Failed to initialize screen capture."
+        )
+
         return
 
     capture.start()
 
-    window_name = "Forza ADAS - Calibração de ROI"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    logger.info(
+        "Screen capture started."
+    )
 
-    running = True
+    cv2.namedWindow(
+        WINDOW_NAME,
+        cv2.WINDOW_NORMAL,
+    )
+
+    cv2.resizeWindow(
+        WINDOW_NAME,
+        min(SCREEN_WIDTH, 1600),
+        min(SCREEN_HEIGHT, 900),
+    )
+
+    step = NORMAL_STEP
+
     saved = False
 
     try:
-        while running:
+
+        while True:
+
             frame = capture.get_latest_frame()
+
             if frame is None:
+
                 cv2.waitKey(1)
                 continue
 
-            # Desenha ROI no frame
-            display = frame.copy()
-            cv2.rectangle(display, (left, top), (right, bottom), (0, 255, 0), 3)
+            # ----------------------------------------------------------
+            # Garante que o ROI nunca saia da tela
+            # ----------------------------------------------------------
 
-            # Info
-            info_texts = [
-                f"ROI: left={left}, top={top}, right={right}, bottom={bottom}",
-                f"Tamanho: {right-left}x{bottom-top}",
-                "WASD/Setas: mover | Q/E: largura | R/F: altura",
-                "+/-: fine | S: salvar | ESC: sair"
-            ]
-            for i, text in enumerate(info_texts):
-                cv2.putText(
-                    display, text,
-                    (10, 30 + i * 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 0), 2
+            left, top, right, bottom = clamp_roi(
+                left,
+                top,
+                right,
+                bottom,
+            )
+
+            # ----------------------------------------------------------
+            # Desenha interface
+            # ----------------------------------------------------------
+
+            display = draw_overlay(
+                frame,
+                left,
+                top,
+                right,
+                bottom,
+                step,
+            )
+
+            cv2.imshow(
+                WINDOW_NAME,
+                display,
+            )
+
+            key = cv2.waitKey(1) & 0xFF
+
+            # ==========================================================
+            # EXIT
+            # ==========================================================
+
+            if key == 27:
+                logger.info(
+                    "Calibration cancelled."
                 )
+                break
 
-            # Preview da ROI
-            roi_preview = display[top:bottom, left:right]
-            if roi_preview.size > 0:
-                preview_h = 200
-                preview_w = int(preview_h * (right - left) / (bottom - top))
-                roi_preview = cv2.resize(roi_preview, (preview_w, preview_h))
-                # Coloca preview no canto superior direito
-                ph, pw = roi_preview.shape[:2]
-                display[10:10+ph, display.shape[1]-pw-10:display.shape[1]-10] = roi_preview
-                cv2.rectangle(
-                    display,
-                    (display.shape[1]-pw-10, 10),
-                    (display.shape[1]-10, 10+ph),
-                    (255, 255, 0), 2
-                )
+            # ==========================================================
+            # SAVE
+            # ==========================================================
 
-            cv2.imshow(window_name, display)
+            if key in (13, 10):
 
-            key = cv2.waitKey(30) & 0xFF
-
-            if key == 27:  # ESC
-                running = False
-            elif key == ord('s') or key == ord('S'):
                 data = {
-                    "left": left,
-                    "top": top,
-                    "right": right,
-                    "bottom": bottom
+                    "left": int(left),
+                    "top": int(top),
+                    "right": int(right),
+                    "bottom": int(bottom),
                 }
+
                 save_calibration(data)
+
                 saved = True
-                logger.info(f"[CALIBRATION] Salvo em {CALIBRATION_FILE}")
-            elif key == ord('w') or key == 82:  # W / Seta cima
-                top = max(0, top - step)
-                bottom = max(top + 100, bottom - step)
-            elif key == ord('s') or key == 84:  # S / Seta baixo
-                top = min(SCREEN_HEIGHT - 100, top + step)
-                bottom = min(SCREEN_HEIGHT, bottom + step)
-            elif key == ord('a') or key == 81:  # A / Seta esquerda
-                left = max(0, left - step)
-                right = max(left + 100, right - step)
-            elif key == ord('d') or key == 83:  # D / Seta direita
-                left = min(SCREEN_WIDTH - 100, left + step)
-                right = min(SCREEN_WIDTH, right + step)
-            elif key == ord('q'):  # Q: diminuir largura
-                right = max(left + 100, right - step)
-            elif key == ord('e'):  # E: aumentar largura
-                right = min(SCREEN_WIDTH, right + step)
-            elif key == ord('r'):  # R: aumentar altura
-                bottom = min(SCREEN_HEIGHT, bottom + step)
-            elif key == ord('f'):  # F: diminuir altura
-                bottom = max(top + 100, bottom - step)
-            elif key == ord('+') or key == ord('='):  # +: fine step
-                step = fine_step
-            elif key == ord('-') or key == ord('_'):  # -: coarse step
-                step = 10
+
+                logger.info(
+                    "ROI saved: %s",
+                    data,
+                )
+
+                logger.info(
+                    "Calibration file: %s",
+                    CALIBRATION_FILE,
+                )
+
+                break
+
+            # ==========================================================
+            # STEP
+            # ==========================================================
+
+            if key in (ord("+"), ord("=")):
+
+                step = FINE_STEP
+
+            elif key in (ord("-"), ord("_")):
+
+                step = NORMAL_STEP
+
+            # ==========================================================
+            # MOVE UP
+            # ==========================================================
+
+            elif key in (ord("w"), ord("W"), 82):
+
+                top -= step
+                bottom -= step
+
+            # ==========================================================
+            # MOVE DOWN
+            # ==========================================================
+
+            elif key in (ord("s"), ord("S"), 84):
+
+                top += step
+                bottom += step
+
+            # ==========================================================
+            # MOVE LEFT
+            # ==========================================================
+
+            elif key in (ord("a"), ord("A"), 81):
+
+                left -= step
+                right -= step
+
+            # ==========================================================
+            # MOVE RIGHT
+            # ==========================================================
+
+            elif key in (ord("d"), ord("D"), 83):
+
+                left += step
+                right += step
+
+            # ==========================================================
+            # WIDTH
+            # ==========================================================
+
+            elif key in (ord("q"), ord("Q")):
+
+                right -= step
+
+            elif key in (ord("e"), ord("E")):
+
+                right += step
+
+            # ==========================================================
+            # HEIGHT
+            # ==========================================================
+
+            elif key in (ord("r"), ord("R")):
+
+                bottom += step
+
+            elif key in (ord("f"), ord("F")):
+
+                bottom -= step
 
     except KeyboardInterrupt:
-        pass
+
+        logger.info(
+            "Calibration interrupted."
+        )
+
     finally:
+
         capture.stop()
+
         cv2.destroyAllWindows()
 
-    if saved:
-        logger.info(f"[CALIBRATION] Calibração salva com sucesso em {CALIBRATION_FILE}")
-    else:
-        logger.info("[CALIBRATION] Saindo sem salvar")
+    # ------------------------------------------------------------------
+    # Result
+    # ------------------------------------------------------------------
 
+    if saved:
+
+        logger.info("=" * 60)
+        logger.info("ROI CALIBRATION SAVED")
+        logger.info(
+            "ROI = (%d, %d, %d, %d)",
+            left,
+            top,
+            right,
+            bottom,
+        )
+        logger.info("=" * 60)
+
+    else:
+
+        logger.info(
+            "ROI calibration finished without changes."
+        )
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
     main()
