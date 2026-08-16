@@ -62,9 +62,19 @@ WEIGHTS_DIR: Final[Path] = (
 )
 
 YOLOP_MODEL_PATH: Final[Path] = (
-    
-    WEIGHTS_DIR / "yolopv2.pt"
-    
+    WEIGHTS_DIR / "yolopv2_local.pt"
+)
+YOLOP_MODEL_PATH: Final[Path] = (
+    WEIGHTS_DIR / "yolopv2_local.pt"
+)
+YOLOP_MODEL_PATH: Final[Path] = (
+    WEIGHTS_DIR / "yolopv2_local.pt"
+)
+YOLOP_MODEL_PATH: Final[Path] = (
+    WEIGHTS_DIR / "yolopv2_local.pt"
+)
+YOLOP_MODEL_PATH: Final[Path] = (
+    WEIGHTS_DIR / "yolopv2_local.pt"
 )
 
 LOG_DIR: Final[Path] = (
