@@ -1,610 +1,437 @@
 """
 capture/screen_capture.py
 
-Captura de tela do Forza Assistents.
+Forza Assistents
+================
 
-Responsabilidades:
-- capturar a tela;
-- aplicar exclusivamente a região recebida pelo chamador;
-- manter captura assíncrona;
-- fornecer o frame mais recente;
-- não possuir configuração própria de ROI;
-- não conter lógica de visão.
+Camada de captura de tela de baixa latência.
 
-O ROI deve vir exclusivamente do config.py.
+Responsabilidades
+-----------------
+- Capturar frames da tela.
+- Utilizar DXGI/DXCam quando disponível.
+- Aplicar exclusivamente o ROI definido em config.py.
+- Garantir que todos os frames tenham formato consistente.
+- Fornecer timestamp monotônico e métricas básicas.
+- Detectar perda de frames.
+- Encerrar o backend de forma segura.
 
-Fluxo:
+Arquitetura
+-----------
 
-    config.py
-        ↓
-    main.py
-        ↓
-    ScreenCapture(region=...)
-        ↓
-    frame
+    Screen
+      │
+      ▼
+    DXGI / DXCam
+      │
+      ▼
+    Full Frame
+      │
+      ▼
+    config.ROI
+      │
+      ▼
+    ROI Frame
+      │
+      ▼
+    Vision Pipeline
+
+PRINCÍPIO
+---------
+
+ROI NÃO é configurado neste módulo.
+
+A única fonte é:
+
+    from config import ROI
+
+Nenhum outro módulo deve possuir coordenadas duplicadas de ROI.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
-import threading
 import time
-from typing import Optional, Tuple
+from typing import Final
 
 import numpy as np
 
-try:
-    import dxcam
-except ImportError:
-    dxcam = None
+from config import CAPTURE, ROI
 
 
-LOGGER = logging.getLogger("forza_assistents.capture")
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+LOGGER = logging.getLogger(
+    __name__
+)
 
 
-# ============================================================================
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+NANOSECONDS_PER_SECOND: Final[int] = 1_000_000_000
+
+MIN_FRAME_DIMENSION: Final[int] = 32
+
+
+# =============================================================================
 # TYPES
-# ============================================================================
-
-ROI = Tuple[int, int, int, int]
+# =============================================================================
 
 
-# ============================================================================
+@dataclass(frozen=True, slots=True)
+class FramePacket:
+    """
+    Frame capturado pelo sistema.
+
+    O frame retornado já está no sistema de coordenadas
+    do ROI.
+
+    Attributes
+    ----------
+    frame:
+        Imagem BGR/RGB conforme config.CAPTURE.
+
+    timestamp_ns:
+        Timestamp monotônico de aquisição.
+
+    sequence:
+        Número sequencial do frame.
+
+    source_width:
+        Largura do frame original.
+
+    source_height:
+        Altura do frame original.
+
+    roi_applied:
+        Indica se o ROI foi aplicado.
+
+    capture_latency_ns:
+        Tempo gasto para obter o frame.
+    """
+
+    frame: np.ndarray
+
+    timestamp_ns: int
+
+    sequence: int
+
+    source_width: int
+
+    source_height: int
+
+    roi_applied: bool
+
+    capture_latency_ns: int
+
+    @property
+    def width(self) -> int:
+        return int(
+            self.frame.shape[1]
+        )
+
+    @property
+    def height(self) -> int:
+        return int(
+            self.frame.shape[0]
+        )
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.frame.shape
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureMetrics:
+    """
+    Métricas acumuladas da captura.
+    """
+
+    frames_captured: int
+
+    frames_dropped: int
+
+    consecutive_failures: int
+
+    elapsed_seconds: float
+
+    effective_fps: float
+
+    average_latency_ms: float
+
+    last_frame_timestamp_ns: int
+
+
+# =============================================================================
+# BACKEND
+# =============================================================================
+
+
+class _DXCamBackend:
+    """
+    Backend DXCam encapsulado.
+
+    A implementação concreta de DXCam fica isolada desta classe
+    para que o restante do sistema não dependa diretamente
+    da API da biblioteca.
+    """
+
+    def __init__(
+        self,
+        monitor_index: int,
+    ) -> None:
+
+        try:
+            import dxcam
+        except ImportError as exc:
+
+            raise RuntimeError(
+                "DXCam não está instalado."
+            ) from exc
+
+        self._camera = dxcam.create(
+            output_idx=monitor_index,
+            output_color=CAPTURE.output_color_format,
+        )
+
+        if self._camera is None:
+
+            raise RuntimeError(
+                "DXCam não conseguiu criar "
+                "o dispositivo de captura."
+            )
+
+        self._started = False
+
+    def start(
+        self,
+        target_fps: int,
+    ) -> None:
+
+        if self._started:
+            return
+
+        self._camera.start(
+            target_fps=target_fps,
+            video_mode=False,
+        )
+
+        self._started = True
+
+    def grab(self) -> np.ndarray | None:
+
+        if not self._started:
+
+            raise RuntimeError(
+                "Backend DXCam não foi iniciado."
+            )
+
+        frame = self._camera.get_latest_frame()
+
+        if frame is None:
+            return None
+
+        return frame
+
+    def stop(self) -> None:
+
+        if not self._started:
+            return
+
+        try:
+            self._camera.stop()
+        finally:
+            self._started = False
+
+
+# =============================================================================
 # SCREEN CAPTURE
-# ============================================================================
+# =============================================================================
+
 
 class ScreenCapture:
     """
-    Capturador assíncrono de tela.
+    Capturador principal do Forza Assistents.
 
-    O ROI é recebido externamente.
+    Características
+    ---------------
 
-    Não existe ROI padrão neste módulo.
+    - baixa latência;
+    - backend DXGI/DXCam;
+    - ROI centralizado em config.py;
+    - sem cópias desnecessárias;
+    - métricas temporais;
+    - detecção de falhas;
+    - shutdown seguro.
 
-    Parameters
-    ----------
-    region:
-        Região da tela no formato:
+    Exemplo
+    -------
 
-            (left, top, right, bottom)
+        capture = ScreenCapture()
 
-        None significa tela inteira.
+        capture.start()
 
-    target_fps:
-        Frequência desejada da captura.
+        packet = capture.read()
 
-    backend:
-        Backend de captura. Atualmente DXCam.
+        if packet is not None:
+            frame = packet.frame
 
-    output_color:
-        Formato de saída. DXCam fornece BGR.
-
-    max_buffer_size:
-        Número máximo de frames mantidos internamente.
+        capture.stop()
     """
 
     def __init__(
         self,
         *,
-        region: Optional[ROI] = None,
-        target_fps: int = 60,
-        backend: str = "dxcam",
-        output_color: str = "BGR",
-        max_buffer_size: int = 2,
+        monitor_index: int | None = None,
     ) -> None:
 
-        self.region = self._normalize_region(region)
-
-        self.target_fps = max(
-            1,
-            int(target_fps),
+        self._monitor_index = (
+            CAPTURE.monitor_index
+            if monitor_index is None
+            else monitor_index
         )
 
-        self.backend = backend.lower().strip()
+        self._backend: _DXCamBackend | None = None
 
-        self.output_color = (
-            output_color.upper().strip()
-        )
+        self._started = False
 
-        self.max_buffer_size = max(
-            1,
-            int(max_buffer_size),
-        )
+        self._sequence = 0
 
-        self._camera = None
+        self._frames_captured = 0
 
-        self._running = False
-        self._initialized = False
+        self._frames_dropped = 0
 
-        self._thread: Optional[
-            threading.Thread
-        ] = None
+        self._consecutive_failures = 0
 
-        self._lock = threading.Lock()
+        self._total_latency_ns = 0
 
-        self._latest_frame: Optional[
-            np.ndarray
-        ] = None
+        self._start_time_ns: int | None = None
 
-        self._frame_counter = 0
+        self._last_frame_timestamp_ns = 0
 
-        self._last_capture_time = 0.0
+        self._last_source_shape: (
+            tuple[int, int] | None
+        ) = None
 
-        self._capture_fps = 0.0
+        self._validate_configuration()
 
-        self._last_error: Optional[str] = None
-
-    # ========================================================================
-    # ROI
-    # ========================================================================
+    # =========================================================================
+    # VALIDATION
+    # =========================================================================
 
     @staticmethod
-    def _normalize_region(
-        region: Optional[ROI],
-    ) -> Optional[ROI]:
+    def _validate_configuration() -> None:
+        """
+        Valida a configuração antes de inicializar o backend.
+        """
 
-        if region is None:
-            return None
+        CAPTURE.validate()
 
-        if len(region) != 4:
-            raise ValueError(
-                "ROI must contain exactly "
-                "(left, top, right, bottom)."
+        if not ROI.enabled:
+
+            raise RuntimeError(
+                "ROI não calibrado. "
+                "Execute calibration/camera_calibration.py "
+                "antes de iniciar o sistema."
             )
 
-        left, top, right, bottom = map(
-            int,
-            region,
-        )
+        ROI.validate()
 
-        if left < 0 or top < 0:
-            raise ValueError(
-                f"ROI coordinates cannot be negative: "
-                f"{region}"
+        if ROI.width < MIN_FRAME_DIMENSION:
+
+            raise RuntimeError(
+                "ROI possui largura inválida."
             )
 
-        if right <= left:
-            raise ValueError(
-                f"ROI right must be greater than left: "
-                f"{region}"
+        if ROI.height < MIN_FRAME_DIMENSION:
+
+            raise RuntimeError(
+                "ROI possui altura inválida."
             )
 
-        if bottom <= top:
-            raise ValueError(
-                f"ROI bottom must be greater than top: "
-                f"{region}"
-            )
+    # =========================================================================
+    # LIFECYCLE
+    # =========================================================================
 
-        return (
-            left,
-            top,
-            right,
-            bottom,
-        )
-
-    # ========================================================================
-    # INITIALIZE
-    # ========================================================================
-
-    def initialize(self) -> bool:
+    def start(self) -> None:
         """
         Inicializa o backend de captura.
-
-        Returns
-        -------
-        bool
-            True quando inicializado corretamente.
         """
 
-        if self._initialized:
-            return True
-
-        if self.backend != "dxcam":
-            self._last_error = (
-                f"Unsupported capture backend: "
-                f"{self.backend}"
-            )
-
-            LOGGER.error(
-                self._last_error
-            )
-
-            return False
-
-        if dxcam is None:
-            self._last_error = (
-                "DXCam is not installed."
-            )
-
-            LOGGER.error(
-                self._last_error
-            )
-
-            return False
-
-        try:
-
-            self._camera = dxcam.create(
-                output_color="BGR",
-            )
-
-            if self._camera is None:
-                raise RuntimeError(
-                    "dxcam.create() returned None."
-                )
-
-            self._initialized = True
-
-            if self.region is None:
-
-                LOGGER.info(
-                    "ScreenCapture: READY | "
-                    "ROI=FULL SCREEN | "
-                    "FPS=%d",
-                    self.target_fps,
-                )
-
-            else:
-
-                left, top, right, bottom = (
-                    self.region
-                )
-
-                LOGGER.info(
-                    "ScreenCapture: READY | "
-                    "ROI=(%d,%d,%d,%d) | "
-                    "SIZE=%dx%d | FPS=%d",
-                    left,
-                    top,
-                    right,
-                    bottom,
-                    right - left,
-                    bottom - top,
-                    self.target_fps,
-                )
-
-            return True
-
-        except Exception as exc:
-
-            self._last_error = str(exc)
-
-            LOGGER.exception(
-                "Failed to initialize ScreenCapture."
-            )
-
-            self._camera = None
-            self._initialized = False
-
-            return False
-
-    # ========================================================================
-    # START
-    # ========================================================================
-
-    def start(self) -> bool:
-        """
-        Inicia a captura assíncrona.
-        """
-
-        if not self._initialized:
-
-            if not self.initialize():
-                return False
-
-        if self._running:
-            return True
-
-        if self._camera is None:
-            self._last_error = (
-                "Capture backend is not initialized."
-            )
-            return False
-
-        try:
-
-            self._running = True
-
-            self._thread = threading.Thread(
-                target=self._capture_loop,
-                name="ForzaAssistents-Capture",
-                daemon=True,
-            )
-
-            self._thread.start()
-
-            LOGGER.info(
-                "ScreenCapture: STARTED"
-            )
-
-            return True
-
-        except Exception as exc:
-
-            self._last_error = str(exc)
-
-            self._running = False
-
-            LOGGER.exception(
-                "Failed to start ScreenCapture."
-            )
-
-            return False
-
-    # ========================================================================
-    # CAPTURE LOOP
-    # ========================================================================
-
-    def _capture_loop(self) -> None:
-        """
-        Loop interno de captura.
-
-        O DXCam recebe diretamente a região configurada.
-        """
-
-        if self._camera is None:
+        if self._started:
             return
 
-        frame_interval = (
-            1.0 / self.target_fps
+        self._validate_configuration()
+
+        backend = _DXCamBackend(
+            self._monitor_index
         )
 
-        last_time = time.perf_counter()
-
-        try:
-
-            self._camera.start(
-                region=self.region,
-                target_fps=self.target_fps,
-                video_mode=True,
-            )
-
-            while self._running:
-
-                frame = (
-                    self._camera.get_latest_frame()
-                )
-
-                if frame is None:
-
-                    time.sleep(0.001)
-                    continue
-
-                now = time.perf_counter()
-
-                elapsed = (
-                    now - last_time
-                )
-
-                last_time = now
-
-                if elapsed > 0.0:
-
-                    instant_fps = (
-                        1.0 / elapsed
-                    )
-
-                    if self._capture_fps <= 0.0:
-
-                        self._capture_fps = (
-                            instant_fps
-                        )
-
-                    else:
-
-                        self._capture_fps = (
-                            self._capture_fps * 0.9
-                            + instant_fps * 0.1
-                        )
-
-                with self._lock:
-
-                    self._latest_frame = frame
-                    self._frame_counter += 1
-
-                remaining = (
-                    frame_interval
-                    - (
-                        time.perf_counter()
-                        - now
-                    )
-                )
-
-                if remaining > 0.0:
-
-                    time.sleep(
-                        min(
-                            remaining,
-                            0.002,
-                        )
-                    )
-
-        except Exception as exc:
-
-            self._last_error = str(exc)
-
-            LOGGER.exception(
-                "ScreenCapture loop failed."
-            )
-
-        finally:
-
-            try:
-                self._camera.stop()
-            except Exception:
-                pass
-
-    # ========================================================================
-    # FRAME
-    # ========================================================================
-
-    def get_latest_frame(
-        self,
-    ) -> Optional[np.ndarray]:
-        """
-        Retorna o frame mais recente.
-
-        O frame pertence à captura atual.
-        """
-
-        with self._lock:
-
-            if self._latest_frame is None:
-                return None
-
-            return self._latest_frame
-
-    # ========================================================================
-    # COPY FRAME
-    # ========================================================================
-
-    def get_latest_frame_copy(
-        self,
-    ) -> Optional[np.ndarray]:
-        """
-        Retorna uma cópia independente do frame.
-        """
-
-        with self._lock:
-
-            if self._latest_frame is None:
-                return None
-
-            return self._latest_frame.copy()
-
-    # ========================================================================
-    # STATUS
-    # ========================================================================
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-    @property
-    def is_initialized(self) -> bool:
-        return self._initialized
-
-    @property
-    def frame_count(self) -> int:
-        return self._frame_counter
-
-    @property
-    def capture_fps(self) -> float:
-        return self._capture_fps
-
-    @property
-    def last_error(self) -> Optional[str]:
-        return self._last_error
-
-    @property
-    def frame_size(
-        self,
-    ) -> Optional[Tuple[int, int]]:
-
-        frame = self.get_latest_frame()
-
-        if frame is None:
-            return None
-
-        height, width = frame.shape[:2]
-
-        return (
-            width,
-            height,
+        backend.start(
+            CAPTURE.target_fps
         )
 
-    # ========================================================================
-    # ROI INFORMATION
-    # ========================================================================
+        self._backend = backend
 
-    @property
-    def roi(self) -> Optional[ROI]:
-        return self.region
+        self._started = True
 
-    @property
-    def roi_size(
-        self,
-    ) -> Optional[Tuple[int, int]]:
-
-        if self.region is None:
-            return None
-
-        left, top, right, bottom = (
-            self.region
+        self._start_time_ns = (
+            time.monotonic_ns()
         )
 
-        return (
-            right - left,
-            bottom - top,
-        )
+        self._sequence = 0
 
-    # ========================================================================
-    # STOP
-    # ========================================================================
+        self._frames_captured = 0
+
+        self._frames_dropped = 0
+
+        self._consecutive_failures = 0
+
+        self._total_latency_ns = 0
+
+        self._last_frame_timestamp_ns = 0
+
+        LOGGER.info(
+            "ScreenCapture iniciado: "
+            "monitor=%d fps=%d ROI=%s",
+            self._monitor_index,
+            CAPTURE.target_fps,
+            ROI.rectangle,
+        )
 
     def stop(self) -> None:
         """
-        Para a captura de forma segura.
+        Encerra o backend de forma segura.
         """
 
-        if not self._running:
-            return
+        backend = self._backend
 
-        self._running = False
+        self._backend = None
 
-        if self._thread is not None:
+        self._started = False
 
-            self._thread.join(
-                timeout=2.0
-            )
+        if backend is not None:
 
-            self._thread = None
+            try:
+                backend.stop()
 
-        try:
+            except Exception:
 
-            if self._camera is not None:
-                self._camera.stop()
-
-        except Exception:
-            pass
+                LOGGER.exception(
+                    "Erro ao encerrar backend "
+                    "de captura."
+                )
 
         LOGGER.info(
-            "ScreenCapture: STOPPED"
+            "ScreenCapture encerrado."
         )
 
-    # ========================================================================
-    # RELEASE
-    # ========================================================================
-
-    def release(self) -> None:
-        """
-        Libera completamente o backend.
-        """
-
-        self.stop()
-
-        self._camera = None
-        self._initialized = False
-
-        with self._lock:
-
-            self._latest_frame = None
-
-        LOGGER.info(
-            "ScreenCapture: RELEASED"
-        )
-
-    # ========================================================================
-    # CONTEXT MANAGER
-    # ========================================================================
-
-    def __enter__(self) -> "ScreenCapture":
-
-        if not self.initialize():
-            raise RuntimeError(
-                self._last_error
-                or "Failed to initialize capture."
-            )
+    def __enter__(self) -> ScreenCapture:
 
         self.start()
 
@@ -617,4 +444,427 @@ class ScreenCapture:
         traceback,
     ) -> None:
 
-        self.release()
+        self.stop()
+
+    # =========================================================================
+    # CAPTURE
+    # =========================================================================
+
+    def read(
+        self,
+    ) -> FramePacket | None:
+        """
+        Captura o frame mais recente.
+
+        Returns
+        -------
+        FramePacket | None
+
+            Frame válido ou None quando não há frame novo.
+
+        Notes
+        -----
+
+        Não reutilizamos silenciosamente o frame anterior.
+        Um frame antigo não deve ser tratado como observação
+        atual pelo pipeline temporal.
+        """
+
+        if not self._started:
+
+            raise RuntimeError(
+                "ScreenCapture não foi iniciado."
+            )
+
+        if self._backend is None:
+
+            raise RuntimeError(
+                "Backend de captura indisponível."
+            )
+
+        capture_start_ns = (
+            time.monotonic_ns()
+        )
+
+        frame = self._backend.grab()
+
+        capture_end_ns = (
+            time.monotonic_ns()
+        )
+
+        latency_ns = (
+            capture_end_ns
+            - capture_start_ns
+        )
+
+        if frame is None:
+
+            self._frames_dropped += 1
+
+            self._consecutive_failures += 1
+
+            return None
+
+        self._consecutive_failures = 0
+
+        self._validate_frame(
+            frame
+        )
+
+        source_height, source_width = (
+            frame.shape[:2]
+        )
+
+        self._last_source_shape = (
+            source_width,
+            source_height,
+        )
+
+        cropped = self._apply_roi(
+            frame
+        )
+
+        if CAPTURE.copy_frame:
+
+            cropped = cropped.copy()
+
+        timestamp_ns = (
+            capture_end_ns
+        )
+
+        sequence = (
+            self._sequence
+        )
+
+        self._sequence += 1
+
+        self._frames_captured += 1
+
+        self._total_latency_ns += (
+            latency_ns
+        )
+
+        self._last_frame_timestamp_ns = (
+            timestamp_ns
+        )
+
+        return FramePacket(
+            frame=cropped,
+            timestamp_ns=timestamp_ns,
+            sequence=sequence,
+            source_width=source_width,
+            source_height=source_height,
+            roi_applied=True,
+            capture_latency_ns=latency_ns,
+        )
+
+    # =========================================================================
+    # ROI
+    # =========================================================================
+
+    @staticmethod
+    def _apply_roi(
+        frame: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Aplica exclusivamente config.ROI.
+
+        O ROI é definido em coordenadas absolutas da tela.
+
+        O frame retornado passa a utilizar coordenadas locais:
+
+            (0, 0)
+                │
+                └── canto superior esquerdo do ROI
+        """
+
+        left = ROI.left
+        top = ROI.top
+        right = ROI.right
+        bottom = ROI.bottom
+
+        frame_height, frame_width = (
+            frame.shape[:2]
+        )
+
+        if right > frame_width:
+
+            raise RuntimeError(
+                "ROI excede a largura real "
+                "do frame capturado: "
+                f"ROI.right={right}, "
+                f"frame_width={frame_width}."
+            )
+
+        if bottom > frame_height:
+
+            raise RuntimeError(
+                "ROI excede a altura real "
+                "do frame capturado: "
+                f"ROI.bottom={bottom}, "
+                f"frame_height={frame_height}."
+            )
+
+        cropped = frame[
+            top:bottom,
+            left:right,
+        ]
+
+        if cropped.size == 0:
+
+            raise RuntimeError(
+                "ROI produziu um frame vazio."
+            )
+
+        return cropped
+
+    # =========================================================================
+    # FRAME VALIDATION
+    # =========================================================================
+
+    @staticmethod
+    def _validate_frame(
+        frame: np.ndarray,
+    ) -> None:
+
+        if not isinstance(
+            frame,
+            np.ndarray,
+        ):
+
+            raise TypeError(
+                "Backend retornou um objeto "
+                "que não é numpy.ndarray."
+            )
+
+        if frame.ndim != 3:
+
+            raise ValueError(
+                "Frame deve possuir dimensão "
+                "(height, width, channels)."
+            )
+
+        if frame.shape[2] != 3:
+
+            raise ValueError(
+                "Frame deve possuir 3 canais."
+            )
+
+        if frame.shape[0] < MIN_FRAME_DIMENSION:
+
+            raise ValueError(
+                "Frame possui altura inválida."
+            )
+
+        if frame.shape[1] < MIN_FRAME_DIMENSION:
+
+            raise ValueError(
+                "Frame possui largura inválida."
+            )
+
+        if frame.dtype != np.uint8:
+
+            raise ValueError(
+                "Frame deve utilizar dtype uint8."
+            )
+
+    # =========================================================================
+    # METRICS
+    # =========================================================================
+
+    def metrics(
+        self,
+    ) -> CaptureMetrics:
+
+        if (
+            self._start_time_ns is None
+        ):
+
+            elapsed_seconds = 0.0
+
+        else:
+
+            elapsed_seconds = (
+                time.monotonic_ns()
+                - self._start_time_ns
+            ) / NANOSECONDS_PER_SECOND
+
+        if elapsed_seconds > 0:
+
+            fps = (
+                self._frames_captured
+                / elapsed_seconds
+            )
+
+        else:
+
+            fps = 0.0
+
+        if self._frames_captured > 0:
+
+            average_latency_ms = (
+                self._total_latency_ns
+                / self._frames_captured
+                / 1_000_000
+            )
+
+        else:
+
+            average_latency_ms = 0.0
+
+        return CaptureMetrics(
+            frames_captured=(
+                self._frames_captured
+            ),
+            frames_dropped=(
+                self._frames_dropped
+            ),
+            consecutive_failures=(
+                self._consecutive_failures
+            ),
+            elapsed_seconds=(
+                elapsed_seconds
+            ),
+            effective_fps=fps,
+            average_latency_ms=(
+                average_latency_ms
+            ),
+            last_frame_timestamp_ns=(
+                self._last_frame_timestamp_ns
+            ),
+        )
+
+    # =========================================================================
+    # STATE
+    # =========================================================================
+
+    @property
+    def is_running(self) -> bool:
+
+        return self._started
+
+    @property
+    def sequence(self) -> int:
+
+        return self._sequence
+
+    @property
+    def roi(self):
+        """
+        Retorna o ROI centralizado.
+
+        Não permite alteração.
+        """
+
+        return ROI
+
+    @property
+    def source_shape(
+        self,
+    ) -> tuple[int, int] | None:
+
+        return self._last_source_shape
+
+    @property
+    def frame_size(
+        self,
+    ) -> tuple[int, int]:
+
+        return (
+            ROI.width,
+            ROI.height,
+        )
+
+
+# =============================================================================
+# FACTORY
+# =============================================================================
+
+
+def create_screen_capture(
+    *,
+    monitor_index: int | None = None,
+) -> ScreenCapture:
+    """
+    Factory oficial utilizada pelo main.py.
+    """
+
+    return ScreenCapture(
+        monitor_index=monitor_index
+    )
+
+
+# =============================================================================
+# SELF TEST
+# =============================================================================
+
+
+def _self_test() -> None:
+    """
+    Teste básico da camada de captura.
+
+    Não inicia automaticamente quando o módulo é importado.
+    """
+
+    print(
+        "ScreenCapture self-test"
+    )
+
+    print(
+        f"ROI: {ROI.rectangle}"
+    )
+
+    print(
+        f"ROI size: "
+        f"{ROI.width}x{ROI.height}"
+    )
+
+    capture = ScreenCapture()
+
+    try:
+
+        capture.start()
+
+        packet = capture.read()
+
+        if packet is None:
+
+            raise RuntimeError(
+                "Nenhum frame foi capturado."
+            )
+
+        print(
+            "Frame:"
+            f" {packet.width}x"
+            f"{packet.height}"
+        )
+
+        print(
+            f"Sequence: "
+            f"{packet.sequence}"
+        )
+
+        print(
+            f"Latency: "
+            f"{packet.capture_latency_ns / 1_000_000:.2f} ms"
+        )
+
+    finally:
+
+        capture.stop()
+
+
+# =============================================================================
+# PUBLIC API
+# =============================================================================
+
+__all__ = [
+    "FramePacket",
+    "CaptureMetrics",
+    "ScreenCapture",
+    "create_screen_capture",
+]
+
+
+if __name__ == "__main__":
+    _self_test()
