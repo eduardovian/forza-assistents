@@ -29,11 +29,11 @@ from vision.lane_model import (
     fit_lane_model,
     validate_lane_model,
 )
-from vision.lane_types import (
-    LanePoint,
-)
+
+from vision.lane_types import LanePoint
+
 from vision.yolop_detector import (
-    YOLOPDetector,
+    YOLOPLaneDetector,
 )
 
 
@@ -110,6 +110,17 @@ def make_synthetic_lane_points(
     return points
 
 
+def create_detector() -> YOLOPLaneDetector:
+    """
+    Cria o detector sem exigir que o modelo seja executado.
+
+    A inicialização atual do detector é compatível com
+    o pipeline YOLOP do projeto.
+    """
+
+    return YOLOPLaneDetector()
+
+
 # =============================================================================
 # IMAGE LOADING
 # =============================================================================
@@ -150,18 +161,20 @@ def test_yolop_test_image_loads() -> None:
 def test_yolop_detector_can_be_imported() -> None:
     """O detector YOLOP deve estar disponível."""
 
-    assert YOLOPDetector is not None
+    assert YOLOPLaneDetector is not None
 
 
 def test_yolop_detector_initialization() -> None:
     """
     Verifica que o detector pode ser inicializado.
 
-    O teste é tolerante à ausência do checkpoint local.
+    A ausência do checkpoint não deve quebrar a coleta
+    dos testes.
     """
 
     try:
-        detector = YOLOPDetector()
+        detector = create_detector()
+
     except (
         FileNotFoundError,
         RuntimeError,
@@ -173,6 +186,10 @@ def test_yolop_detector_initialization() -> None:
         )
 
     assert detector is not None
+    assert isinstance(
+        detector,
+        YOLOPLaneDetector,
+    )
 
 
 # =============================================================================
@@ -181,7 +198,7 @@ def test_yolop_detector_initialization() -> None:
 
 
 def test_yolop_lane_points_are_compatible_with_lane_model() -> None:
-    """LanePoints produzidos pelo pipeline devem ser aceitos pelo model."""
+    """LanePoints devem ser aceitos pelo modelo matemático."""
 
     points = make_synthetic_lane_points()
 
@@ -207,8 +224,10 @@ def test_yolop_builds_valid_lane_model() -> None:
 
     assert model is not None
     assert model.valid
+
     assert model.polynomial is not None
     assert model.polynomial.valid
+
     assert model.line is not None
     assert model.line.valid
 
@@ -234,17 +253,18 @@ def test_yolop_lane_model_validation() -> None:
 
 def test_yolop_full_pipeline() -> None:
     """
-    Executa YOLOP sobre a imagem de teste quando o ambiente
-    possui o modelo configurado.
+    Executa YOLOP sobre a imagem de teste quando o modelo
+    estiver disponível.
 
-    O teste não falha por ausência do checkpoint ou CUDA:
-    nesse caso ele é simplesmente ignorado.
+    Ausência do checkpoint ou impossibilidade de executar
+    YOLOP neste ambiente resulta em skip.
     """
 
     image = load_image(TEST_IMAGE)
 
     try:
-        detector = YOLOPDetector()
+        detector = create_detector()
+
     except (
         FileNotFoundError,
         RuntimeError,
@@ -257,7 +277,9 @@ def test_yolop_full_pipeline() -> None:
 
     try:
         result = detector.detect(image)
+
     except (
+        FileNotFoundError,
         RuntimeError,
         OSError,
         ValueError,
@@ -277,14 +299,15 @@ def test_yolop_full_pipeline() -> None:
 
 def test_yolop_result_has_lane_information() -> None:
     """
-    Quando o detector estiver disponível, o resultado deve
-    expor informações de lane compatíveis com o pipeline.
+    Quando YOLOP estiver disponível, o resultado deve
+    expor a estrutura de lanes.
     """
 
     image = load_image(TEST_IMAGE)
 
     try:
-        detector = YOLOPDetector()
+        detector = create_detector()
+
     except (
         FileNotFoundError,
         RuntimeError,
@@ -297,7 +320,9 @@ def test_yolop_result_has_lane_information() -> None:
 
     try:
         result = detector.detect(image)
+
     except (
+        FileNotFoundError,
         RuntimeError,
         OSError,
         ValueError,
@@ -309,18 +334,9 @@ def test_yolop_result_has_lane_information() -> None:
 
     assert result is not None
 
-    # Diferentes versões do detector podem expor as lanes
-    # com nomes ligeiramente diferentes. O importante neste
-    # teste é garantir que o resultado foi produzido.
-    lane_attributes = (
+    assert hasattr(
+        result,
         "lanes",
-        "lane_points",
-        "lane_lines",
-    )
-
-    assert any(
-        hasattr(result, name)
-        for name in lane_attributes
     )
 
 
@@ -331,8 +347,7 @@ def test_yolop_result_has_lane_information() -> None:
 
 def test_yolop_lane_points_can_build_model() -> None:
     """
-    Teste de integração entre a representação de pontos
-    e o modelo matemático.
+    Teste de integração entre LanePoint e LaneModel.
     """
 
     points = make_synthetic_lane_points(
@@ -346,7 +361,9 @@ def test_yolop_lane_points_can_build_model() -> None:
     )
 
     assert model.valid
+
     assert model.polynomial is not None
+
     assert model.projection is not None
     assert model.projection.valid
 
@@ -357,7 +374,10 @@ def test_yolop_lane_points_can_build_model() -> None:
 
 
 def test_yolop_lane_model_rejects_non_finite_points() -> None:
-    """Dados não finitos não podem produzir modelo válido."""
+    """
+    Dados não finitos são ignorados e não devem invalidar
+    uma observação que continua geometricamente válida.
+    """
 
     points = make_synthetic_lane_points()
 
