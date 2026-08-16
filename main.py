@@ -53,7 +53,6 @@ from config import (
     ADAS,
     SAFETY,
     VISUALIZATION,
-    ensure_directories,
     validate_config,
 )
 
@@ -109,7 +108,7 @@ LOGGER = logging.getLogger("forza_assistents")
 def setup_logging() -> None:
     """Inicializa o logging."""
 
-    ensure_directories()
+    
 
     if LOGGER.handlers:
         return
