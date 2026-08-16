@@ -21,32 +21,15 @@ PRINCÍPIOS
 8. Segurança possui prioridade sobre disponibilidade.
 9. Monitoramento é o modo padrão.
 10. Controle físico permanece desabilitado por padrão.
-
-Arquitetura:
-
-    Camera Calibration
-            │
-            ▼
-    camera_calibration.json
-            │
-            ▼
-        config.py
-            │
-            ├── ScreenCapture
-            ├── YOLOP
-            ├── LaneSelector
-            ├── LaneGeometry
-            ├── LaneTracker
-            ├── LaneProjection
-            ├── LaneAssignment
-            ├── ADAS
-            ├── LKA
-            └── Visualization
+11. O modelo oficial de lane é cúbico.
+12. Nenhuma camada deve duplicar configuração pertencente
+    a este módulo.
 
 IMPORTANTE
 ----------
 
 Este projeto não é um sistema automotivo certificado.
+
 As estruturas abaixo buscam aplicar princípios de engenharia
 robusta, determinística, fail-safe e testável.
 """
@@ -135,6 +118,8 @@ class ROIConfig:
         y = 0 ... height
 
     Os módulos de visão trabalham nesse sistema local.
+
+    Nenhum módulo downstream deve redefinir ROI.
     """
 
     enabled: bool
@@ -176,11 +161,6 @@ class ROIConfig:
     ) -> None:
         """
         Valida a geometria do ROI.
-
-        Raises
-        ------
-        ValueError
-            Caso o ROI seja inválido.
         """
 
         if not self.enabled:
@@ -221,13 +201,7 @@ class ROIConfig:
 
 def _load_roi() -> ROIConfig:
     """
-    Carrega o ROI produzido pelo calibrador.
-
-    Não existe ROI alternativo espalhado pelo sistema.
-
-    Se a calibração não existir, o sistema permanece sem ROI
-    válido e deve ser tratado pelo runtime como condição de
-    configuração incompleta.
+    Carrega exclusivamente o ROI produzido pelo calibrador.
     """
 
     if not CALIBRATION_FILE.exists():
@@ -323,9 +297,9 @@ class CaptureConfig:
     """
     Configuração da captura.
 
-    O ROI NÃO é definido aqui.
+    ROI não pertence a esta configuração.
 
-    O capturador deve importar:
+    O capturador deve consumir:
 
         from config import ROI
     """
@@ -371,6 +345,11 @@ class CaptureConfig:
                 "Formato de cor inválido."
             )
 
+        if self.max_buffer_size < 1:
+            raise ValueError(
+                "max_buffer_size deve ser >= 1."
+            )
+
 
 CAPTURE: Final[CaptureConfig] = CaptureConfig()
 
@@ -382,9 +361,6 @@ CAPTURE: Final[CaptureConfig] = CaptureConfig()
 
 @dataclass(frozen=True, slots=True)
 class YOLOPConfig:
-    """
-    Configuração do detector YOLOP.
-    """
 
     model_path: Path = YOLOP_MODEL_PATH
 
@@ -462,6 +438,16 @@ class YOLOPConfig:
                 "max_lanes deve ser > 0."
             )
 
+        if self.minimum_lane_points < 2:
+            raise ValueError(
+                "minimum_lane_points deve ser >= 2."
+            )
+
+        if self.input_scale <= 0:
+            raise ValueError(
+                "input_scale deve ser > 0."
+            )
+
 
 YOLOP: Final[YOLOPConfig] = YOLOPConfig()
 
@@ -486,6 +472,28 @@ class LaneSelectorConfig:
 
     enable_multi_lane_selection: bool = True
 
+    def validate(self) -> None:
+
+        if not 0.0 <= self.minimum_confidence <= 1.0:
+            raise ValueError(
+                "LANE_SELECTOR.minimum_confidence inválido."
+            )
+
+        if self.maximum_lanes <= 0:
+            raise ValueError(
+                "LANE_SELECTOR.maximum_lanes deve ser > 0."
+            )
+
+        if not 0.0 <= self.center_reference_ratio <= 1.0:
+            raise ValueError(
+                "LANE_SELECTOR.center_reference_ratio inválido."
+            )
+
+        if self.minimum_lane_separation < 0:
+            raise ValueError(
+                "LANE_SELECTOR.minimum_lane_separation inválido."
+            )
+
 
 LANE_SELECTOR: Final[LaneSelectorConfig] = (
     LaneSelectorConfig()
@@ -500,12 +508,10 @@ LANE_SELECTOR: Final[LaneSelectorConfig] = (
 @dataclass(frozen=True, slots=True)
 class LaneGeometryConfig:
     """
-    Geometria trabalha exclusivamente sobre o frame recebido.
+    Configuração da geometria das lanes.
 
-    Não possui ROI.
-
-    image_width / image_height são parâmetros derivados do ROI
-    somente para validações e referências geométricas.
+    IMPORTANTE:
+    O modelo matemático oficial é cúbico.
     """
 
     min_lane_confidence: float = 0.35
@@ -532,7 +538,8 @@ class LaneGeometryConfig:
 
     enable_polynomial_fit: bool = True
 
-    polynomial_degree: int = 2
+    # CONTRATO OFICIAL: LanePolynomial é cúbico.
+    polynomial_degree: int = 3
 
     enable_outlier_rejection: bool = True
 
@@ -545,6 +552,39 @@ class LaneGeometryConfig:
     confidence_weight_width: float = 0.20
 
     confidence_weight_geometry: float = 0.25
+
+    def validate(self) -> None:
+
+        if not 0.0 <= self.min_lane_confidence <= 1.0:
+            raise ValueError(
+                "min_lane_confidence inválido."
+            )
+
+        if self.min_points < 2:
+            raise ValueError(
+                "min_points deve ser >= 2."
+            )
+
+        if self.min_observed_span <= 0:
+            raise ValueError(
+                "min_observed_span deve ser > 0."
+            )
+
+        if self.min_lane_width <= 0:
+            raise ValueError(
+                "min_lane_width deve ser > 0."
+            )
+
+        if self.max_lane_width <= self.min_lane_width:
+            raise ValueError(
+                "max_lane_width deve ser > min_lane_width."
+            )
+
+        if self.polynomial_degree != 3:
+            raise ValueError(
+                "O modelo LanePolynomial oficial é cúbico. "
+                "polynomial_degree deve ser 3."
+            )
 
 
 LANE_GEOMETRY: Final[LaneGeometryConfig] = (
@@ -559,8 +599,15 @@ LANE_GEOMETRY: Final[LaneGeometryConfig] = (
 
 @dataclass(frozen=True, slots=True)
 class LaneModelConfig:
+    """
+    Configuração do ajuste matemático das lanes.
 
-    polynomial_degree: int = 2
+    O fitting deve consumir esta configuração.
+    Não devem existir DEFAULT_* paralelos em lane_model.py.
+    """
+
+    # CONTRATO OFICIAL: LanePolynomial é cúbico.
+    polynomial_degree: int = 3
 
     minimum_points: int = 6
 
@@ -577,6 +624,44 @@ class LaneModelConfig:
     enable_polynomial_smoothing: bool = True
 
     enable_outlier_rejection: bool = True
+
+    def validate(self) -> None:
+
+        if self.polynomial_degree != 3:
+            raise ValueError(
+                "LaneModelConfig deve utilizar "
+                "polynomial_degree=3."
+            )
+
+        if self.minimum_points < 4:
+            raise ValueError(
+                "minimum_points deve ser >= 4."
+            )
+
+        if self.minimum_y_span <= 0:
+            raise ValueError(
+                "minimum_y_span deve ser > 0."
+            )
+
+        if self.max_outlier_iterations < 0:
+            raise ValueError(
+                "max_outlier_iterations inválido."
+            )
+
+        if self.outlier_threshold <= 0:
+            raise ValueError(
+                "outlier_threshold deve ser > 0."
+            )
+
+        if not 0.0 <= self.minimum_confidence <= 1.0:
+            raise ValueError(
+                "minimum_confidence inválido."
+            )
+
+        if self.projection_samples < 2:
+            raise ValueError(
+                "projection_samples deve ser >= 2."
+            )
 
 
 LANE_MODEL: Final[LaneModelConfig] = (
@@ -615,6 +700,48 @@ class LaneTrackerConfig:
     enable_identity_preservation: bool = True
 
     enable_lane_swap_protection: bool = True
+
+    def validate(self) -> None:
+
+        if self.max_lost_frames < 0:
+            raise ValueError(
+                "max_lost_frames inválido."
+            )
+
+        if self.min_stable_frames < 1:
+            raise ValueError(
+                "min_stable_frames deve ser >= 1."
+            )
+
+        if self.history_size < 1:
+            raise ValueError(
+                "history_size deve ser >= 1."
+            )
+
+        if self.max_tracks < 1:
+            raise ValueError(
+                "max_tracks deve ser >= 1."
+            )
+
+        if not 0.0 <= self.min_confidence <= 1.0:
+            raise ValueError(
+                "min_confidence inválido."
+            )
+
+        if self.association_distance <= 0:
+            raise ValueError(
+                "association_distance deve ser > 0."
+            )
+
+        if not 0.0 <= self.confidence_decay <= 1.0:
+            raise ValueError(
+                "confidence_decay inválido."
+            )
+
+        if not 0.0 <= self.velocity_smoothing <= 1.0:
+            raise ValueError(
+                "velocity_smoothing inválido."
+            )
 
 
 LANE_TRACKER: Final[LaneTrackerConfig] = (
@@ -655,6 +782,58 @@ class LaneProjectionConfig:
     maximum_curvature: float = 0.02
 
     reject_non_finite_points: bool = True
+
+    def validate(self) -> None:
+
+        if self.max_projection_distance <= 0:
+            raise ValueError(
+                "max_projection_distance deve ser > 0."
+            )
+
+        if self.minimum_points < 2:
+            raise ValueError(
+                "minimum_points deve ser >= 2."
+            )
+
+        if not 0.0 <= self.minimum_confidence <= 1.0:
+            raise ValueError(
+                "minimum_confidence inválido."
+            )
+
+        if self.samples < 2:
+            raise ValueError(
+                "samples deve ser >= 2."
+            )
+
+        if self.lookahead_distance <= 0:
+            raise ValueError(
+                "lookahead_distance deve ser > 0."
+            )
+
+        if self.near_distance < 0:
+            raise ValueError(
+                "near_distance inválido."
+            )
+
+        if self.far_distance <= self.near_distance:
+            raise ValueError(
+                "far_distance deve ser > near_distance."
+            )
+
+        if self.extrapolation_limit < 0:
+            raise ValueError(
+                "extrapolation_limit não pode ser negativo."
+            )
+
+        if self.confidence_decay_distance <= 0:
+            raise ValueError(
+                "confidence_decay_distance deve ser > 0."
+            )
+
+        if self.maximum_curvature <= 0:
+            raise ValueError(
+                "maximum_curvature deve ser > 0."
+            )
 
 
 LANE_PROJECTION: Final[
@@ -1064,36 +1243,92 @@ def validate_config() -> None:
 
     CAPTURE.validate()
     YOLOP.validate()
+    LANE_SELECTOR.validate()
+    LANE_GEOMETRY.validate()
+    LANE_MODEL.validate()
+    LANE_TRACKER.validate()
+    LANE_PROJECTION.validate()
 
     if ROI.enabled:
         ROI.validate()
 
-    if LANE_GEOMETRY.polynomial_degree != (
-        LANE_MODEL.polynomial_degree
+    # -------------------------------------------------------------------------
+    # Contrato matemático global.
+    # -------------------------------------------------------------------------
+
+    if LANE_GEOMETRY.polynomial_degree != 3:
+        raise ValueError(
+            "LANE_GEOMETRY deve utilizar "
+            "polynomial_degree=3."
+        )
+
+    if LANE_MODEL.polynomial_degree != 3:
+        raise ValueError(
+            "LANE_MODEL deve utilizar "
+            "polynomial_degree=3."
+        )
+
+    if (
+        LANE_GEOMETRY.polynomial_degree
+        != LANE_MODEL.polynomial_degree
     ):
         raise ValueError(
             "Grau polinomial inconsistente entre "
             "LANE_GEOMETRY e LANE_MODEL."
         )
 
-    if LANE_PROJECTION.samples < 2:
+    # -------------------------------------------------------------------------
+    # Projection.
+    # -------------------------------------------------------------------------
+
+    if (
+        LANE_PROJECTION.extrapolation_limit
+        > LANE_PROJECTION.max_projection_distance
+    ):
         raise ValueError(
-            "LANE_PROJECTION.samples deve ser >= 2."
+            "extrapolation_limit não pode exceder "
+            "max_projection_distance."
         )
 
-    if LANE_PROJECTION.extrapolation_limit < 0:
+    # -------------------------------------------------------------------------
+    # Safety.
+    # -------------------------------------------------------------------------
+
+    if not 0.0 <= SAFETY.minimum_adas_confidence <= 1.0:
         raise ValueError(
-            "extrapolation_limit não pode ser negativo."
+            "SAFETY.minimum_adas_confidence inválido."
         )
 
-    if SAFETY.minimum_adas_confidence < 0.0:
+    if (
+        SAFETY.maximum_allowed_detection_age_frames
+        < 0
+    ):
         raise ValueError(
-            "minimum_adas_confidence inválido."
+            "SAFETY.maximum_allowed_detection_age_frames "
+            "inválido."
         )
 
-    if SAFETY.minimum_adas_confidence > 1.0:
+    if (
+        SAFETY.maximum_lost_frames_before_disable
+        < 0
+    ):
         raise ValueError(
-            "minimum_adas_confidence inválido."
+            "SAFETY.maximum_lost_frames_before_disable "
+            "inválido."
+        )
+
+    # -------------------------------------------------------------------------
+    # Performance.
+    # -------------------------------------------------------------------------
+
+    if PERFORMANCE.target_capture_fps <= 0:
+        raise ValueError(
+            "target_capture_fps deve ser > 0."
+        )
+
+    if PERFORMANCE.target_inference_fps <= 0:
+        raise ValueError(
+            "target_inference_fps deve ser > 0."
         )
 
     if PERFORMANCE.target_pipeline_fps <= 0:
@@ -1104,6 +1339,16 @@ def validate_config() -> None:
     if PERFORMANCE.target_control_hz <= 0:
         raise ValueError(
             "target_control_hz deve ser > 0."
+        )
+
+    if PERFORMANCE.max_pipeline_latency_ms <= 0:
+        raise ValueError(
+            "max_pipeline_latency_ms deve ser > 0."
+        )
+
+    if PERFORMANCE.max_inference_latency_ms <= 0:
+        raise ValueError(
+            "max_inference_latency_ms deve ser > 0."
         )
 
 
@@ -1120,45 +1365,66 @@ __all__ = [
     "YOLOP_MODEL_PATH",
     "LOG_DIR",
     "SCREENSHOT_DIR",
+
     "RuntimeMode",
     "DEFAULT_RUNTIME_MODE",
+
     "ROIConfig",
     "ROI",
+
     "CaptureConfig",
     "CAPTURE",
+
     "YOLOPConfig",
     "YOLOP",
+
     "LaneSelectorConfig",
     "LANE_SELECTOR",
+
     "LaneGeometryConfig",
     "LANE_GEOMETRY",
+
     "LaneModelConfig",
     "LANE_MODEL",
+
     "LaneTrackerConfig",
     "LANE_TRACKER",
+
     "LaneProjectionConfig",
     "LANE_PROJECTION",
+
     "LaneAssignmentConfig",
     "LANE_ASSIGNMENT",
+
     "ADASConfig",
     "ADAS",
+
     "TemporalFilterConfig",
     "TEMPORAL_FILTER",
+
     "SafetyConfig",
     "SAFETY",
+
     "LKAConfig",
     "LKA",
+
     "G29Config",
     "G29",
+
     "VisualizationConfig",
     "VISUALIZATION",
+
     "PerformanceConfig",
     "PERFORMANCE",
+
     "LoggingConfig",
     "LOGGING",
+
     "HotkeyConfig",
     "HOTKEYS",
+
     "DebugConfig",
     "DEBUG",
+
     "validate_config",
 ]
