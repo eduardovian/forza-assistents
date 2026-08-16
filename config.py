@@ -62,7 +62,9 @@ WEIGHTS_DIR: Final[Path] = (
 )
 
 YOLOP_MODEL_PATH: Final[Path] = (
-    WEIGHTS_DIR / "yolop-640-640.onnx"
+    
+    WEIGHTS_DIR / "yolopv2.pt"
+    
 )
 
 LOG_DIR: Final[Path] = (

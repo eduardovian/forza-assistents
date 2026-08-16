@@ -26,7 +26,7 @@ Arquitetura:
         ↓
     Safety Gate
         ↓
-    Visualization
+    ADASDisplay
 
 Princípios:
 
@@ -51,7 +51,6 @@ O main.py NÃO deve:
     - aplicar ROI novamente;
     - converter coordenadas do detector;
     - fazer segundo mapeamento geométrico.
-
 """
 
 from __future__ import annotations
@@ -144,7 +143,6 @@ def setup_logging() -> None:
     )
 
     LOGGER.addHandler(handler)
-
     LOGGER.propagate = False
 
 
@@ -309,7 +307,6 @@ class SafetyGate:
         - confiança suficiente;
         - estado ADAS não crítico;
         - ausência de erro no pipeline.
-
     """
 
     def __init__(
@@ -334,7 +331,6 @@ class SafetyGate:
         self._stable_frames = 0
 
     def reset(self) -> None:
-
         self._stable_frames = 0
 
     def evaluate(
@@ -351,7 +347,6 @@ class SafetyGate:
         ],
     ) -> bool:
 
-        # Controle precisa estar explicitamente habilitado.
         if not bool(
             getattr(
                 config.SAFETY,
@@ -362,7 +357,6 @@ class SafetyGate:
             self._stable_frames = 0
             return False
 
-        # Tracking.
         if tracking is None:
             self._stable_frames = 0
             return False
@@ -371,7 +365,6 @@ class SafetyGate:
             self._stable_frames = 0
             return False
 
-        # Geometria real.
         if geometry is None:
             self._stable_frames = 0
             return False
@@ -380,7 +373,6 @@ class SafetyGate:
             self._stable_frames = 0
             return False
 
-        # ADAS.
         if adas is None:
             self._stable_frames = 0
             return False
@@ -410,7 +402,6 @@ class SafetyGate:
             self._stable_frames = 0
             return False
 
-        # Estado ADAS.
         state = getattr(
             adas,
             "state",
@@ -457,9 +448,7 @@ class ForzaAssistents:
 
         self.frame_index = 0
 
-        self.stats = (
-            RuntimeStatistics()
-        )
+        self.stats = RuntimeStatistics()
 
         self.capture: Optional[
             ScreenCapture
@@ -489,9 +478,7 @@ class ForzaAssistents:
             ADASStateEstimator
         ] = None
 
-        self.display: Optional[
-            Any
-        ] = None
+        self.display: Optional[Any] = None
 
         self.safety = SafetyGate(
             minimum_confidence=float(
@@ -522,9 +509,7 @@ class ForzaAssistents:
             return
 
         LOGGER.info("=" * 72)
-        LOGGER.info(
-            "FORZA ASSISTENTS"
-        )
+        LOGGER.info("FORZA ASSISTENTS")
         LOGGER.info(
             "Inicializando pipeline ADAS..."
         )
@@ -536,7 +521,6 @@ class ForzaAssistents:
         roi = config.ROI
 
         if not roi.enabled:
-
             raise RuntimeError(
                 "ROI não está calibrado."
             )
@@ -556,31 +540,21 @@ class ForzaAssistents:
         # ---------------------------------------------------------------------
         # CAPTURE
         # ---------------------------------------------------------------------
+        #
+        # ScreenCapture atual:
+        #
+        #     ScreenCapture(monitor_index=...)
+        #     start()
+        #     read() -> FramePacket
+        #
+        # O ROI é aplicado internamente pelo ScreenCapture.
+        # ---------------------------------------------------------------------
 
         self.capture = ScreenCapture(
-            region=roi.rectangle,
-            target_fps=(
-                config.CAPTURE.target_fps
-            ),
-            backend=(
-                config.CAPTURE.backend
-            ),
-            output_color=(
-                config.CAPTURE
-                .output_color_format
-            ),
-            max_buffer_size=(
-                config.CAPTURE
-                .max_buffer_size
+            monitor_index=(
+                config.CAPTURE.monitor_index
             ),
         )
-
-        if not self.capture.initialize():
-
-            raise RuntimeError(
-                "Falha ao inicializar "
-                "ScreenCapture."
-            )
 
         self.capture.start()
 
@@ -890,33 +864,48 @@ class ForzaAssistents:
         if self.capture is None:
             return None
 
-        start = (
-            time.perf_counter()
-        )
+        start = time.perf_counter()
 
-        frame = (
-            self.capture
-            .get_latest_frame()
-        )
+        try:
+
+            packet = self.capture.read()
+
+        except Exception:
+
+            LOGGER.exception(
+                "Falha durante captura do frame."
+            )
+
+            self.stats.dropped_frames += 1
+
+            return None
 
         self.stats.capture_ms = (
             time.perf_counter()
             - start
         ) * 1000.0
 
-        if frame is None:
+        if packet is None:
+
+            self.stats.dropped_frames += 1
+
             return None
+
+        frame = packet.frame
 
         if not isinstance(
             frame,
             np.ndarray,
         ):
+            self.stats.dropped_frames += 1
             return None
 
         if frame.ndim != 3:
+            self.stats.dropped_frames += 1
             return None
 
         if frame.shape[2] != 3:
+            self.stats.dropped_frames += 1
             return None
 
         return frame
@@ -930,9 +919,7 @@ class ForzaAssistents:
         frame: np.ndarray,
     ) -> PipelineResult:
 
-        started = (
-            time.perf_counter()
-        )
+        started = time.perf_counter()
 
         timestamp = time.perf_counter()
 
@@ -1011,9 +998,7 @@ class ForzaAssistents:
                 "fora do frame original."
             )
 
-            LOGGER.error(
-                error
-            )
+            LOGGER.error(error)
 
             self._reset_temporal_state()
 
@@ -1031,9 +1016,7 @@ class ForzaAssistents:
             LaneTrackingResult
         ] = None
 
-        tracking_started = (
-            time.perf_counter()
-        )
+        tracking_started = time.perf_counter()
 
         try:
 
@@ -1054,7 +1037,7 @@ class ForzaAssistents:
                 )
             )
 
-        except Exception as exc:
+        except Exception:
 
             LOGGER.exception(
                 "Falha no LaneTracker."
@@ -1073,9 +1056,7 @@ class ForzaAssistents:
             LaneGeometryResult
         ] = None
 
-        geometry_started = (
-            time.perf_counter()
-        )
+        geometry_started = time.perf_counter()
 
         try:
 
@@ -1090,7 +1071,7 @@ class ForzaAssistents:
                     )
                 )
 
-        except Exception as exc:
+        except Exception:
 
             LOGGER.exception(
                 "Falha no LaneGeometry."
@@ -1107,9 +1088,7 @@ class ForzaAssistents:
 
         models = []
 
-        model_started = (
-            time.perf_counter()
-        )
+        model_started = time.perf_counter()
 
         if tracking is not None:
 
@@ -1130,9 +1109,7 @@ class ForzaAssistents:
 
         projections = []
 
-        projection_started = (
-            time.perf_counter()
-        )
+        projection_started = time.perf_counter()
 
         if (
             self.projection is not None
@@ -1158,9 +1135,7 @@ class ForzaAssistents:
             LaneAssignmentResult
         ] = None
 
-        assignment_started = (
-            time.perf_counter()
-        )
+        assignment_started = time.perf_counter()
 
         try:
 
@@ -1200,17 +1175,11 @@ class ForzaAssistents:
             ADASStateResult
         ] = None
 
-        adas_started = (
-            time.perf_counter()
-        )
+        adas_started = time.perf_counter()
 
         try:
 
             if self.adas is not None:
-
-                # Segurança:
-                # geometria inválida não pode alimentar
-                # o estado como se fosse uma geometria real.
 
                 geometry_for_adas = (
                     geometry
@@ -1260,24 +1229,18 @@ class ForzaAssistents:
             - started
         ) * 1000.0
 
-        self.stats.total_ms = (
-            processing_ms
-        )
+        self.stats.total_ms = processing_ms
 
         self.stats.update_fps()
 
         result = PipelineResult(
-            frame_index=(
-                self.frame_index
-            ),
+            frame_index=self.frame_index,
             timestamp=timestamp,
             detection=detection,
             tracking=tracking,
             geometry=geometry,
             models=tuple(models),
-            projections=tuple(
-                projections
-            ),
+            projections=tuple(projections),
             assignment=assignment,
             adas=adas_result,
             actuation_allowed=(
@@ -1286,9 +1249,7 @@ class ForzaAssistents:
             valid=bool(
                 detection is not None
             ),
-            processing_ms=(
-                processing_ms
-            ),
+            processing_ms=processing_ms,
         )
 
         self._last_result = result
@@ -1307,9 +1268,6 @@ class ForzaAssistents:
         models = []
 
         for track in tracking.lanes:
-
-            # Não utilizar uma lane perdida
-            # como geometria observada.
 
             if not track.points:
                 continue
@@ -1419,9 +1377,6 @@ class ForzaAssistents:
         ):
             return False
 
-        # O novo detector declara explicitamente
-        # seu sistema de coordenadas.
-
         coordinate_system = (
             detection.metadata.get(
                 "coordinate_system"
@@ -1495,9 +1450,7 @@ class ForzaAssistents:
         self.safety.reset()
 
         return PipelineResult(
-            frame_index=(
-                self.frame_index
-            ),
+            frame_index=self.frame_index,
             timestamp=timestamp,
             detection=None,
             tracking=None,
@@ -1508,9 +1461,7 @@ class ForzaAssistents:
             adas=None,
             actuation_allowed=False,
             valid=False,
-            processing_ms=(
-                processing_ms
-            ),
+            processing_ms=processing_ms,
             error=error,
         )
 
@@ -1545,7 +1496,6 @@ class ForzaAssistents:
     def run(self) -> None:
 
         if not self.initialized:
-
             self.initialize()
 
         if self.capture is None:
@@ -1564,15 +1514,11 @@ class ForzaAssistents:
 
             while self.running:
 
-                frame = (
-                    self.get_frame()
-                )
+                frame = self.get_frame()
 
                 if frame is None:
 
-                    time.sleep(
-                        0.001
-                    )
+                    time.sleep(0.001)
 
                     continue
 
@@ -1588,7 +1534,6 @@ class ForzaAssistents:
                 )
 
                 if self._handle_keyboard():
-
                     break
 
         except KeyboardInterrupt:
@@ -1611,29 +1556,29 @@ class ForzaAssistents:
         result: PipelineResult,
     ) -> None:
 
-        if self.display is not None:
+        # O ADASDisplay não precisa do frame.
+        # Ele representa os resultados calculados
+        # pelo pipeline.
 
-            try:
+        del frame
 
-                # Mantém a responsabilidade visual
-                # no módulo de visualização.
+        if self.display is None:
+            return
 
-                if hasattr(
-                    self.display,
-                    "update",
-                ):
+        try:
 
-                    self.display.update(
-                        frame,
-                        result,
-                    )
+            self.display.update_from_pipeline(
+                geometry=result.geometry,
+                adas_state=result.adas,
+                active=result.actuation_allowed,
+            )
 
-            except Exception:
+        except Exception:
 
-                LOGGER.debug(
-                    "Falha ao atualizar display.",
-                    exc_info=True,
-                )
+            LOGGER.debug(
+                "Falha ao atualizar ADASDisplay.",
+                exc_info=True,
+            )
 
     # =========================================================================
     # TECLADO
@@ -1644,16 +1589,13 @@ class ForzaAssistents:
 
         try:
 
-            key = cv2.waitKey(
-                1
-            ) & 0xFF
+            key = cv2.waitKey(1) & 0xFF
 
         except Exception:
 
             return False
 
-        if key == 27:  # ESC
-
+        if key == 27:
             return True
 
         return False
@@ -1664,8 +1606,9 @@ class ForzaAssistents:
 
     def shutdown(self) -> None:
 
-        if not self.running and (
-            self.capture is None
+        if (
+            not self.running
+            and self.capture is None
         ):
             return
 
@@ -1675,22 +1618,17 @@ class ForzaAssistents:
 
         self.running = False
 
-        # Segurança primeiro.
-
         self.safety.reset()
 
-        # Display.
+        # ---------------------------------------------------------------------
+        # DISPLAY
+        # ---------------------------------------------------------------------
 
         if self.display is not None:
 
             try:
 
-                if hasattr(
-                    self.display,
-                    "stop",
-                ):
-
-                    self.display.stop()
+                self.display.stop()
 
             except Exception:
 
@@ -1701,7 +1639,9 @@ class ForzaAssistents:
 
             self.display = None
 
-        # Capture.
+        # ---------------------------------------------------------------------
+        # CAPTURE
+        # ---------------------------------------------------------------------
 
         if self.capture is not None:
 
@@ -1718,14 +1658,13 @@ class ForzaAssistents:
 
             self.capture = None
 
-        # OpenCV.
+        # ---------------------------------------------------------------------
+        # OPENCV
+        # ---------------------------------------------------------------------
 
         try:
-
             cv2.destroyAllWindows()
-
         except Exception:
-
             pass
 
         self.initialized = False
@@ -1755,7 +1694,6 @@ def _signal_handler(
     global _APP
 
     if _APP is not None:
-
         _APP.running = False
 
 
