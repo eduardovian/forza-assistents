@@ -8,13 +8,13 @@ Production-grade YOLOPv2 perception front-end.
 
 Responsabilidades
 -----------------
-- carregar YOLOPv2 TorchScript;
+- carregar YOLOPv2 TorchScript de forma robusta no Windows;
 - executar inferência CUDA/FP16;
-- pré-processar frames de forma determinística;
+- pré-processar frames deterministicamente;
 - extrair lane segmentation;
 - extrair drivable-area segmentation;
-- extrair objetos quando o output do checkpoint permitir;
-- converter todas as coordenadas para o frame original;
+- extrair objetos quando disponíveis;
+- converter coordenadas para o frame original;
 - extrair segmentos espaciais;
 - associar segmentos em lanes dentro do frame atual;
 - produzir LaneDetectionResult;
@@ -66,17 +66,12 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_MODEL_PATH = (
-    PROJECT_ROOT
-    / "weights"
-    / "yolopv2.pt"
-)
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "weights" / "yolopv2.pt"
 
-LEGACY_MODEL_PATH = (
-    PROJECT_ROOT
-    / "weights"
-    / "yolop-640-640.onnx"
-)
+# Compatibilidade com o nome que está sendo usado no ambiente local.
+LOCAL_MODEL_PATH = PROJECT_ROOT / "weights" / "yolopv2_local.pt"
+
+LEGACY_MODEL_PATH = PROJECT_ROOT / "weights" / "yolop-640-640.onnx"
 
 
 # =============================================================================
@@ -206,10 +201,10 @@ COCO_CLASS_NAMES: Tuple[str, ...] = (
 
 VEHICLE_CLASS_IDS = frozenset(
     {
-        2,  # car
-        3,  # motorcycle
-        5,  # bus
-        7,  # truck
+        2,
+        3,
+        5,
+        7,
     }
 )
 
@@ -250,13 +245,6 @@ def _shape_of(value: Any) -> Tuple[int, ...]:
 
 
 def _collect_shapes(value: Any) -> List[Tuple[int, ...]]:
-    """
-    Coleta recursivamente os shapes reais do TorchScript.
-
-    Importante:
-    não usar shape() diretamente em estruturas aninhadas.
-    """
-
     shapes: List[Tuple[int, ...]] = []
 
     if isinstance(value, torch.Tensor):
@@ -354,23 +342,15 @@ class ObjectDetection:
 
 @dataclass
 class LaneDetectionResult:
-    lanes: List[List[LanePoint]] = field(
-        default_factory=list
-    )
+    lanes: List[List[LanePoint]] = field(default_factory=list)
 
-    lane_confidences: List[float] = field(
-        default_factory=list
-    )
+    lane_confidences: List[float] = field(default_factory=list)
 
     current_lane_index: Optional[int] = None
 
-    left_lane: List[LanePoint] = field(
-        default_factory=list
-    )
+    left_lane: List[LanePoint] = field(default_factory=list)
 
-    right_lane: List[LanePoint] = field(
-        default_factory=list
-    )
+    right_lane: List[LanePoint] = field(default_factory=list)
 
     additional_lanes: List[List[LanePoint]] = field(
         default_factory=list
@@ -415,9 +395,7 @@ class LaneDetectionResult:
         )
 
     @property
-    def vehicle_detections(
-        self,
-    ) -> List[ObjectDetection]:
+    def vehicle_detections(self) -> List[ObjectDetection]:
         return [
             obj
             for obj in self.objects
@@ -450,9 +428,9 @@ class _RowSegment:
 
 @dataclass
 class _LaneTrack:
-    points: List[
-        Tuple[int, float, float]
-    ] = field(default_factory=list)
+    points: List[Tuple[int, float, float]] = field(
+        default_factory=list
+    )
 
     last_x: float = 0.0
     last_y: int = 0
@@ -479,10 +457,7 @@ class _LaneTrack:
         self.last_x = float(x)
         self.last_y = int(y)
 
-        self.confidence_sum += float(
-            confidence
-        )
-
+        self.confidence_sum += float(confidence)
         self.road_confidence_sum += float(
             road_confidence
         )
@@ -512,17 +487,6 @@ class YOLOPLaneDetector:
     """
     YOLOPv2 production detector.
 
-    Propriedades:
-        - fail-soft;
-        - deterministic;
-        - coordinate-safe;
-        - CUDA/FP16;
-        - inference_mode;
-        - warmup;
-        - output validation;
-        - bounded lane count;
-        - no temporal state.
-
     Todas as coordenadas públicas pertencem ao frame original.
     """
 
@@ -545,12 +509,30 @@ class YOLOPLaneDetector:
 
         self.model_path = Path(model_path)
 
-        if (
-            not self.model_path.exists()
-            and self.model_path == LEGACY_MODEL_PATH
-            and DEFAULT_MODEL_PATH.exists()
-        ):
-            self.model_path = DEFAULT_MODEL_PATH
+        # ---------------------------------------------------------------------
+        # Compatibilidade automática.
+        #
+        # Se o caminho configurado não existir, tenta o modelo local e depois
+        # o modelo padrão.
+        # ---------------------------------------------------------------------
+        if not self.model_path.is_file():
+
+            candidates = []
+
+            if self.model_path.name == "yolopv2.pt":
+                candidates.append(LOCAL_MODEL_PATH)
+
+            if self.model_path.name == "yolop-640-640.onnx":
+                candidates.append(DEFAULT_MODEL_PATH)
+                candidates.append(LOCAL_MODEL_PATH)
+
+            candidates.append(DEFAULT_MODEL_PATH)
+            candidates.append(LOCAL_MODEL_PATH)
+
+            for candidate in candidates:
+                if candidate.is_file():
+                    self.model_path = candidate
+                    break
 
         self.input_width = max(
             32,
@@ -655,6 +637,99 @@ class YOLOPLaneDetector:
     def model_exists(self) -> bool:
         return self.model_path.is_file()
 
+    def _describe_model_file(self) -> Dict[str, Any]:
+        """
+        Retorna informações físicas do checkpoint sem carregá-lo.
+        """
+
+        info: Dict[str, Any] = {
+            "path": str(self.model_path),
+            "exists": False,
+            "is_file": False,
+            "size_bytes": 0,
+            "header": None,
+        }
+
+        try:
+            info["exists"] = self.model_path.exists()
+            info["is_file"] = self.model_path.is_file()
+
+            if not info["is_file"]:
+                return info
+
+            info["size_bytes"] = self.model_path.stat().st_size
+
+            with self.model_path.open("rb") as file:
+                header = file.read(16)
+
+            info["header"] = header.hex()
+
+        except OSError as exc:
+            info["error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        return info
+
+    def _resolve_model_path(self) -> bool:
+        """
+        Resolve novamente o checkpoint imediatamente antes do carregamento.
+
+        Isso evita depender exclusivamente do caminho selecionado durante
+        a construção do detector.
+        """
+
+        if self.model_path.is_file():
+            return True
+
+        candidates = [
+            LOCAL_MODEL_PATH,
+            DEFAULT_MODEL_PATH,
+        ]
+
+        if self.model_path.name == "yolop-640-640.onnx":
+            candidates = [
+                DEFAULT_MODEL_PATH,
+                LOCAL_MODEL_PATH,
+            ]
+
+        for candidate in candidates:
+            if candidate.is_file():
+                logger.warning(
+                    "[YOLOPv2] Modelo configurado não encontrado. "
+                    "Usando fallback: %s",
+                    candidate,
+                )
+
+                self.model_path = candidate
+                return True
+
+        return False
+
+    def _load_torchscript_from_file(
+        self,
+    ) -> torch.jit.ScriptModule:
+        """
+        Carrega TorchScript através de um file object.
+
+        Correção importante para Windows/OneDrive/Unicode.
+
+        O caminho:
+            C:\\Users\\...\\Área de Trabalho\\...
+
+        pode funcionar com Python open() e falhar em determinadas
+        chamadas internas do runtime C++ do TorchScript.
+
+        Ao fornecer o arquivo já aberto, eliminamos esse ponto
+        de falha.
+        """
+
+        with self.model_path.open("rb") as model_file:
+            return torch.jit.load(
+                model_file,
+                map_location=self.device,
+            )
+
     def load_model(self) -> bool:
 
         if (
@@ -665,10 +740,15 @@ class YOLOPLaneDetector:
 
         self.last_error = None
 
-        if not self.model_exists():
+        if not self._resolve_model_path():
+
+            info = self._describe_model_file()
+
             self.last_error = (
-                "Modelo YOLOPv2 não encontrado: "
-                f"{self.model_path}"
+                "Modelo YOLOPv2 não encontrado. "
+                f"caminho={self.model_path}; "
+                f"exists={info.get('exists')}; "
+                f"is_file={info.get('is_file')}"
             )
 
             logger.error(
@@ -678,11 +758,40 @@ class YOLOPLaneDetector:
 
             return False
 
+        file_info = self._describe_model_file()
+
+        logger.info(
+            "[YOLOPv2] Abrindo checkpoint: %s",
+            self.model_path,
+        )
+
+        logger.info(
+            "[YOLOPv2] checkpoint_size=%d bytes",
+            file_info.get("size_bytes", 0),
+        )
+
+        logger.debug(
+            "[YOLOPv2] checkpoint_header=%s",
+            file_info.get("header"),
+        )
+
         try:
-            model = torch.jit.load(
-                str(self.model_path),
-                map_location=self.device,
-            )
+
+            # -----------------------------------------------------------------
+            # CORREÇÃO PRINCIPAL:
+            #
+            # NÃO:
+            #
+            # torch.jit.load(str(self.model_path))
+            #
+            # SIM:
+            #
+            # torch.jit.load(file_object)
+            #
+            # Isso evita o problema de fopen() no caminho Unicode.
+            # -----------------------------------------------------------------
+
+            model = self._load_torchscript_from_file()
 
             model.eval()
 
@@ -690,13 +799,28 @@ class YOLOPLaneDetector:
                 model = model.cuda()
 
                 if self.use_fp16:
-                    model = model.half()
-                    self.fp16_active = True
+                    try:
+                        model = model.half()
+                        self.fp16_active = True
+
+                    except Exception:
+                        logger.warning(
+                            "[YOLOPv2] FP16 indisponível para "
+                            "este TorchScript. Usando FP32."
+                        )
+
+                        self.fp16_active = False
+
             else:
                 self.fp16_active = False
 
             self.model = model
             self.loaded = True
+            self._warmed_up = False
+
+            # -----------------------------------------------------------------
+            # Warmup.
+            # -----------------------------------------------------------------
 
             self._warmup()
 
@@ -718,6 +842,7 @@ class YOLOPLaneDetector:
             self.model = None
             self.loaded = False
             self.fp16_active = False
+            self._warmed_up = False
 
             logger.exception(
                 "[YOLOPv2] Falha ao carregar modelo."
@@ -734,6 +859,7 @@ class YOLOPLaneDetector:
             return
 
         try:
+
             dtype = (
                 torch.float16
                 if self.fp16_active
@@ -759,10 +885,19 @@ class YOLOPLaneDetector:
 
             self._warmed_up = True
 
-        except Exception:
-            logger.exception(
-                "[YOLOPv2] Warmup falhou."
+            logger.info(
+                "[YOLOPv2] Warmup concluído."
             )
+
+        except Exception as exc:
+
+            logger.warning(
+                "[YOLOPv2] Warmup falhou: %s",
+                exc,
+            )
+
+            # Warmup não invalida automaticamente o modelo.
+            self._warmed_up = False
 
     def get_device_name(self) -> str:
 
@@ -785,10 +920,7 @@ class YOLOPLaneDetector:
         frame: np.ndarray,
     ) -> Tuple[int, int]:
 
-        if not isinstance(
-            frame,
-            np.ndarray,
-        ):
+        if not isinstance(frame, np.ndarray):
             raise TypeError(
                 "Frame deve ser numpy.ndarray."
             )
@@ -811,6 +943,7 @@ class YOLOPLaneDetector:
             )
 
         if frame.dtype != np.uint8:
+
             if not np.isfinite(
                 frame.astype(
                     np.float32,
@@ -835,18 +968,7 @@ class YOLOPLaneDetector:
         _PreprocessMeta,
     ]:
 
-        width, height = self._validate_frame(
-            frame
-        )
-
-        # -------------------------------------------------------------
-        # Letterbox direto do frame original para 640x640.
-        #
-        # Não existe canonicalização intermediária.
-        #
-        # Isso reduz transformações e torna a transformação inversa
-        # determinística.
-        # -------------------------------------------------------------
+        width, height = self._validate_frame(frame)
 
         scale = min(
             self.input_width / width,
@@ -973,9 +1095,7 @@ class YOLOPLaneDetector:
                 "Modelo YOLOPv2 inexistente."
             )
 
-        tensor_np, _ = self._prepare_frame(
-            frame
-        )
+        tensor_np, _ = self._prepare_frame(frame)
 
         tensor = torch.from_numpy(
             tensor_np
@@ -986,12 +1106,6 @@ class YOLOPLaneDetector:
 
         if self.fp16_active:
             tensor = tensor.half()
-
-        # -------------------------------------------------------------
-        # CUDA events permitem medir o trabalho efetivamente executado
-        # pela GPU sem depender de sincronizações durante o caminho
-        # quente.
-        # -------------------------------------------------------------
 
         if self.device.type == "cuda":
 
@@ -1028,8 +1142,8 @@ class YOLOPLaneDetector:
                 - start
             ) * 1000.0
 
-        self.last_output_shapes = (
-            _collect_shapes(outputs)
+        self.last_output_shapes = _collect_shapes(
+            outputs
         )
 
         self.last_diagnostics[
@@ -1063,9 +1177,7 @@ class YOLOPLaneDetector:
         outputs: Any,
     ) -> Optional[torch.Tensor]:
 
-        tensors = _flatten_tensors(
-            outputs
-        )
+        tensors = _flatten_tensors(outputs)
 
         candidates = [
             tensor
@@ -1085,7 +1197,7 @@ class YOLOPLaneDetector:
             candidates,
             key=lambda tensor:
                 int(tensor.shape[2])
-                * int(tensor.shape[3])
+                * int(tensor.shape[3]),
         )
 
     @staticmethod
@@ -1093,9 +1205,7 @@ class YOLOPLaneDetector:
         outputs: Any,
     ) -> Optional[torch.Tensor]:
 
-        tensors = _flatten_tensors(
-            outputs
-        )
+        tensors = _flatten_tensors(outputs)
 
         candidates = [
             tensor
@@ -1115,7 +1225,7 @@ class YOLOPLaneDetector:
             candidates,
             key=lambda tensor:
                 int(tensor.shape[2])
-                * int(tensor.shape[3])
+                * int(tensor.shape[3]),
         )
 
     # =========================================================================
@@ -1185,13 +1295,8 @@ class YOLOPLaneDetector:
 
         logits = segmentation[0]
 
-        # -------------------------------------------------------------
-        # Lane segmentation:
-        #
-        # [background, lane]
-        # -------------------------------------------------------------
-
         if channels >= 2:
+
             probabilities = (
                 self._softmax_channels(
                     logits
@@ -1203,15 +1308,6 @@ class YOLOPLaneDetector:
                 0.0,
                 1.0,
             )
-
-        # -------------------------------------------------------------
-        # Drivable segmentation YOLOPv2:
-        #
-        # [1,H,W]
-        #
-        # Algumas exportações produzem logits binários.
-        # Aplicamos sigmoid.
-        # -------------------------------------------------------------
 
         logits = np.nan_to_num(
             logits[0],
@@ -1249,22 +1345,6 @@ class YOLOPLaneDetector:
         probability: np.ndarray,
         meta: _PreprocessMeta,
     ) -> np.ndarray:
-
-        """
-        Converte máscara do espaço 640x640 para o frame original.
-
-        Ordem:
-
-            model
-              ↓
-            remove padding
-              ↓
-            resized image
-              ↓
-            original frame
-
-        Esta função é a única transformação geométrica da máscara.
-        """
 
         if probability.ndim != 2:
             raise ValueError(
@@ -1332,6 +1412,7 @@ class YOLOPLaneDetector:
     ) -> np.ndarray:
 
         if self._last_preprocess_meta is None:
+
             return cv2.resize(
                 probability,
                 (
@@ -1429,22 +1510,9 @@ class YOLOPLaneDetector:
         drivable_probability: Optional[np.ndarray],
     ) -> List[_RowSegment]:
 
-        height, width = lane_mask.shape
+        height, _ = lane_mask.shape
 
-        segments: List[
-            _RowSegment
-        ] = []
-
-        # -------------------------------------------------------------
-        # lane_mask já está no frame original.
-        #
-        # Consequentemente:
-        #
-        #     x = frame x
-        #     y = frame y
-        #
-        # Não existe remapeamento posterior.
-        # -------------------------------------------------------------
+        segments: List[_RowSegment] = []
 
         for y in range(
             height - 1,
@@ -1462,9 +1530,7 @@ class YOLOPLaneDetector:
             ):
                 continue
 
-            for group in self._split_contiguous(
-                xs
-            ):
+            for group in self._split_contiguous(xs):
 
                 if (
                     group.size
@@ -1472,17 +1538,11 @@ class YOLOPLaneDetector:
                 ):
                     continue
 
-                x_min = float(
-                    group[0]
-                )
-
-                x_max = float(
-                    group[-1]
-                )
+                x_min = float(group[0])
+                x_max = float(group[-1])
 
                 x_center = (
-                    x_min
-                    + x_max
+                    x_min + x_max
                 ) * 0.5
 
                 confidence = float(
@@ -1495,6 +1555,7 @@ class YOLOPLaneDetector:
                 )
 
                 if drivable_probability is not None:
+
                     road_confidence = float(
                         np.mean(
                             drivable_probability[
@@ -1503,6 +1564,7 @@ class YOLOPLaneDetector:
                             ]
                         )
                     )
+
                 else:
                     road_confidence = 0.0
 
@@ -1550,9 +1612,7 @@ class YOLOPLaneDetector:
                 []
             ).append(segment)
 
-        tracks: List[
-            _LaneTrack
-        ] = []
+        tracks: List[_LaneTrack] = []
 
         max_jump = max(
             DEFAULT_MAX_TRACKING_JUMP,
@@ -1597,9 +1657,7 @@ class YOLOPLaneDetector:
                 best_index = None
                 best_score = float("inf")
 
-                for index, track in enumerate(
-                    tracks
-                ):
+                for index, track in enumerate(tracks):
 
                     if index in used_tracks:
                         continue
@@ -1612,14 +1670,10 @@ class YOLOPLaneDetector:
                     if dx > max_jump:
                         continue
 
-                    # Penaliza saltos abruptos e favorece
-                    # alta confiança.
                     score = (
                         dx
-                        - 8.0
-                        * candidate.confidence
-                        - 4.0
-                        * candidate.road_confidence
+                        - 8.0 * candidate.confidence
+                        - 4.0 * candidate.road_confidence
                     )
 
                     if score < best_score:
@@ -1644,18 +1698,14 @@ class YOLOPLaneDetector:
 
                 else:
 
-                    tracks[
-                        best_index
-                    ].add(
+                    tracks[best_index].add(
                         candidate.y,
                         candidate.x_center,
                         candidate.confidence,
                         candidate.road_confidence,
                     )
 
-                    used_tracks.add(
-                        best_index
-                    )
+                    used_tracks.add(best_index)
 
         return tracks
 
@@ -1670,9 +1720,7 @@ class YOLOPLaneDetector:
         frame_height: int,
     ) -> List[LanePoint]:
 
-        points: List[
-            LanePoint
-        ] = []
+        points: List[LanePoint] = []
 
         for (
             frame_y,
@@ -1680,22 +1728,11 @@ class YOLOPLaneDetector:
             confidence,
         ) in track.points:
 
-            # =========================================================
-            # CONTRATO CRÍTICO:
-            #
-            # frame_x/frame_y JÁ ESTÃO NO FRAME ORIGINAL.
-            #
-            # NÃO existe _map_inference_point_to_frame()
-            # aqui.
-            # =========================================================
-
             x = float(
                 np.clip(
                     frame_x,
                     0.0,
-                    float(
-                        frame_width - 1
-                    ),
+                    float(frame_width - 1),
                 )
             )
 
@@ -1703,20 +1740,14 @@ class YOLOPLaneDetector:
                 np.clip(
                     frame_y,
                     0.0,
-                    float(
-                        frame_height - 1
-                    ),
+                    float(frame_height - 1),
                 )
-            )
-
-            confidence = _clip01(
-                confidence
             )
 
             point = LanePoint(
                 x=x,
                 y=y,
-                confidence=confidence,
+                confidence=_clip01(confidence),
                 valid=True,
             )
 
@@ -1728,10 +1759,7 @@ class YOLOPLaneDetector:
                 point.y
         )
 
-        # Remove duplicatas verticais.
-        result: List[
-            LanePoint
-        ] = []
+        result: List[LanePoint] = []
 
         last_y: Optional[float] = None
 
@@ -1739,9 +1767,7 @@ class YOLOPLaneDetector:
 
             if (
                 last_y is not None
-                and abs(
-                    point.y - last_y
-                ) < 0.5
+                and abs(point.y - last_y) < 0.5
             ):
                 continue
 
@@ -1852,8 +1878,7 @@ class YOLOPLaneDetector:
         ]
 
         vertical_span = (
-            max(ys)
-            - min(ys)
+            max(ys) - min(ys)
         )
 
         if (
@@ -1889,8 +1914,7 @@ class YOLOPLaneDetector:
             lane,
             key=lambda item:
                 abs(
-                    item.y
-                    - target_y
+                    item.y - target_y
                 ),
         )
 
@@ -1909,7 +1933,7 @@ class YOLOPLaneDetector:
                 self._lane_reference_x(
                     lane,
                     frame_height,
-                )
+                ),
         )
 
     # =========================================================================
@@ -1967,13 +1991,11 @@ class YOLOPLaneDetector:
         area_b = (
             np.maximum(
                 0.0,
-                boxes[:, 2]
-                - boxes[:, 0],
+                boxes[:, 2] - boxes[:, 0],
             )
             * np.maximum(
                 0.0,
-                boxes[:, 3]
-                - boxes[:, 1],
+                boxes[:, 3] - boxes[:, 1],
             )
         )
 
@@ -2002,17 +2024,13 @@ class YOLOPLaneDetector:
         if boxes.size == 0:
             return []
 
-        order = np.argsort(
-            scores
-        )[::-1]
+        order = np.argsort(scores)[::-1]
 
         keep: List[int] = []
 
         while order.size > 0:
 
-            index = int(
-                order[0]
-            )
+            index = int(order[0])
 
             keep.append(index)
 
@@ -2021,16 +2039,11 @@ class YOLOPLaneDetector:
 
             ious = cls._box_iou(
                 boxes[index],
-                boxes[
-                    order[1:]
-                ],
+                boxes[order[1:]],
             )
 
-            order = order[
-                1:
-            ][
-                ious
-                <= iou_threshold
+            order = order[1:][
+                ious <= iou_threshold
             ]
 
         return keep
@@ -2050,6 +2063,7 @@ class YOLOPLaneDetector:
         meta = self._last_preprocess_meta
 
         if meta is None:
+
             x1, y1, x2, y2 = box
 
             return (
@@ -2064,27 +2078,12 @@ class YOLOPLaneDetector:
             box,
         )
 
-        x1 = (
-            cx
-            - width * 0.5
-        )
+        x1 = cx - width * 0.5
+        y1 = cy - height * 0.5
+        x2 = cx + width * 0.5
+        y2 = cy + height * 0.5
 
-        y1 = (
-            cy
-            - height * 0.5
-        )
-
-        x2 = (
-            cx
-            + width * 0.5
-        )
-
-        y2 = (
-            cy
-            + height * 0.5
-        )
-
-        # Normalized → model pixels.
+        # Normalized coordinates.
         if max(
             abs(x1),
             abs(y1),
@@ -2097,25 +2096,20 @@ class YOLOPLaneDetector:
             y1 *= self.input_height
             y2 *= self.input_height
 
-        # Remove letterbox.
         x1 = (
-            x1
-            - meta.pad_left
+            x1 - meta.pad_left
         ) / meta.scale
 
         x2 = (
-            x2
-            - meta.pad_left
+            x2 - meta.pad_left
         ) / meta.scale
 
         y1 = (
-            y1
-            - meta.pad_top
+            y1 - meta.pad_top
         ) / meta.scale
 
         y2 = (
-            y2
-            - meta.pad_top
+            y2 - meta.pad_top
         ) / meta.scale
 
         x1 = float(
@@ -2159,9 +2153,7 @@ class YOLOPLaneDetector:
         frame_height: int,
     ) -> List[ObjectDetection]:
 
-        tensors = _flatten_tensors(
-            outputs
-        )
+        tensors = _flatten_tensors(outputs)
 
         candidates: List[
             torch.Tensor
@@ -2186,7 +2178,7 @@ class YOLOPLaneDetector:
         tensor = max(
             candidates,
             key=lambda item:
-                int(item.numel())
+                int(item.numel()),
         )
 
         array = (
@@ -2278,31 +2270,22 @@ class YOLOPLaneDetector:
         valid_boxes = (
             (final_boxes[:, 2]
              > final_boxes[:, 0])
-            & (final_boxes[:, 3]
-               > final_boxes[:, 1])
+            & (
+                final_boxes[:, 3]
+                > final_boxes[:, 1]
+            )
         )
 
         if not np.any(valid_boxes):
             return []
 
-        final_boxes = final_boxes[
-            valid_boxes
-        ]
+        final_boxes = final_boxes[valid_boxes]
+        confidence = confidence[valid_boxes]
+        class_ids = class_ids[valid_boxes]
 
-        confidence = confidence[
-            valid_boxes
-        ]
-
-        class_ids = class_ids[
-            valid_boxes
-        ]
-
-        # NMS por classe.
         keep: List[int] = []
 
-        for class_id in np.unique(
-            class_ids
-        ):
+        for class_id in np.unique(class_ids):
 
             indices = np.flatnonzero(
                 class_ids == class_id
@@ -2321,9 +2304,7 @@ class YOLOPLaneDetector:
 
         keep.sort(
             key=lambda index:
-                float(
-                    confidence[index]
-                ),
+                float(confidence[index]),
             reverse=True,
         )
 
@@ -2416,16 +2397,12 @@ class YOLOPLaneDetector:
             in valid_pairs
         ]
 
-        center = (
-            frame_width * 0.5
-        )
+        center = frame_width * 0.5
 
         left_candidates = []
         right_candidates = []
 
-        for index, lane in enumerate(
-            lanes
-        ):
+        for index, lane in enumerate(lanes):
 
             reference_x = (
                 self._lane_reference_x(
@@ -2434,19 +2411,13 @@ class YOLOPLaneDetector:
                 )
             )
 
-            if not math.isfinite(
-                reference_x
-            ):
+            if not math.isfinite(reference_x):
                 continue
 
             if reference_x < center:
-                left_candidates.append(
-                    index
-                )
+                left_candidates.append(index)
             else:
-                right_candidates.append(
-                    index
-                )
+                right_candidates.append(index)
 
         left_index = None
         right_index = None
@@ -2459,7 +2430,7 @@ class YOLOPLaneDetector:
                     self._lane_reference_x(
                         lanes[index],
                         frame_height,
-                    )
+                    ),
             )
 
         if right_candidates:
@@ -2470,7 +2441,7 @@ class YOLOPLaneDetector:
                     self._lane_reference_x(
                         lanes[index],
                         frame_height,
-                    )
+                    ),
             )
 
         left_lane = (
@@ -2508,9 +2479,7 @@ class YOLOPLaneDetector:
 
         additional_lanes = [
             lane
-            for index, lane in enumerate(
-                lanes
-            )
+            for index, lane in enumerate(lanes)
             if index not in used
         ]
 
@@ -2536,9 +2505,8 @@ class YOLOPLaneDetector:
             ),
             "object_count": len(objects),
             "drivable_pixels": drivable_pixels,
-            "coordinate_system": (
-                "original_frame"
-            ),
+            "coordinate_system": "original_frame",
+            "model_path": str(self.model_path),
         }
 
         return LaneDetectionResult(
@@ -2579,14 +2547,11 @@ class YOLOPLaneDetector:
         self.last_error = None
         self.last_diagnostics = {}
 
-        # -------------------------------------------------------------
-        # Fail-safe input validation.
-        # -------------------------------------------------------------
-
         try:
             frame_width, frame_height = (
                 self._validate_frame(frame)
             )
+
         except Exception as exc:
 
             error = (
@@ -2613,9 +2578,9 @@ class YOLOPLaneDetector:
                 self.last_output_shapes
             )
 
-            # ---------------------------------------------------------
+            # -----------------------------------------------------------------
             # Lane segmentation.
-            # ---------------------------------------------------------
+            # -----------------------------------------------------------------
 
             lane_tensor = (
                 self._find_lane_segmentation(
@@ -2655,9 +2620,9 @@ class YOLOPLaneDetector:
                 )
             )
 
-            # ---------------------------------------------------------
+            # -----------------------------------------------------------------
             # Drivable segmentation.
-            # ---------------------------------------------------------
+            # -----------------------------------------------------------------
 
             drivable_probability = None
             drivable_mask = None
@@ -2696,9 +2661,9 @@ class YOLOPLaneDetector:
                     )
                 )
 
-            # ---------------------------------------------------------
-            # Frame-space segmentation → row segments.
-            # ---------------------------------------------------------
+            # -----------------------------------------------------------------
+            # Spatial segmentation.
+            # -----------------------------------------------------------------
 
             segments = (
                 self._extract_row_segments(
@@ -2707,12 +2672,6 @@ class YOLOPLaneDetector:
                     drivable_probability,
                 )
             )
-
-            # ---------------------------------------------------------
-            # Spatial association.
-            #
-            # Isto NÃO é temporal tracking.
-            # ---------------------------------------------------------
 
             raw_tracks = (
                 self._associate_segments(
@@ -2745,9 +2704,9 @@ class YOLOPLaneDetector:
                 if len(lanes) >= self.max_lanes:
                     break
 
-            # ---------------------------------------------------------
-            # Object detection.
-            # ---------------------------------------------------------
+            # -----------------------------------------------------------------
+            # Objects.
+            # -----------------------------------------------------------------
 
             objects = (
                 self._extract_objects(
@@ -2776,9 +2735,9 @@ class YOLOPLaneDetector:
                 )
             )
 
-            # ---------------------------------------------------------
+            # -----------------------------------------------------------------
             # Diagnostics.
-            # ---------------------------------------------------------
+            # -----------------------------------------------------------------
 
             active_lane_pixels = int(
                 np.count_nonzero(
@@ -2854,61 +2813,43 @@ class YOLOPLaneDetector:
                     }
                 ),
 
-                "segment_count": len(
-                    segments
-                ),
+                "segment_count": len(segments),
 
-                "raw_tracks": len(
-                    raw_tracks
-                ),
+                "raw_tracks": len(raw_tracks),
 
-                "valid_lanes": len(
-                    lanes
-                ),
+                "valid_lanes": len(lanes),
 
                 "vehicle_count": sum(
                     obj.is_vehicle
                     for obj in objects
                 ),
 
-                "object_count": len(
-                    objects
-                ),
+                "object_count": len(objects),
 
-                "model_output_shapes": (
-                    output_shapes
-                ),
+                "model_output_shapes": output_shapes,
 
-                "frame_width": (
-                    frame_width
-                ),
+                "frame_width": frame_width,
+                "frame_height": frame_height,
 
-                "frame_height": (
-                    frame_height
-                ),
+                "coordinate_system": "original_frame",
 
-                "coordinate_system": (
-                    "original_frame"
-                ),
+                "model_input_width": self.input_width,
+                "model_input_height": self.input_height,
 
-                "model_input_width": (
-                    self.input_width
-                ),
-
-                "model_input_height": (
-                    self.input_height
-                ),
-
-                "lane_threshold": (
-                    self.lane_threshold
-                ),
+                "lane_threshold": self.lane_threshold,
 
                 "drivable_threshold": (
                     DEFAULT_DRIVABLE_THRESHOLD
                 ),
 
-                "max_lanes": (
-                    self.max_lanes
+                "max_lanes": self.max_lanes,
+
+                "model_path": str(self.model_path),
+
+                "model_size_bytes": (
+                    self.model_path.stat().st_size
+                    if self.model_path.is_file()
+                    else 0
                 ),
             }
 
@@ -2968,6 +2909,9 @@ class YOLOPLaneDetector:
                     ),
                     "coordinate_system": (
                         "original_frame"
+                    ),
+                    "model_path": str(
+                        self.model_path
                     ),
                     "total_ms": total_ms,
                 },

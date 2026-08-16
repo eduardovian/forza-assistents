@@ -623,7 +623,7 @@ class ForzaAssistents:
                 config.LANE_TRACKER
                 .history_size
             ),
-            min_fit_points=max(
+            min_points=max(
                 4,
                 config.YOLOP
                 .minimum_lane_points,
