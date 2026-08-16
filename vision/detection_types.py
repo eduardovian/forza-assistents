@@ -4,74 +4,155 @@ vision/detection_types.py
 Forza Assistents
 ================
 
-Tipos de dados compartilhados pelo pipeline de percepção.
+Contratos de dados compartilhados pelo pipeline de percepção.
 
-Este módulo é deliberadamente independente de:
+Este módulo não depende de:
+    - YOLOP
+    - UFLD
+    - OpenCV
+    - ONNX Runtime
+    - PyTorch
 
-- YOLOP
-- UFLD
-- OpenCV
-- ONNX Runtime
-- PyTorch
+Responsabilidade:
+    - representar pontos de faixa;
+    - representar resultados de detecção;
+    - normalizar entradas;
+    - impedir que dados inválidos avancem para a geometria/modelagem.
 
-A finalidade é fornecer contratos estáveis para os módulos posteriores
-do pipeline:
+Regra importante
+----------------
+NaN e infinito podem existir na entrada de um detector como representação
+de uma observação inválida. Portanto, LanePoint NÃO deve lançar exceção
+apenas por receber um valor não-finito.
 
-    Detector
-        ↓
-    LaneDetectionResult
-        ↓
-    LaneGeometry
-        ↓
-    LaneModel
-        ↓
-    LaneTracker / LaneAssignment
-        ↓
-    ADAS
+Em vez disso:
 
-IMPORTANTE
-----------
-Este módulo não deve importar nenhum detector.
+    ponto não-finito -> valid=False
 
-Isso permite que os testes matemáticos e geométricos sejam executados
-sem carregar CUDA, OpenCV, ONNX Runtime ou qualquer backend de inferência.
+Isso permite que filtros temporais e módulos de limpeza removam o ponto
+antes de qualquer operação matemática.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Sequence, Tuple
+from math import isfinite, hypot
+from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 
-# ---------------------------------------------------------------------------
-# Tipos básicos
-# ---------------------------------------------------------------------------
+# ============================================================================
+# TIPOS BÁSICOS
+# ============================================================================
 
 Point2D = Tuple[float, float]
 
 
-# ---------------------------------------------------------------------------
-# LanePoint
-# ---------------------------------------------------------------------------
+# ============================================================================
+# CONSTANTES DE DETECÇÃO
+# ============================================================================
+
+# Âncoras verticais padrão do CULane.
+#
+# Mantidas aqui por compatibilidade com testes e módulos que ainda utilizam
+# a convenção de 18 linhas verticais do UFLD/CULane.
+#
+# A arquitetura atual pode utilizar YOLOP, mas esse contrato permanece
+# disponível porque LanePoint é um tipo neutro do pipeline.
+CULANE_ROW_ANCHORS: Tuple[float, ...] = (
+    240.0,
+    230.0,
+    220.0,
+    210.0,
+    200.0,
+    190.0,
+    180.0,
+    170.0,
+    160.0,
+    150.0,
+    140.0,
+    130.0,
+    120.0,
+    110.0,
+    100.0,
+    90.0,
+    80.0,
+    70.0,
+)
+
+
+# ============================================================================
+# FUNÇÕES INTERNAS
+# ============================================================================
+
+
+def _clamp_confidence(value: float) -> float:
+    """
+    Limita confiança ao intervalo [0, 1].
+
+    Valores inválidos são tratados como 0.
+    """
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if not isfinite(value):
+        return 0.0
+
+    return max(0.0, min(1.0, value))
+
+
+def _safe_float(value: float) -> float:
+    """
+    Converte um valor para float.
+
+    Não rejeita NaN/infinito.
+
+    A decisão sobre validade pertence ao LanePoint.
+    """
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+# ============================================================================
+# LANE POINT
+# ============================================================================
+
 
 @dataclass(frozen=True, slots=True)
 class LanePoint:
     """
-    Ponto pertencente a uma marcação de faixa.
+    Ponto de uma marcação de faixa.
 
-    Attributes
+    Parameters
     ----------
     x:
-        Coordenada horizontal em pixels.
+        Coordenada horizontal.
 
     y:
-        Coordenada vertical em pixels.
+        Coordenada vertical.
 
     confidence:
-        Confiança da detecção no intervalo [0, 1].
+        Confiança da observação, normalizada para [0, 1].
 
     valid:
-        Indica se o ponto deve ser considerado válido pelo pipeline.
+        Indica se o ponto é matematicamente utilizável.
+
+    Comportamento para dados inválidos
+    -----------------------------------
+    Caso x ou y sejam NaN/infinito, o ponto é preservado como objeto de
+    entrada, mas automaticamente marcado como:
+
+        valid=False
+
+    Isso é intencional.
+
+    O detector/filtro pode então receber observações inválidas sem quebrar
+    a execução e removê-las antes da modelagem.
     """
 
     x: float
@@ -80,83 +161,109 @@ class LanePoint:
     valid: bool = True
 
     def __post_init__(self) -> None:
-        """Normaliza e valida os valores básicos."""
+        x = _safe_float(self.x)
+        y = _safe_float(self.y)
+        confidence = _clamp_confidence(self.confidence)
 
-        x = float(self.x)
-        y = float(self.y)
-        confidence = float(self.confidence)
+        requested_valid = bool(self.valid)
 
-        if not all(
-            value == value and abs(value) != float("inf")
-            for value in (x, y, confidence)
-        ):
-            raise ValueError("LanePoint não pode conter NaN ou infinito.")
+        # Um ponto não-finito jamais pode ser considerado matematicamente
+        # válido.
+        finite = isfinite(x) and isfinite(y)
 
-        confidence = max(0.0, min(1.0, confidence))
+        normalized_valid = requested_valid and finite
 
         object.__setattr__(self, "x", x)
         object.__setattr__(self, "y", y)
         object.__setattr__(self, "confidence", confidence)
-        object.__setattr__(self, "valid", bool(self.valid))
+        object.__setattr__(self, "valid", normalized_valid)
+
+    # ------------------------------------------------------------------
+    # Propriedades
+    # ------------------------------------------------------------------
 
     @property
     def xy(self) -> Point2D:
-        """Retorna o ponto como `(x, y)`."""
+        """Retorna `(x, y)`."""
 
         return self.x, self.y
 
+    @property
+    def finite(self) -> bool:
+        """
+        Indica se x e y são finitos.
+
+        Não depende do campo `valid`.
+        """
+
+        return isfinite(self.x) and isfinite(self.y)
+
+    @property
+    def usable(self) -> bool:
+        """
+        Indica se o ponto pode entrar em operações matemáticas.
+        """
+
+        return self.valid and self.finite and self.confidence > 0.0
+
     def distance_to(self, other: "LanePoint") -> float:
-        """Distância euclidiana até outro ponto."""
+        """
+        Distância euclidiana até outro ponto.
+
+        Levanta ValueError caso algum dos pontos seja não-finito.
+        """
 
         if not isinstance(other, LanePoint):
             raise TypeError("other deve ser LanePoint.")
 
-        dx = self.x - other.x
-        dy = self.y - other.y
+        if not self.finite or not other.finite:
+            raise ValueError(
+                "Não é possível calcular distância de ponto não-finito."
+            )
 
-        return (dx * dx + dy * dy) ** 0.5
+        return hypot(
+            self.x - other.x,
+            self.y - other.y,
+        )
 
 
-# ---------------------------------------------------------------------------
-# LaneDetectionResult
-# ---------------------------------------------------------------------------
+# ============================================================================
+# LANE DETECTION RESULT
+# ============================================================================
+
 
 @dataclass(slots=True)
 class LaneDetectionResult:
     """
-    Resultado neutro da etapa de detecção de faixas.
+    Resultado neutro da detecção de faixas.
 
-    O detector pode ser YOLOP ou qualquer outro detector futuro.
-    Nenhuma parte posterior do pipeline precisa conhecer a implementação
-    interna do detector.
+    O objeto é independente do detector utilizado.
 
     Attributes
     ----------
     lanes:
-        Sequência de faixas detectadas.
-
-        Cada faixa é representada por uma sequência de LanePoint.
+        Tupla de lanes, sendo cada lane uma sequência de LanePoint.
 
     confidence:
-        Confiança global da detecção.
+        Confiança global do resultado.
 
     image_width:
-        Largura da imagem utilizada na detecção.
+        Largura da imagem de origem.
 
     image_height:
-        Altura da imagem utilizada na detecção.
+        Altura da imagem de origem.
 
     valid:
-        Indica se o resultado é utilizável.
+        Validade global da detecção.
 
     frame_id:
         Identificador opcional do frame.
 
     timestamp:
-        Timestamp opcional associado ao frame.
+        Timestamp opcional.
 
     metadata:
-        Informações adicionais não obrigatórias.
+        Metadados adicionais.
     """
 
     lanes: Sequence[Sequence[LanePoint]] = field(default_factory=tuple)
@@ -174,28 +281,25 @@ class LaneDetectionResult:
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Normaliza o resultado sem introduzir dependências externas."""
-
         normalized_lanes = []
 
         for lane in self.lanes:
             normalized_lane = []
 
             for point in lane:
-                if isinstance(point, LanePoint):
-                    normalized_lane.append(point)
-                else:
+                if not isinstance(point, LanePoint):
                     raise TypeError(
-                        "Cada ponto de lane deve ser uma instância de LanePoint."
+                        "Cada ponto de lane deve ser LanePoint."
                     )
+
+                normalized_lane.append(point)
 
             normalized_lanes.append(tuple(normalized_lane))
 
         self.lanes = tuple(normalized_lanes)
 
-        self.confidence = max(
-            0.0,
-            min(1.0, float(self.confidence)),
+        self.confidence = _clamp_confidence(
+            self.confidence
         )
 
         if self.image_width is not None:
@@ -208,7 +312,13 @@ class LaneDetectionResult:
             self.frame_id = int(self.frame_id)
 
         if self.timestamp is not None:
-            self.timestamp = float(self.timestamp)
+            timestamp = float(self.timestamp)
+
+            self.timestamp = (
+                timestamp
+                if isfinite(timestamp)
+                else None
+            )
 
         self.valid = bool(self.valid)
 
@@ -218,22 +328,18 @@ class LaneDetectionResult:
             self.metadata = dict(self.metadata)
 
     # ------------------------------------------------------------------
-    # Compatibilidade / acesso
+    # Propriedades
     # ------------------------------------------------------------------
 
     @property
     def lane_count(self) -> int:
-        """Número de faixas detectadas."""
+        """Número de lanes."""
 
         return len(self.lanes)
 
     @property
     def points(self) -> tuple[LanePoint, ...]:
-        """
-        Retorna todos os pontos de todas as faixas em uma única sequência.
-
-        Útil para módulos que não precisam preservar a identidade da faixa.
-        """
+        """Todos os pontos em uma sequência plana."""
 
         return tuple(
             point
@@ -242,13 +348,41 @@ class LaneDetectionResult:
         )
 
     @property
+    def valid_points(self) -> tuple[LanePoint, ...]:
+        """
+        Todos os pontos matematicamente utilizáveis.
+        """
+
+        return tuple(
+            point
+            for point in self.points
+            if point.usable
+        )
+
+    @property
     def is_valid(self) -> bool:
-        """Alias semântico para `valid`."""
+        """Alias semântico de `valid`."""
 
         return self.valid
 
-    def get_lane(self, index: int) -> tuple[LanePoint, ...]:
-        """Retorna uma faixa pelo índice."""
+    @property
+    def has_valid_points(self) -> bool:
+        """Indica se existe pelo menos um ponto utilizável."""
+
+        return any(
+            point.usable
+            for point in self.points
+        )
+
+    # ------------------------------------------------------------------
+    # Acesso
+    # ------------------------------------------------------------------
+
+    def get_lane(
+        self,
+        index: int,
+    ) -> tuple[LanePoint, ...]:
+        """Retorna uma lane pelo índice."""
 
         if index < 0 or index >= len(self.lanes):
             raise IndexError(
@@ -257,20 +391,23 @@ class LaneDetectionResult:
 
         return tuple(self.lanes[index])
 
-    def iter_lanes(self) -> Iterable[tuple[LanePoint, ...]]:
-        """Itera pelas faixas detectadas."""
+    def iter_lanes(
+        self,
+    ) -> Iterable[tuple[LanePoint, ...]]:
+        """Itera pelas lanes."""
 
         return iter(self.lanes)
 
     def __len__(self) -> int:
-        """Permite `len(result)` para obter o número de faixas."""
+        """Retorna a quantidade de lanes."""
 
         return len(self.lanes)
 
 
-# ---------------------------------------------------------------------------
-# Fábricas auxiliares
-# ---------------------------------------------------------------------------
+# ============================================================================
+# FÁBRICAS
+# ============================================================================
+
 
 def make_lane_point(
     x: float,
@@ -279,16 +416,14 @@ def make_lane_point(
     valid: bool = True,
 ) -> LanePoint:
     """
-    Cria um LanePoint.
-
-    Função pequena para manter criação de pontos consistente.
+    Cria um LanePoint normalizado.
     """
 
     return LanePoint(
-        x=float(x),
-        y=float(y),
-        confidence=float(confidence),
-        valid=bool(valid),
+        x=x,
+        y=y,
+        confidence=confidence,
+        valid=valid,
     )
 
 
@@ -301,10 +436,10 @@ def make_detection_result(
     valid: bool = True,
     frame_id: Optional[int] = None,
     timestamp: Optional[float] = None,
-    metadata: Optional[dict] = None,
+    metadata: Optional[Mapping] = None,
 ) -> LaneDetectionResult:
     """
-    Cria um LaneDetectionResult de forma explícita.
+    Cria um LaneDetectionResult.
     """
 
     return LaneDetectionResult(
@@ -315,12 +450,18 @@ def make_detection_result(
         valid=valid,
         frame_id=frame_id,
         timestamp=timestamp,
-        metadata={} if metadata is None else metadata,
+        metadata={} if metadata is None else dict(metadata),
     )
+
+
+# ============================================================================
+# EXPORTS
+# ============================================================================
 
 
 __all__ = [
     "Point2D",
+    "CULANE_ROW_ANCHORS",
     "LanePoint",
     "LaneDetectionResult",
     "make_lane_point",
