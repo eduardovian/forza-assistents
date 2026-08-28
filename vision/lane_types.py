@@ -1,164 +1,281 @@
 """
 vision/lane_types.py
 
-Tipos fundamentais do sistema de visão de faixas.
+Forza Assistents
+================
 
-Responsabilidade:
-    Definir enums e estruturas de dados compartilhadas
-    entre detector, modelagem, projeção e tracking.
+Contratos canônicos de dados para percepção de faixas.
 
-Este módulo NÃO executa:
-    - inferência;
-    - fitting;
-    - projeção;
-    - tracking;
-    - decisões ADAS.
+Este módulo é a única fonte de verdade para os tipos de dados
+compartilhados entre:
+
+    YOLOPv2
+        ↓
+    LaneTracker
+        ↓
+    LaneGeometry
+        ↓
+    LaneModel
+        ↓
+    LaneProjection
+        ↓
+    LaneAssignment
+        ↓
+    ADAS
+
+Princípios:
+    - contratos explícitos;
+    - objetos imutáveis nas fronteiras dos módulos;
+    - validação rigorosa;
+    - somente valores numéricos finitos;
+    - modelo de lane exclusivamente cúbico;
+    - nenhuma dependência de OpenCV, PyTorch ou detector específico.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-import math
-from typing import List, Optional
+from math import isfinite
+from typing import Iterable, Optional, Sequence, Tuple
 
 
 # =============================================================================
-# ENUMS
+# TIPOS BÁSICOS
 # =============================================================================
 
+Point = Tuple[float, float]
 
-class LaneQuality(Enum):
+
+# =============================================================================
+# ORIGEM DA LANE
+# =============================================================================
+
+class LaneSource(str, Enum):
     """
-    Qualidade estrutural de uma faixa.
+    Origem atual dos dados da lane.
+
+    DETECTED:
+        Diretamente observada pelo detector.
+
+    TRACKED:
+        Observação mantida/refinada pelo rastreador temporal.
+
+    PROJECTED:
+        Dados obtidos por projeção/extrapolação de um modelo anterior.
+
+    FUSED:
+        Dados resultantes da combinação de múltiplas fontes.
     """
 
-    NONE = "none"
-    POOR = "poor"
-    PARTIAL = "partial"
-    GOOD = "good"
-    EXCELLENT = "excellent"
-
-
-class ProjectionQuality(Enum):
-    """
-    Qualidade de uma projeção matemática.
-    """
-
-    NONE = "none"
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
+    DETECTED = "detected"
+    TRACKED = "tracked"
+    PROJECTED = "projected"
+    FUSED = "fused"
 
 
 # =============================================================================
 # LANE POINT
 # =============================================================================
 
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class LanePoint:
     """
-    Ponto individual de uma linha de faixa.
+    Ponto bidimensional pertencente a uma lane.
+
+    Coordenadas:
+        x -> posição horizontal em pixels.
+        y -> posição vertical em pixels.
+
+    As coordenadas devem sempre ser finitas.
     """
 
     x: float
     y: float
-    confidence: float
-    valid: bool = True
 
-    def is_finite(self) -> bool:
-        return (
-            math.isfinite(float(self.x))
-            and math.isfinite(float(self.y))
-            and math.isfinite(float(self.confidence))
-        )
+    def __post_init__(self) -> None:
+        x = float(self.x)
+        y = float(self.y)
 
-    def is_valid(self) -> bool:
-        return (
-            bool(self.valid)
-            and self.is_finite()
-        )
+        if not isfinite(x):
+            raise ValueError(
+                f"LanePoint.x must be finite, got {self.x!r}"
+            )
+
+        if not isfinite(y):
+            raise ValueError(
+                f"LanePoint.y must be finite, got {self.y!r}"
+            )
+
+        object.__setattr__(self, "x", x)
+        object.__setattr__(self, "y", y)
+
+    def as_tuple(self) -> Point:
+        """Retorna o ponto como tupla (x, y)."""
+
+        return self.x, self.y
 
 
 # =============================================================================
 # LANE POLYNOMIAL
 # =============================================================================
 
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class LanePolynomial:
     """
-    Modelo cúbico:
+    Modelo cúbico de uma lane.
+
+    A representação matemática oficial do projeto é:
 
         x(y) = a*y³ + b*y² + c*y + d
+
+    Os coeficientes são armazenados na ordem:
+
+        (a, b, c, d)
+
+    Não são permitidos modelos lineares ou quadráticos neste contrato.
     """
 
-    a: float = 0.0
-    b: float = 0.0
-    c: float = 0.0
-    d: float = 0.0
+    coefficients: Tuple[float, float, float, float]
 
-    valid: bool = False
+    fit_error: float
+    confidence: float
 
-    sample_count: int = 0
+    y_min: float
+    y_max: float
 
-    y_min: float = 0.0
-    y_max: float = 0.0
+    normalized: bool = False
 
-    fit_error: float = float("inf")
+    def __post_init__(self) -> None:
+        coefficients = tuple(
+            float(value)
+            for value in self.coefficients
+        )
 
-    confidence: float = 0.0
+        if len(coefficients) != 4:
+            raise ValueError(
+                "LanePolynomial requires exactly four coefficients"
+            )
+
+        if not all(
+            isfinite(value)
+            for value in coefficients
+        ):
+            raise ValueError(
+                "LanePolynomial coefficients must be finite"
+            )
+
+        fit_error = float(self.fit_error)
+        confidence = float(self.confidence)
+        y_min = float(self.y_min)
+        y_max = float(self.y_max)
+
+        if not isfinite(fit_error):
+            raise ValueError(
+                "LanePolynomial.fit_error must be finite"
+            )
+
+        if not isfinite(confidence):
+            raise ValueError(
+                "LanePolynomial.confidence must be finite"
+            )
+
+        if not isfinite(y_min):
+            raise ValueError(
+                "LanePolynomial.y_min must be finite"
+            )
+
+        if not isfinite(y_max):
+            raise ValueError(
+                "LanePolynomial.y_max must be finite"
+            )
+
+        if y_max < y_min:
+            raise ValueError(
+                "LanePolynomial.y_max must be >= y_min"
+            )
+
+        object.__setattr__(
+            self,
+            "coefficients",
+            coefficients,
+        )
+
+        object.__setattr__(
+            self,
+            "fit_error",
+            max(0.0, fit_error),
+        )
+
+        object.__setattr__(
+            self,
+            "confidence",
+            min(1.0, max(0.0, confidence)),
+        )
+
+        object.__setattr__(
+            self,
+            "y_min",
+            y_min,
+        )
+
+        object.__setattr__(
+            self,
+            "y_max",
+            y_max,
+        )
+
+    @property
+    def degree(self) -> int:
+        """Grau fixo do modelo."""
+
+        return 3
 
     def evaluate(self, y: float) -> float:
+        """
+        Avalia x(y).
+
+        Usa Horner para reduzir operações e erro numérico.
+        """
+
         y = float(y)
 
-        return float(
-            self.a * y ** 3
-            + self.b * y ** 2
-            + self.c * y
-            + self.d
-        )
+        if not isfinite(y):
+            raise ValueError(
+                "y must be finite"
+            )
+
+        a, b, c, d = self.coefficients
+
+        return (
+            (a * y + b) * y + c
+        ) * y + d
 
     def derivative(self, y: float) -> float:
+        """
+        Calcula dx/dy.
+
+        Para:
+
+            x(y) = a*y³ + b*y² + c*y + d
+
+        temos:
+
+            dx/dy = 3a*y² + 2b*y + c
+        """
+
         y = float(y)
 
-        return float(
-            3.0 * self.a * y ** 2
-            + 2.0 * self.b * y
-            + self.c
-        )
-
-    def second_derivative(self, y: float) -> float:
-        y = float(y)
-
-        return float(
-            6.0 * self.a * y
-            + 2.0 * self.b
-        )
-
-    def is_finite(self) -> bool:
-        return all(
-            math.isfinite(float(value))
-            for value in (
-                self.a,
-                self.b,
-                self.c,
-                self.d,
-                self.y_min,
-                self.y_max,
-                self.fit_error,
-                self.confidence,
+        if not isfinite(y):
+            raise ValueError(
+                "y must be finite"
             )
-        )
 
-    def is_valid(self) -> bool:
+        a, b, c, _ = self.coefficients
+
         return (
-            bool(self.valid)
-            and self.sample_count >= 0
-            and self.is_finite()
-            and 0.0 <= self.confidence <= 1.0
-            and self.y_max >= self.y_min
+            (3.0 * a * y + 2.0 * b) * y
+            + c
         )
 
 
@@ -166,205 +283,439 @@ class LanePolynomial:
 # LANE LINE
 # =============================================================================
 
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class LaneLine:
     """
-    Linha de faixa detectada.
+    Representação canônica de uma borda de faixa.
+
+    Uma LaneLine pode representar uma observação direta,
+    uma lane rastreada ou uma lane projetada.
+
+    lane_id:
+        Identidade temporal atribuída pelo tracker.
+
+    points:
+        Pontos da borda da faixa.
+
+    confidence:
+        Confiança atual da percepção [0, 1].
+
+    quality:
+        Qualidade geométrica [0, 1].
+
+    source:
+        Origem dos dados.
+
+    detected_directly:
+        True quando existe observação direta no frame atual.
+
+    projected:
+        True quando parte ou toda a representação foi projetada.
+
+    age:
+        Quantidade de frames desde a criação da identidade.
+
+    missed_frames:
+        Quantidade de frames consecutivos sem observação direta.
+
+    velocity_x / velocity_y:
+        Velocidade estimada da representação da lane.
+
+    model:
+        Modelo cúbico opcional associado à lane.
     """
 
     lane_id: int
 
-    points: List[LanePoint] = field(
-        default_factory=list
-    )
+    points: Tuple[LanePoint, ...]
 
     confidence: float = 0.0
+    quality: float = 0.0
 
-    quality: LaneQuality = LaneQuality.NONE
+    source: LaneSource = LaneSource.DETECTED
 
     detected_directly: bool = True
-
     projected: bool = False
 
-    valid: bool = False
-
-    age_frames: int = 0
-
+    age: int = 0
     missed_frames: int = 0
 
-    def point_count(self) -> int:
-        return len(self.points)
+    velocity_x: float = 0.0
+    velocity_y: float = 0.0
 
-    def valid_points(self) -> List[LanePoint]:
-        return [
+    model: Optional[LanePolynomial] = None
+
+    def __post_init__(self) -> None:
+
+        lane_id = int(self.lane_id)
+
+        if lane_id < 0:
+            raise ValueError(
+                "lane_id must be non-negative"
+            )
+
+        points = tuple(
             point
+            if isinstance(point, LanePoint)
+            else LanePoint(
+                float(point[0]),
+                float(point[1]),
+            )
             for point in self.points
-            if point.is_valid()
+        )
+
+        if not points:
+            raise ValueError(
+                "LaneLine requires at least one point"
+            )
+
+        confidence = float(self.confidence)
+        quality = float(self.quality)
+
+        if not isfinite(confidence):
+            raise ValueError(
+                "LaneLine.confidence must be finite"
+            )
+
+        if not isfinite(quality):
+            raise ValueError(
+                "LaneLine.quality must be finite"
+            )
+
+        velocity_x = float(self.velocity_x)
+        velocity_y = float(self.velocity_y)
+
+        if not isfinite(velocity_x):
+            raise ValueError(
+                "LaneLine.velocity_x must be finite"
+            )
+
+        if not isfinite(velocity_y):
+            raise ValueError(
+                "LaneLine.velocity_y must be finite"
+            )
+
+        object.__setattr__(
+            self,
+            "lane_id",
+            lane_id,
+        )
+
+        object.__setattr__(
+            self,
+            "points",
+            points,
+        )
+
+        object.__setattr__(
+            self,
+            "confidence",
+            min(
+                1.0,
+                max(0.0, confidence),
+            ),
+        )
+
+        object.__setattr__(
+            self,
+            "quality",
+            min(
+                1.0,
+                max(0.0, quality),
+            ),
+        )
+
+        object.__setattr__(
+            self,
+            "source",
+            LaneSource(self.source),
+        )
+
+        object.__setattr__(
+            self,
+            "age",
+            max(0, int(self.age)),
+        )
+
+        object.__setattr__(
+            self,
+            "missed_frames",
+            max(
+                0,
+                int(self.missed_frames),
+            ),
+        )
+
+        object.__setattr__(
+            self,
+            "velocity_x",
+            velocity_x,
+        )
+
+        object.__setattr__(
+            self,
+            "velocity_y",
+            velocity_y,
+        )
+
+    @property
+    def is_projected(self) -> bool:
+        """Indica se a lane contém dados projetados."""
+
+        return (
+            self.projected
+            or self.source is LaneSource.PROJECTED
+        )
+
+    @property
+    def span(self) -> float:
+        """Extensão vertical observada da lane em pixels."""
+
+        if len(self.points) < 2:
+            return 0.0
+
+        ys = [
+            point.y
+            for point in self.points
         ]
 
-    def valid_point_count(self) -> int:
-        return len(
-            self.valid_points()
-        )
-
-    def is_finite(self) -> bool:
-        if not math.isfinite(
-            float(self.confidence)
-        ):
-            return False
-
-        return all(
-            point.is_finite()
-            for point in self.points
-        )
-
-    def is_valid(self) -> bool:
-        return (
-            bool(self.valid)
-            and self.point_count() >= 1
-            and self.is_finite()
-            and 0.0 <= self.confidence <= 1.0
-        )
+        return max(ys) - min(ys)
 
 
 # =============================================================================
 # LANE PROJECTION
 # =============================================================================
 
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class LaneProjection:
     """
-    Projeção matemática de uma faixa.
-    """
+    Resultado da projeção de uma lane.
 
-    polynomial: Optional[LanePolynomial] = None
-
-    points: List[LanePoint] = field(
-        default_factory=list
-    )
-
-    quality: ProjectionQuality = (
-        ProjectionQuality.NONE
-    )
-
-    extrapolated: bool = False
-
-    valid: bool = False
-
-    horizon_y: Optional[float] = None
-
-    def point_count(self) -> int:
-        return len(self.points)
-
-    def is_finite(self) -> bool:
-
-        if self.horizon_y is not None:
-            if not math.isfinite(
-                float(self.horizon_y)
-            ):
-                return False
-
-        if self.polynomial is not None:
-            if not self.polynomial.is_finite():
-                return False
-
-        return all(
-            point.is_finite()
-            for point in self.points
-        )
-
-    def is_valid(self) -> bool:
-        return (
-            bool(self.valid)
-            and self.polynomial is not None
-            and self.polynomial.valid
-            and self.point_count() >= 2
-            and self.is_finite()
-        )
-
-
-# =============================================================================
-# LANE MODEL
-# =============================================================================
-
-
-@dataclass
-class LaneModel:
-    """
-    Modelo matemático completo de uma faixa.
+    A projeção nunca altera a observação original.
     """
 
     lane_id: int
 
-    line: LaneLine
+    points: Tuple[LanePoint, ...]
 
-    polynomial: Optional[LanePolynomial] = None
+    confidence: float
 
-    projection: Optional[LaneProjection] = None
+    extrapolated_distance: float = 0.0
 
-    tracked: bool = False
+    source: LaneSource = LaneSource.PROJECTED
 
-    stable: bool = False
+    def __post_init__(self) -> None:
 
-    valid: bool = False
+        lane_id = int(self.lane_id)
 
-    def point_count(self) -> int:
-        if self.line is None:
-            return 0
+        if lane_id < 0:
+            raise ValueError(
+                "lane_id must be non-negative"
+            )
 
-        return self.line.point_count()
+        points = tuple(
+            point
+            if isinstance(point, LanePoint)
+            else LanePoint(
+                float(point[0]),
+                float(point[1]),
+            )
+            for point in self.points
+        )
 
-    def is_finite(self) -> bool:
+        if not points:
+            raise ValueError(
+                "LaneProjection requires at least one point"
+            )
 
-        if self.line is None:
-            return False
+        confidence = float(self.confidence)
+        extrapolated_distance = float(
+            self.extrapolated_distance
+        )
 
-        if not self.line.is_finite():
-            return False
+        if not isfinite(confidence):
+            raise ValueError(
+                "LaneProjection.confidence must be finite"
+            )
 
-        if self.polynomial is not None:
-            if not self.polynomial.is_finite():
-                return False
+        if not isfinite(extrapolated_distance):
+            raise ValueError(
+                "LaneProjection.extrapolated_distance "
+                "must be finite"
+            )
 
-        if self.projection is not None:
-            if not self.projection.is_finite():
-                return False
+        object.__setattr__(
+            self,
+            "lane_id",
+            lane_id,
+        )
 
-        return True
+        object.__setattr__(
+            self,
+            "points",
+            points,
+        )
 
-    def is_valid(self) -> bool:
+        object.__setattr__(
+            self,
+            "confidence",
+            min(
+                1.0,
+                max(0.0, confidence),
+            ),
+        )
 
-        if not self.valid:
-            return False
+        object.__setattr__(
+            self,
+            "extrapolated_distance",
+            max(
+                0.0,
+                extrapolated_distance,
+            ),
+        )
 
-        if self.line is None:
-            return False
-
-        if not self.line.valid:
-            return False
-
-        if self.polynomial is None:
-            return False
-
-        if not self.polynomial.valid:
-            return False
-
-        return self.is_finite()
+        object.__setattr__(
+            self,
+            "source",
+            LaneSource(self.source),
+        )
 
 
 # =============================================================================
-# EXPORTS
+# DETECTION RESULT
 # =============================================================================
 
+@dataclass(frozen=True, slots=True)
+class LaneDetectionResult:
+    """
+    Resultado canônico produzido pelo detector de lanes.
+
+    Este objeto representa somente a percepção daquele frame.
+    Não contém estado temporal.
+    """
+
+    lanes: Tuple[LaneLine, ...] = field(
+        default_factory=tuple
+    )
+
+    frame_width: int = 0
+    frame_height: int = 0
+
+    inference_ms: float = 0.0
+
+    confidence: float = 0.0
+
+    def __post_init__(self) -> None:
+
+        lanes = tuple(self.lanes)
+
+        frame_width = int(self.frame_width)
+        frame_height = int(self.frame_height)
+
+        if frame_width < 0:
+            raise ValueError(
+                "frame_width must be non-negative"
+            )
+
+        if frame_height < 0:
+            raise ValueError(
+                "frame_height must be non-negative"
+            )
+
+        inference_ms = float(
+            self.inference_ms
+        )
+
+        confidence = float(
+            self.confidence
+        )
+
+        if not isfinite(inference_ms):
+            raise ValueError(
+                "inference_ms must be finite"
+            )
+
+        if not isfinite(confidence):
+            raise ValueError(
+                "confidence must be finite"
+            )
+
+        object.__setattr__(
+            self,
+            "lanes",
+            lanes,
+        )
+
+        object.__setattr__(
+            self,
+            "frame_width",
+            frame_width,
+        )
+
+        object.__setattr__(
+            self,
+            "frame_height",
+            frame_height,
+        )
+
+        object.__setattr__(
+            self,
+            "inference_ms",
+            max(
+                0.0,
+                inference_ms,
+            ),
+        )
+
+        object.__setattr__(
+            self,
+            "confidence",
+            min(
+                1.0,
+                max(0.0, confidence),
+            ),
+        )
+
+    @property
+    def lane_count(self) -> int:
+        """Quantidade de lanes detectadas."""
+
+        return len(self.lanes)
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def points_from_xy(
+    points: Iterable[Sequence[float]],
+) -> Tuple[LanePoint, ...]:
+    """
+    Converte sequências (x, y) para LanePoint.
+
+    Útil na fronteira entre YOLOPv2/OpenCV e o domínio.
+    """
+
+    return tuple(
+        LanePoint(
+            float(point[0]),
+            float(point[1]),
+        )
+        for point in points
+    )
+
+
+# =============================================================================
+# PUBLIC API
+# =============================================================================
 
 __all__ = [
-    "LaneQuality",
-    "ProjectionQuality",
+    "Point",
+    "LaneSource",
     "LanePoint",
     "LanePolynomial",
     "LaneLine",
     "LaneProjection",
-    "LaneModel",
+    "LaneDetectionResult",
+    "points_from_xy",
 ]
