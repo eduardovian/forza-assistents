@@ -61,20 +61,10 @@ WEIGHTS_DIR: Final[Path] = (
     PROJECT_ROOT / "weights"
 )
 
+# Checkpoint TorchScript oficial do YOLOPv2. O detector ainda aceita o
+# nome histórico ``yolopv2_local.pt`` como fallback para instalações antigas.
 YOLOP_MODEL_PATH: Final[Path] = (
-    WEIGHTS_DIR / "yolopv2_local.pt"
-)
-YOLOP_MODEL_PATH: Final[Path] = (
-    WEIGHTS_DIR / "yolopv2_local.pt"
-)
-YOLOP_MODEL_PATH: Final[Path] = (
-    WEIGHTS_DIR / "yolopv2_local.pt"
-)
-YOLOP_MODEL_PATH: Final[Path] = (
-    WEIGHTS_DIR / "yolopv2_local.pt"
-)
-YOLOP_MODEL_PATH: Final[Path] = (
-    WEIGHTS_DIR / "yolopv2_local.pt"
+    WEIGHTS_DIR / "yolopv2.pt"
 )
 
 LOG_DIR: Final[Path] = (
@@ -378,7 +368,9 @@ class YOLOPConfig:
 
     input_width: int = 640
 
-    input_height: int = 640
+    # O export oficial usa conteúdo 640x360 com padding vertical de 12 px,
+    # portanto a entrada TorchScript efetiva é 640x384.
+    input_height: int = 384
 
     confidence_threshold: float = 0.50
 
@@ -396,7 +388,9 @@ class YOLOPConfig:
 
     max_lanes: int = 16
 
-    minimum_lane_points: int = 4
+    # Segmentos menores normalmente são ruído de textura, guard-rail ou uma
+    # parte isolada de uma marcação tracejada. O detector exige continuidade.
+    minimum_lane_points: int = 8
 
     preserve_low_confidence_lanes: bool = True
 

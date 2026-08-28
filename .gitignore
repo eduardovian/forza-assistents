@@ -1,4 +1,5 @@
 .venv/
+.venv-yolopv2/
 __pycache__/
 *.pyc
 *.pyo
