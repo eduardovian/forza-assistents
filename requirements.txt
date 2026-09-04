@@ -1,5 +1,0 @@
-numpy>=1.26,<3
-opencv-python>=4.8
-torch>=2.0
-pytest>=8
-mss>=9
